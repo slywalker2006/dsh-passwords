@@ -166,7 +166,7 @@ test('补丁：alpha.3 settings 使用 remote.$host.isLoopback 时强制 host pe
   }
 });
 
-test('补丁：当前 rc.1 npm artifacts 的原生 settings 与 Cookie bridge 都可验证并保持语法有效', () => {
+test('补丁：当前 rc.1 npm artifacts 应应用 settings 与 Cookie bridge 并保持语法有效', () => {
   const { root, cleanup } = makeDshRoot(RC7_APIPROXY, RC7_SETTINGS_PATCHED);
   try {
     const packages = [
@@ -179,11 +179,14 @@ test('补丁：当前 rc.1 npm artifacts 的原生 settings 与 Cookie bridge �
       mkdirSync(path.dirname(target), { recursive: true });
       copyFileSync(source, target);
     }
-    // rc.1 ships the host persistence decision natively; only the private
-    // Host-side Cookie bridge remains a dsh-passwords patch responsibility.
+    // npm ci installs the official unmodified RC.1 artifacts. Both the
+    // browser-side host persistence and the private Host Cookie bridge must
+    // be patched before the public gateway is allowed to start.
+    assert.equal(patchStatus(root).settingsHostMode, false);
+    assert.equal(patchStatus(root).connectionCookieBridge, 'unsupported');
+    assert.equal(applyRemotePatch(root), 'applied');
     assert.equal(patchStatus(root).settingsHostMode, true);
     assert.equal(patchStatus(root).connectionCookieBridge, 'patched');
-    assert.equal(applyRemotePatch(root), 'unchanged');
     const settings = path.join(root, 'node_modules', '@deepseek-ai', 'dsh-client-ui-settings', 'lib', 'client.js');
     const connection = path.join(root, 'node_modules', '@deepseek-ai', 'dsh-client-connection', 'lib', 'index.js');
     assert.ok(readFileSync(settings, 'utf8').includes('const persistence = "host"'));
