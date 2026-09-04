@@ -108,6 +108,49 @@ test('settings card renders account and patch controls for a healthy response', 
   assert.doesNotMatch(card.text(), /card-crashed/);
 });
 
+test('settings card synchronizes the SSH permission beside upload and save API', async (t) => {
+  const card = await mountCard(t, {
+    '/gateway/api/permissions': () => Response.json({ ok: true }),
+  }, {
+    '/gateway/api/overview': {
+      me: { id: 1, username: 'test-admin', role: 'admin' },
+      availableWebSocketPaths: [],
+      users: [{
+        id: 2,
+        username: 'subuser',
+        role: 'user',
+        permissions: {
+          allowedFolders: [],
+          hourlyTokenLimit: null,
+          dailyMinutesLimit: null,
+          allowUpload: false,
+          allowGitDownload: false,
+          allowWorkspaceCreate: false,
+          allowSsh: false,
+          allowedWebSocketPaths: [],
+          allowedAgentPresets: [],
+          banned: false,
+          sandboxMode: null,
+          disabledSessions: [],
+          allowedSessionIds: [],
+        },
+        usage: null,
+      }],
+    },
+  });
+  const sshLabel = card.renderer.root.findAllByType('label').find((label) => label.children.some((child) => child === 'permsSsh'));
+  assert.ok(sshLabel, 'SSH 权限开关必须出现在上传权限附近');
+  const checkbox = sshLabel!.findByType('input');
+  assert.equal(checkbox.props.checked, false);
+  await act(async () => { checkbox.props.onChange({ target: { checked: true } }); });
+  const saveButton = card.renderer.root.findAllByType('button').find((button) => button.children.some((child) => child === 'permsSave'));
+  assert.ok(saveButton);
+  await act(async () => { saveButton!.props.onClick(); });
+  const permissionRequest = card.requests.find((request) => request.input === '/gateway/api/permissions');
+  assert.ok(permissionRequest);
+  assert.equal(JSON.parse(String(permissionRequest!.init?.body)).allowSsh, true);
+});
+
 test('settings card synchronizes the large request body permission to the visible checkbox and save API', async (t) => {
   const card = await mountCard(t, {
     '/gateway/api/permissions': () => Response.json({ ok: true }),
@@ -126,6 +169,7 @@ test('settings card synchronizes the large request body permission to the visibl
           allowUpload: false,
           allowGitDownload: false,
           allowWorkspaceCreate: false,
+          allowSsh: false,
           allowedWebSocketPaths: [],
           allowedAgentPresets: [],
           banned: false,

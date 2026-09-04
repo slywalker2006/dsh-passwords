@@ -97,7 +97,7 @@ if (!existsSync(pkgPath)) {
   process.exit(1);
 }
 
-// ── 1. Node.js（与 DSH 0.1.2-alpha.5 官方 engines 对齐） ──
+// ── 1. Node.js（与 DSH 0.1.2-rc.1 官方 engines 对齐） ──
 const [nodeMajor, nodeMinor] = process.versions.node.split('.').map(Number);
 if ((nodeMajor === 22 && nodeMinor < 19) || nodeMajor < 22 || nodeMajor === 23) {
   err(`Node.js 版本不受支持（当前 v${process.versions.node}），需要 22.19+ 或 24+。`);
@@ -109,7 +109,7 @@ say(`Node.js v${process.versions.node} ✓`);
 // ── 2. dsh（DeepSeek Harness）──
 if (run('dsh', ['--version'], { quiet: true }) !== 0) {
   err('未找到 dsh。请先安装 DeepSeek Harness：');
-  err('  npm install -g @deepseek-ai/dsh@0.1.2-alpha.5');
+  err('  npm install -g @deepseek-ai/dsh@0.1.2-rc.1');
   err('  然后用 DEEPSEEK_API_KEY=sk-你的key dsh web 先跑一次确认能用');
   process.exit(1);
 }

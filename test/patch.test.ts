@@ -166,7 +166,7 @@ test('补丁：alpha.3 settings 使用 remote.$host.isLoopback 时强制 host pe
   }
 });
 
-test('补丁：当前 alpha.3 npm artifacts 的 settings 与 Cookie bridge 都可命中并保持语法有效', () => {
+test('补丁：当前 rc.1 npm artifacts 的原生 settings 与 Cookie bridge 都可验证并保持语法有效', () => {
   const { root, cleanup } = makeDshRoot(RC7_APIPROXY, RC7_SETTINGS_PATCHED);
   try {
     const packages = [
@@ -179,17 +179,17 @@ test('补丁：当前 alpha.3 npm artifacts 的 settings 与 Cookie bridge 都�
       mkdirSync(path.dirname(target), { recursive: true });
       copyFileSync(source, target);
     }
-    assert.equal(patchStatus(root).settingsHostMode, false);
-    assert.equal(patchStatus(root).connectionCookieBridge, 'unsupported');
-    assert.equal(applyRemotePatch(root), 'applied');
+    // rc.1 ships the host persistence decision natively; only the private
+    // Host-side Cookie bridge remains a dsh-passwords patch responsibility.
+    assert.equal(patchStatus(root).settingsHostMode, true);
+    assert.equal(patchStatus(root).connectionCookieBridge, 'patched');
+    assert.equal(applyRemotePatch(root), 'unchanged');
     const settings = path.join(root, 'node_modules', '@deepseek-ai', 'dsh-client-ui-settings', 'lib', 'client.js');
     const connection = path.join(root, 'node_modules', '@deepseek-ai', 'dsh-client-connection', 'lib', 'index.js');
     assert.ok(readFileSync(settings, 'utf8').includes('const persistence = "host"'));
     assert.ok(readFileSync(connection, 'utf8').includes(ALPHA_CONNECTION_PATCH_HARDEN_MARK));
     assert.equal(spawnSync(process.execPath, ['--check', settings]).status, 0);
     assert.equal(spawnSync(process.execPath, ['--check', connection]).status, 0);
-    assert.equal(patchStatus(root).settingsHostMode, true);
-    assert.equal(patchStatus(root).connectionCookieBridge, 'patched');
   } finally {
     cleanup();
   }

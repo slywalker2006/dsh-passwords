@@ -95,6 +95,7 @@ export interface PermOverview {
       allowUpload: boolean;
       allowGitDownload: boolean;
       allowWorkspaceCreate: boolean;
+      allowSsh?: boolean;
       allowedWebSocketPaths: string[];
       allowedAgentPresets: string[] | null;
       banned: boolean;
@@ -119,6 +120,7 @@ interface PermDraft {
   upload: boolean;
   git: boolean;
   workspaceCreate: boolean;
+  ssh: boolean;
   banned: boolean;
   sandbox: string;
   disabledSessions: string[];
@@ -272,6 +274,7 @@ export function DshPasswordsCard(props: PropsLocale<'dshpw'>) {
                   upload: u.permissions.allowUpload,
                   git: u.permissions.allowGitDownload,
                   workspaceCreate: u.permissions.allowWorkspaceCreate,
+                  ssh: u.permissions.allowSsh === true,
                   banned: u.permissions.banned,
                   webSocketPaths: [...(u.permissions.allowedWebSocketPaths ?? [])],
                   agentPresets: u.permissions.allowedAgentPresets === null ? null : [...u.permissions.allowedAgentPresets],
@@ -647,6 +650,7 @@ export function DshPasswordsCard(props: PropsLocale<'dshpw'>) {
           allowUpload: d.upload,
           allowGitDownload: d.git,
           allowWorkspaceCreate: d.workspaceCreate,
+          allowSsh: d.ssh,
           allowedWebSocketPaths: d.webSocketPaths,
           allowedAgentPresets: d.agentPresets,
           banned: d.banned,
@@ -1237,6 +1241,17 @@ export function DshPasswordsCard(props: PropsLocale<'dshpw'>) {
                     onChange: (e: { target: { checked: boolean } }) => setDraft(u.id, { git: e.target.checked }),
                   }),
                   t('permsGit'),
+                ),
+                h(
+                  'label',
+                  { className: 'dshpw-check' },
+                  h('input', {
+                    type: 'checkbox',
+                    checked: d.ssh,
+                    disabled: busy,
+                    onChange: (e: { target: { checked: boolean } }) => setDraft(u.id, { ssh: e.target.checked }),
+                  }),
+                  t('permsSsh'),
                 ),
                 h(
                   'label',

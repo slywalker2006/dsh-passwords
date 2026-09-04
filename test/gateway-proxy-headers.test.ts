@@ -75,6 +75,7 @@ let sandboxSessionSequence = 0;
 let workspaceCreateMakesNewWorkspace = false;
 let delaySessionCreateResponse = false;
 let dropDelayedWorkspaceUpsert = false;
+let sessionSearchResponseMode: 'valid' | 'malformed' = 'valid';
 let releaseSessionCreateResponse: (() => void) | null = null;
 let createdSessionIdForMock = 'created-session';
 let wireCreatedSessionId = '';
@@ -86,6 +87,11 @@ let assignableResources = {
 };
 let assignableResourcesUnavailable = false;
 let remoteMuxOpenEndpoints: string[] = [];
+let remoteMuxOpenFrames: Array<Record<string, unknown>> = [];
+let lastScopedRequestBody: Record<string, unknown> | null = null;
+let mockSshHosts: Array<{ alias: string; host: string }> = [
+  { alias: 'admin-host', host: '198.51.100.10' },
+];
 
 /** mock 上游：刻意不设 content-length（write 分段写），Node 会以 chunked 分帧——
  *  这正是生产环境 dsh 的行为，也是触发原 bug 的前提 */
@@ -94,9 +100,10 @@ function startMockUpstream(): Promise<http.Server> {
     const remoteMux = new WebSocketServer({ noServer: true });
     remoteMux.on('connection', (client: any) => {
       client.on('message', (data: Buffer) => {
-        const frame = JSON.parse(data.toString()) as { type?: string; streamId?: string; endpoint?: string };
+        const frame = JSON.parse(data.toString()) as Record<string, unknown> & { type?: string; streamId?: string; endpoint?: string };
         if (frame.type !== 'open' || typeof frame.streamId !== 'string' || typeof frame.endpoint !== 'string') return;
         remoteMuxOpenEndpoints.push(frame.endpoint);
+        remoteMuxOpenFrames.push(frame);
         if (frame.endpoint === 'workspace/follow') {
           client.send(JSON.stringify({
             type: 'item',
@@ -176,11 +183,34 @@ function startMockUpstream(): Promise<http.Server> {
           return;
         }
         if (frame.endpoint === 'session/follow') {
-          client.send(JSON.stringify({
-            type: 'item',
-            streamId: frame.streamId,
-            value: { events: [{ type: 'message', text: 'authorized session history' }] },
-          }));
+          const payload = frame.payload as Record<string, unknown> | undefined;
+          const args = payload?.args as Record<string, unknown> | undefined;
+          const request = args?.request as Record<string, unknown> | undefined;
+          const address = request?.address as Record<string, unknown> | undefined;
+          if (address?.kind === 'subagent') {
+            client.send(JSON.stringify({
+              type: 'item',
+              streamId: frame.streamId,
+              value: {
+                type: 'snapshot',
+                cursor: 17,
+                records: [{ type: 'event', event: { type: 'message', seq: 17, text: 'child history' } }],
+                projections: { model: 'test-model' },
+                hasMore: true,
+              },
+            }));
+            client.send(JSON.stringify({
+              type: 'item',
+              streamId: frame.streamId,
+              value: { type: 'event', seq: 18, records: ['child-live-event'] },
+            }));
+          } else {
+            client.send(JSON.stringify({
+              type: 'item',
+              streamId: frame.streamId,
+              value: { events: [{ type: 'message', text: 'authorized session history' }] },
+            }));
+          }
           return;
         }
         if (frame.endpoint === 'session/control') {
@@ -256,6 +286,64 @@ function startMockUpstream(): Promise<http.Server> {
             respond();
           }
         });
+      } else if (/^\/api\/(?:session[.]page|subagents[.](?:prompt|interruptByParent))$/.test(req.url ?? '')) {
+        const chunks: Buffer[] = [];
+        req.on('data', (chunk: Buffer) => chunks.push(chunk));
+        req.on('end', () => {
+          try {
+            lastScopedRequestBody = JSON.parse(Buffer.concat(chunks).toString('utf8')) as Record<string, unknown>;
+          } catch {
+            lastScopedRequestBody = null;
+          }
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ result: { ok: true, value: { accepted: true } } }));
+        });
+      } else if ((req.url ?? '').startsWith('/api/dsh-ssh/hosts')) {
+        const chunks: Buffer[] = [];
+        req.on('data', (chunk: Buffer) => chunks.push(chunk));
+        req.on('end', () => {
+          if (req.method === 'GET') {
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ hosts: mockSshHosts }));
+            return;
+          }
+          if (req.method === 'POST') {
+            const body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as { alias?: unknown; host?: unknown };
+            if (typeof body.alias !== 'string' || typeof body.host !== 'string') {
+              res.writeHead(400, { 'content-type': 'application/json' });
+              res.end(JSON.stringify({ error: 'invalid host' }));
+              return;
+            }
+            if (mockSshHosts.some((host) => host.alias === body.alias)) {
+              res.writeHead(400, { 'content-type': 'application/json' });
+              res.end(JSON.stringify({ error: 'alias already exists' }));
+              return;
+            }
+            const host = { alias: body.alias, host: body.host };
+            mockSshHosts.push(host);
+            res.writeHead(201, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ host }));
+            return;
+          }
+          res.writeHead(405, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'method not allowed' }));
+        });
+      } else if ((req.url ?? '').startsWith('/api/session.search')) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(sessionSearchResponseMode === 'malformed'
+          ? JSON.stringify({ result: { ok: true, value: { items: { malformed: true }, hasMore: false } } })
+          : JSON.stringify({
+            result: {
+              ok: true,
+              value: {
+                items: [
+                  { sessionId: 'session-visible', snippet: 'visible session snippet' },
+                  { sessionId: 'session-hidden', snippet: 'hidden session snippet' },
+                ],
+                hasMore: false,
+              },
+            },
+          }));
       } else if ((req.url ?? '').startsWith('/api/session.list')) {
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({
@@ -418,7 +506,7 @@ before(async () => {
     jwtSecret: 'test-secret',
     internalSecret: 'test-internal',
     patch: { dshRoot: '', restartService: '' },
-    webSocket: { adminAllowlist: ['/sidebar/ws/terminal'], userAllowlist: ['/plugin/ws/*'] },
+    webSocket: { adminAllowlist: ['/sidebar/ws/terminal'], userAllowlist: ['/plugin/ws/*', '/api/dsh-ssh/terminal'] },
   };
 
   auth = new AuthService(config, db);
@@ -880,6 +968,197 @@ test('Issue #25：资源核验不可用时权限保存 fail-closed', async () =>
   }
 });
 
+test('rc.1 session.search 只返回子用户已授权会话的摘要', async () => {
+  const subUser = db.createUser('session-search-user', '$2a$10$dummyhashdummyhashdummyhashdu', 'user');
+  db.setPermissions(subUser.id, {
+    allowedFolders: ['/workspaces/visible'], hourlyTokenLimit: null, dailyMinutesLimit: null,
+    allowUpload: false, allowGitDownload: false, allowWorkspaceCreate: false, allowedWebSocketPaths: [],
+    allowedAgentPresets: null, banned: false, sandboxMode: null, disabledSessions: [], allowedSessionIds: ['session-visible'],
+  });
+  db.markSessionGrantsSeeded(subUser.id);
+  const subToken = jwt.sign({ sub: String(subUser.id), username: subUser.username, cv: 0 }, 'test-secret', { expiresIn: '12h' });
+  const subCookie = `dsh_gateway_token=${subToken}`;
+  const originalCookie = cookie;
+  cookie = subCookie;
+  try {
+    const connection = await openRemoteMux({ cookie: subCookie, origin: 'http://127.0.0.1', host: '127.0.0.1' });
+    try {
+      connection.client.send(JSON.stringify({
+        type: 'open', streamId: 'session-search-workspace', endpoint: 'workspace/follow', payload: { args: {} },
+      }));
+      await connection.nextFrame();
+      const response = await gatewayReq(
+        'POST',
+        '/api/session.search',
+        { 'content-type': 'application/json' },
+        JSON.stringify({ type: 'client-request', rpcId: 'session-search', method: 'session/search', payload: { args: { request: { query: 'secret' } } } }),
+      );
+      assert.equal(response.status, 200, response.body);
+      const value = (JSON.parse(response.body) as {
+        result: { value: { items: Array<{ sessionId: string; snippet: string }>; hasMore: boolean } };
+      }).result.value;
+      assert.deepEqual(value.items, [{ sessionId: 'session-visible', snippet: 'visible session snippet' }]);
+      assert.equal(value.hasMore, false);
+      assert.doesNotMatch(response.body, /hidden session snippet|session-hidden/);
+    } finally {
+      connection.client.close();
+    }
+  } finally {
+    cookie = originalCookie;
+  }
+});
+
+test('rc.1 session.search 成功响应结构异常时 fail-closed，不透传原始结果', async () => {
+  const subUser = db.createUser('session-search-malformed', '$2a$10$dummyhashdummyhashdummyhashdu', 'user');
+  db.setPermissions(subUser.id, {
+    allowedFolders: ['/workspaces/visible'], hourlyTokenLimit: null, dailyMinutesLimit: null,
+    allowUpload: false, allowGitDownload: false, allowWorkspaceCreate: false, allowedWebSocketPaths: [],
+    allowedAgentPresets: null, banned: false, sandboxMode: null, disabledSessions: [], allowedSessionIds: ['session-visible'],
+  });
+  db.markSessionGrantsSeeded(subUser.id);
+  const subCookie = `dsh_gateway_token=${jwt.sign({ sub: String(subUser.id), username: subUser.username, cv: 0 }, 'test-secret', { expiresIn: '12h' })}`;
+  const originalCookie = cookie;
+  const originalMode = sessionSearchResponseMode;
+  cookie = subCookie;
+  sessionSearchResponseMode = 'malformed';
+  try {
+    const connection = await openRemoteMux({ cookie: subCookie, origin: 'http://127.0.0.1', host: '127.0.0.1' });
+    try {
+      connection.client.send(JSON.stringify({
+        type: 'open', streamId: 'session-search-malformed-workspace', endpoint: 'workspace/follow', payload: { args: {} },
+      }));
+      await connection.nextFrame();
+      const response = await gatewayReq(
+        'POST',
+        '/api/session.search',
+        { 'content-type': 'application/json' },
+        JSON.stringify({ type: 'client-request', rpcId: 'session-search-malformed', method: 'session/search', payload: { args: { request: { query: 'secret' } } } }),
+      );
+      assert.equal(response.status, 502, response.body);
+      assert.doesNotMatch(response.body, /malformed|session-visible/);
+    } finally {
+      connection.client.close();
+    }
+  } finally {
+    sessionSearchResponseMode = originalMode;
+    cookie = originalCookie;
+  }
+});
+
+test('SSH 插件 HTTP 运维端点对子用户在到达上游前拒绝', async () => {
+  const subUser = db.createUser('ssh-denied-user', '$2a$10$dummyhashdummyhashdummyhashdu', 'user');
+  db.setPermissions(subUser.id, {
+    allowedFolders: ['/workspaces/visible'], hourlyTokenLimit: null, dailyMinutesLimit: null,
+    allowUpload: true, allowGitDownload: true, allowWorkspaceCreate: false, allowSsh: false, allowedWebSocketPaths: [],
+    allowedAgentPresets: null, banned: false, sandboxMode: null, disabledSessions: [], allowedSessionIds: [],
+  });
+  const subCookie = `dsh_gateway_token=${jwt.sign({ sub: String(subUser.id), username: subUser.username, cv: 0 }, 'test-secret', { expiresIn: '12h' })}`;
+  const upstreamUrlBefore = lastUpstreamUrl;
+  const originalCookie = cookie;
+  cookie = subCookie;
+  try {
+    const response = await gatewayReq(
+      'POST',
+      '/api/dsh-ssh/hosts',
+      { 'content-type': 'application/json' },
+      JSON.stringify({ alias: 'must-not-reach-upstream', host: '203.0.113.10' }),
+    );
+    assert.equal(response.status, 403, response.body);
+    assert.equal(lastUpstreamUrl, upstreamUrlBefore, '子用户 SSH 运维请求不得到达 dsh');
+  } finally {
+    cookie = originalCookie;
+  }
+});
+
+test('SSH 插件只向已启用的子用户暴露其认领的主机，且创建会持久化认领', async () => {
+  const subUser = db.createUser('ssh-isolated-user', '$2a$10$dummyhashdummyhashdummyhashdu', 'user');
+  const otherUser = db.createUser('ssh-other-user', '$2a$10$dummyhashdummyhashdummyhashdu', 'user');
+  for (const user of [subUser, otherUser]) {
+    db.setPermissions(user.id, {
+      allowedFolders: ['/workspaces/visible'], hourlyTokenLimit: null, dailyMinutesLimit: null,
+      allowUpload: true, allowGitDownload: true, allowWorkspaceCreate: false, allowSsh: true, allowedWebSocketPaths: ['/api/dsh-ssh/terminal'],
+      allowedAgentPresets: null, banned: false, sandboxMode: null, disabledSessions: [], allowedSessionIds: [],
+    });
+  }
+  const subCookie = `dsh_gateway_token=${jwt.sign({ sub: String(subUser.id), username: subUser.username, cv: 0 }, 'test-secret', { expiresIn: '12h' })}`;
+  const otherCookie = `dsh_gateway_token=${jwt.sign({ sub: String(otherUser.id), username: otherUser.username, cv: 0 }, 'test-secret', { expiresIn: '12h' })}`;
+  const originalCookie = cookie;
+  const originalHosts = mockSshHosts;
+  mockSshHosts = [{ alias: 'admin-host', host: '198.51.100.10' }];
+  try {
+    cookie = subCookie;
+    const beforeCreate = await gatewayReq('GET', '/api/dsh-ssh/hosts');
+    assert.equal(beforeCreate.status, 200, beforeCreate.body);
+    assert.deepEqual(JSON.parse(beforeCreate.body).hosts, [], '未认领的管理员主机不得泄露给子用户');
+
+    const created = await gatewayReq(
+      'POST',
+      '/api/dsh-ssh/hosts',
+      { 'content-type': 'application/json' },
+      JSON.stringify({ alias: 'child-host', host: '203.0.113.10' }),
+    );
+    assert.equal(created.status, 201, created.body);
+    assert.equal(db.getSshHostOwner('child-host'), subUser.id, '成功创建后必须归属创建者');
+
+    const afterCreate = await gatewayReq('GET', '/api/dsh-ssh/hosts');
+    assert.equal(afterCreate.status, 200, afterCreate.body);
+    assert.deepEqual(JSON.parse(afterCreate.body).hosts, [{ alias: 'child-host', host: '203.0.113.10' }]);
+
+    cookie = otherCookie;
+    const otherList = await gatewayReq('GET', '/api/dsh-ssh/hosts');
+    assert.equal(otherList.status, 200, otherList.body);
+    assert.deepEqual(JSON.parse(otherList.body).hosts, []);
+    const aliasCollision = await gatewayReq(
+      'POST', '/api/dsh-ssh/hosts', { 'content-type': 'application/json' }, JSON.stringify({ alias: 'child-host', host: '203.0.113.11' }),
+    );
+    assert.equal(aliasCollision.status, 403, aliasCollision.body);
+    const forbiddenExec = await gatewayReq(
+      'POST', '/api/dsh-ssh/exec', { 'content-type': 'application/json' }, JSON.stringify({ alias: 'child-host', command: 'id' }),
+    );
+    assert.equal(forbiddenExec.status, 403, forbiddenExec.body);
+    const forbiddenLs = await gatewayReq('GET', '/api/dsh-ssh/ls?alias=child-host&path=/');
+    assert.equal(forbiddenLs.status, 403, forbiddenLs.body);
+  } finally {
+    mockSshHosts = originalHosts;
+    cookie = originalCookie;
+  }
+});
+
+test('SSH 终端 WebSocket 升级对子用户拒绝', async () => {
+  const subUser = db.createUser('ssh-terminal-denied-user', '$2a$10$dummyhashdummyhashdummyhashdu', 'user');
+  db.setPermissions(subUser.id, {
+    allowedFolders: ['/workspaces/visible'], hourlyTokenLimit: null, dailyMinutesLimit: null,
+    allowUpload: true, allowGitDownload: true, allowWorkspaceCreate: false, allowSsh: false, allowedWebSocketPaths: ['/api/dsh-ssh/terminal'],
+    allowedAgentPresets: null, banned: false, sandboxMode: null, disabledSessions: [], allowedSessionIds: [],
+  });
+  const subToken = jwt.sign({ sub: String(subUser.id), username: subUser.username, cv: 0 }, 'test-secret', { expiresIn: '12h' });
+  const handshake = await websocketHandshake('/api/dsh-ssh/terminal?alias=forbidden', {
+    cookie: `dsh_gateway_token=${subToken}`,
+    origin: 'http://127.0.0.1',
+    host: '127.0.0.1',
+  });
+  assert.match(handshake.statusLine, /403/);
+});
+
+test('SSH 终端只允许拥有 alias 且开启 SSH 的子用户到达上游', async () => {
+  const subUser = db.createUser('ssh-terminal-owner-user', '$2a$10$dummyhashdummyhashdummyhashdu', 'user');
+  db.setPermissions(subUser.id, {
+    allowedFolders: ['/workspaces/visible'], hourlyTokenLimit: null, dailyMinutesLimit: null,
+    allowUpload: true, allowGitDownload: true, allowWorkspaceCreate: false, allowSsh: true, allowedWebSocketPaths: [],
+    allowedAgentPresets: null, banned: false, sandboxMode: null, disabledSessions: [], allowedSessionIds: [],
+  });
+  assert.equal(db.claimSshHost('owned-terminal', subUser.id), true);
+  const subToken = jwt.sign({ sub: String(subUser.id), username: subUser.username, cv: 0 }, 'test-secret', { expiresIn: '12h' });
+  const denied = await websocketHandshake('/api/dsh-ssh/terminal?alias=admin-host', {
+    cookie: `dsh_gateway_token=${subToken}`, origin: 'http://127.0.0.1', host: '127.0.0.1',
+  });
+  assert.match(denied.statusLine, /403/);
+  const allowed = await websocketHandshake('/api/dsh-ssh/terminal?alias=owned-terminal', {
+    cookie: `dsh_gateway_token=${subToken}`, origin: 'http://127.0.0.1', host: '127.0.0.1',
+  });
+  assert.match(allowed.statusLine, /101/, '拥有的 alias 应真实转发至上游 PTY WebSocket');
+});
+
 test('Issue #25：alpha.3 session.list 先到时等待 Remote 基线并只返回显式授权会话', async () => {
   const subUser = db.createUser('issue-25-session-list-race', '$2a$10$dummyhashdummyhashdummyhashdu', 'user');
   db.setPermissions(subUser.id, {
@@ -1093,6 +1372,163 @@ test('Issue #25：alpha.3 只允许子用户订阅被明确授予的 session/fol
     client.once('close', (code: number, reason: Buffer) => resolve({ code, reason: reason.toString() }));
   });
   assert.deepEqual(forbidden, { code: 1008, reason: 'Remote session not available for this user' });
+});
+
+test('RC.1 子代理 session/follow 沿用 parent 授权并原样保留地址与连续字段', async () => {
+  const subUser = db.createUser('rc1-subagent-follow-user', '$2a$10$dummyhashdummyhashdummyhashdu', 'user');
+  db.setPermissions(subUser.id, {
+    allowedFolders: ['/workspaces/visible'], hourlyTokenLimit: null, dailyMinutesLimit: null,
+    allowUpload: true, allowGitDownload: false, allowWorkspaceCreate: false, allowedWebSocketPaths: [],
+    allowedAgentPresets: null, banned: false, sandboxMode: null, disabledSessions: [],
+    allowedSessionIds: ['session-visible'],
+  });
+  db.markSessionGrantsSeeded(subUser.id);
+  const childId = 'child-without-grant';
+  assert.deepEqual(db.listUserSessionGrants(subUser.id), ['session-visible']);
+  const headers = {
+    cookie: `dsh_gateway_token=${jwt.sign({ sub: String(subUser.id), username: subUser.username, cv: 0 }, 'test-secret', { expiresIn: '12h' })}`,
+    origin: 'http://127.0.0.1', host: '127.0.0.1',
+  };
+  remoteMuxOpenEndpoints = [];
+  remoteMuxOpenFrames = [];
+  const connection = await openRemoteMux(headers);
+  try {
+    connection.client.send(JSON.stringify({
+      type: 'open', streamId: 'subagent-workspace', endpoint: 'workspace/follow', payload: { args: {} },
+    }));
+    await connection.nextFrame();
+    connection.client.send(JSON.stringify({
+      type: 'open', streamId: 'subagent-follow', endpoint: 'session/follow',
+      payload: { args: { request: {
+        address: { kind: 'subagent', parentSessionId: 'session-visible', childSessionId: childId, mode: 'continuable' },
+        maxMessages: 50,
+      } } },
+    }));
+    const snapshot = await connection.nextFrame();
+    const event = await connection.nextFrame();
+    assert.deepEqual((remoteMuxOpenFrames.find((frame) => frame.endpoint === 'session/follow')?.payload as any).args.request.address, {
+      kind: 'subagent', parentSessionId: 'session-visible', childSessionId: childId, mode: 'continuable',
+    });
+    assert.deepEqual(snapshot, {
+      type: 'item', streamId: 'subagent-follow', value: {
+        type: 'snapshot', cursor: 17,
+        records: [{ type: 'event', event: { type: 'message', seq: 17, text: 'child history' } }],
+        projections: { model: 'test-model' }, hasMore: true,
+      },
+    });
+    assert.deepEqual(event, {
+      type: 'item', streamId: 'subagent-follow', value: { type: 'event', seq: 18, records: ['child-live-event'] },
+    });
+    assert.deepEqual(db.listUserSessionGrants(subUser.id), ['session-visible'], 'child must not become an ordinary grant');
+    connection.client.send(JSON.stringify({
+      type: 'open', streamId: 'subagent-follow-one-shot', endpoint: 'session/follow',
+      payload: { args: { request: {
+        address: { kind: 'subagent', parentSessionId: 'session-visible', childSessionId: 'one-shot-child', mode: 'one-shot' },
+        maxMessages: 50,
+      } } },
+    }));
+    const oneShotSnapshot = await connection.nextFrame();
+    const oneShotEvent = await connection.nextFrame();
+    assert.equal((oneShotSnapshot.value as any).cursor, 17);
+    assert.equal((oneShotEvent.value as any).seq, 18);
+    assert.deepEqual((remoteMuxOpenFrames.filter((frame) => frame.endpoint === 'session/follow').at(-1)?.payload as any).args.request.address, {
+      kind: 'subagent', parentSessionId: 'session-visible', childSessionId: 'one-shot-child', mode: 'one-shot',
+    });
+  } finally {
+    connection.client.close();
+  }
+});
+
+test('RC.1 子代理 HTTP 请求只校验 parent，并保留 child 与 mode', async () => {
+  const subUser = db.createUser('rc1-subagent-http-user', '$2a$10$dummyhashdummyhashdummyhashdu', 'user');
+  db.setPermissions(subUser.id, {
+    allowedFolders: ['/workspaces/visible'], hourlyTokenLimit: null, dailyMinutesLimit: null,
+    allowUpload: true, allowGitDownload: false, allowWorkspaceCreate: false, allowedWebSocketPaths: [],
+    allowedAgentPresets: null, banned: false, sandboxMode: null, disabledSessions: [],
+    allowedSessionIds: ['session-visible'],
+  });
+  db.markSessionGrantsSeeded(subUser.id);
+  const subToken = jwt.sign({ sub: String(subUser.id), username: subUser.username, cv: 0 }, 'test-secret', { expiresIn: '12h' });
+  const originalCookie = cookie;
+  cookie = `dsh_gateway_token=${subToken}`;
+  const address = { kind: 'subagent', parentSessionId: 'session-visible', childSessionId: 'http-child-without-grant', mode: 'continuable' };
+  try {
+    const connection = await openRemoteMux({
+      cookie: `dsh_gateway_token=${subToken}`, origin: 'http://127.0.0.1', host: '127.0.0.1',
+    });
+    try {
+      connection.client.send(JSON.stringify({
+        type: 'open', streamId: 'http-baseline', endpoint: 'workspace/follow', payload: { args: {} },
+      }));
+      await connection.nextFrame();
+    } finally {
+      connection.client.close();
+    }
+    const requests = [
+      {
+        method: 'session/page',
+        args: { request: { address, throughSeq: 12, maxMessages: 50 } },
+      },
+      {
+        method: 'subagents/prompt',
+        args: { request: { requestId: 'request-1', parentSessionId: address.parentSessionId, childSessionId: address.childSessionId, mode: address.mode, content: [{ type: 'text', text: 'continue' }] } },
+      },
+      {
+        method: 'subagents/interruptByParent',
+        args: { childSessionId: address.childSessionId, parentSessionId: address.parentSessionId, mode: address.mode },
+      },
+    ] as const;
+    for (const { method, args } of requests) {
+      lastScopedRequestBody = null;
+      const response = await gatewayReq(
+        'POST', `/api/${method.replace('/', '.')}`, { 'content-type': 'application/json' },
+        JSON.stringify({ type: 'client-request', rpcId: `rpc-${method}`, method, payload: { args } }),
+      );
+      assert.equal(response.status, 200, `${method}: ${response.body}`);
+      const forwarded = lastScopedRequestBody as Record<string, unknown> | null;
+      assert.deepEqual(forwarded?.payload, { args }, `${method} must preserve its request`);
+    }
+    assert.deepEqual(db.listUserSessionGrants(subUser.id), ['session-visible']);
+  } finally {
+    cookie = originalCookie;
+  }
+});
+
+test('RC.1 未授权 parent 的子代理地址在到达 DSH 前被拒绝', async () => {
+  const subUser = db.createUser('rc1-subagent-denied-user', '$2a$10$dummyhashdummyhashdummyhashdu', 'user');
+  db.setPermissions(subUser.id, {
+    allowedFolders: ['/workspaces/visible'], hourlyTokenLimit: null, dailyMinutesLimit: null, allowUpload: true,
+    allowGitDownload: false, allowWorkspaceCreate: false, allowedWebSocketPaths: [], allowedAgentPresets: null,
+    banned: false, sandboxMode: null, disabledSessions: [], allowedSessionIds: ['session-visible'],
+  });
+  db.markSessionGrantsSeeded(subUser.id);
+  const subToken = jwt.sign({ sub: String(subUser.id), username: subUser.username, cv: 0 }, 'test-secret', { expiresIn: '12h' });
+  const originalCookie = cookie;
+  cookie = `dsh_gateway_token=${subToken}`;
+  const before = lastUpstreamUrl;
+  try {
+    const response = await gatewayReq(
+      'POST', '/api/session.page', { 'content-type': 'application/json' },
+      JSON.stringify({ type: 'client-request', rpcId: 'rpc-denied-parent', method: 'session/page', payload: { args: { request: {
+        address: { kind: 'subagent', parentSessionId: 'not-visible', childSessionId: 'child', mode: 'one-shot' }, throughSeq: 1,
+      } } } }),
+    );
+    assert.equal(response.status, 403, response.body);
+    assert.equal(lastUpstreamUrl, before, 'unauthorized subagent parent must not reach DSH');
+    for (const [method, args] of [
+      ['subagents/prompt', { request: { requestId: 'denied-request', parentSessionId: 'not-visible', childSessionId: 'child', mode: 'continuable', content: [{ type: 'text', text: 'denied' }] } }],
+      ['subagents/interruptByParent', { childSessionId: 'child', parentSessionId: 'not-visible', mode: 'continuable' }],
+    ] as const) {
+      const denied = await gatewayReq(
+        'POST', `/api/${method.replace('/', '.')}`, { 'content-type': 'application/json' },
+        JSON.stringify({ type: 'client-request', rpcId: `rpc-${method}-denied`, method, payload: { args } }),
+      );
+      assert.equal(denied.status, 403, `${method}: ${denied.body}`);
+      assert.equal(lastUpstreamUrl, before, `${method} must not reach DSH`);
+    }
+  } finally {
+    cookie = originalCookie;
+  }
 });
 
 test('Issue #25：Remote session/follow 不能只凭数据库 grant 绕过当前工作区基线', async () => {
@@ -1632,7 +2068,7 @@ test('Issue #13：子用户必须先获得主用户授予的 WebSocket 路径权
       adminOnlyWebSocketPaths: string[];
       users: Array<{ id: number; permissions: { allowedWebSocketPaths: string[] } }>;
     };
-    assert.deepEqual(overviewBody.availableWebSocketPaths, ['/plugin/ws/*']);
+    assert.deepEqual(overviewBody.availableWebSocketPaths, ['/plugin/ws/*', '/api/dsh-ssh/terminal']);
     assert.deepEqual(overviewBody.adminOnlyWebSocketPaths, ['/sidebar/ws/terminal']);
     assert.deepEqual(
       overviewBody.users.find((user) => user.id === subUser.id)?.permissions.allowedWebSocketPaths,

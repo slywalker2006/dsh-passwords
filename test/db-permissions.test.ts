@@ -39,6 +39,38 @@ test('Issue #19：显式会话 grant 原子持久化、隔离且拒绝非法 ID'
   }
 });
 
+test('SSH alias 认领按用户隔离、互斥并在重启后保留', () => {
+  const tempDir = mkdtempSync(path.join(os.tmpdir(), 'dshpw-ssh-owner-'));
+  const dbPath = path.join(tempDir, 'owners.db');
+  const crypto = createFieldCrypto('test-key', 'test-key');
+  const db = new Database(dbPath, crypto);
+  try {
+    db.init();
+    const first = db.createUser('ssh-owner-first', '$2a$10$dummyhashdummyhashdummyhashdu');
+    const second = db.createUser('ssh-owner-second', '$2a$10$dummyhashdummyhashdummyhashdu');
+    assert.equal(db.claimSshHost('work-host', first.id), true);
+    assert.equal(db.claimSshHost('work-host', second.id), false, '同一 alias 不得跨子用户认领');
+    assert.equal(db.getSshHostOwner('work-host'), first.id);
+    assert.deepEqual(db.listSshHostAliases(first.id), ['work-host']);
+    db.releaseSshHost('work-host', second.id);
+    assert.equal(db.getSshHostOwner('work-host'), first.id, '非 owner 不得释放 alias');
+    db.close();
+
+    const reopened = new Database(dbPath, crypto);
+    try {
+      reopened.init();
+      assert.equal(reopened.getSshHostOwner('work-host'), first.id, '认领关系必须跨重启持久化');
+      reopened.releaseSshHost('work-host', first.id);
+      assert.equal(reopened.getSshHostOwner('work-host'), null);
+    } finally {
+      reopened.close();
+    }
+  } finally {
+    try { db.close(); } catch { /* closed for reopen assertion */ }
+    rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
 test('极旧 user_permissions 表缺少上传与 git 列时会补齐并默认关闭', () => {
   const tempDir = mkdtempSync(path.join(os.tmpdir(), 'dshpw-db-legacy-upload-'));
   const dbPath = path.join(tempDir, 'legacy-upload.db');
@@ -62,6 +94,7 @@ test('极旧 user_permissions 表缺少上传与 git 列时会补齐并默认关
     const migrated = db.getPermissions(7);
     assert.equal(migrated?.allow_upload, false);
     assert.equal(migrated?.allow_git_download, false);
+    assert.equal(migrated?.allow_ssh, false);
   } finally {
     db.close();
     rmSync(tempDir, { recursive: true, force: true });
@@ -102,6 +135,7 @@ test('旧 user_permissions 表会迁移 WebSocket 授权列，并保留现有权
       allow_upload: true,
       allow_git_download: true,
       allow_workspace_create: false,
+      allow_ssh: false,
       allowed_websocket_paths: [],
       allowed_agent_presets: null,
       banned: false,

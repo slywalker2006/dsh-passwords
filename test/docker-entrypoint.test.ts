@@ -15,7 +15,7 @@ test('bundled entrypoint leaves gateway startup to the authenticated DSH plugin 
   assert.doesNotMatch(script, /DSH_UPSTREAM_AUTH_COOKIE/);
 });
 
-test('bundled Dockerfile allows alpha.5 runtime postinstall dependencies', () => {
+test('bundled Dockerfile allows rc.1 runtime postinstall dependencies', () => {
   const dockerfile = readFileSync(bundledDockerfile, 'utf8');
   assert.match(dockerfile, /'allowBuilds:'/);
   for (const dependency of ['@deepseek-ai/dsh-subprocess-local', '@google/genai', 'koffi', 'node-pty', 'protobufjs']) {

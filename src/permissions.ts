@@ -687,9 +687,40 @@ export function isGitRequest(pathname: string): boolean {
    return pathname === '/sidebar' || pathname.startsWith('/sidebar/');
  }
 
+/** SSH 插件路由族；子用户只有在 allowSsh 且 alias 归属当前用户时可访问。 */
+export function isSshPluginEndpoint(pathname: string): boolean {
+  return pathname === '/api/dsh-ssh' || pathname.startsWith('/api/dsh-ssh/');
+}
+
+/** SSH 不具备单 alias 归属的批量/导入能力，始终仅限主用户。 */
+export function isUnscopedSshEndpoint(pathname: string): boolean {
+  return pathname === '/api/dsh-ssh/hosts/import-ssh-config' ||
+    pathname === '/api/dsh-ssh/cluster' || pathname === '/api/dsh-ssh/tunnel';
+}
+
+/** 使用 query alias 的 SSH 操作；调用方必须在转发前检查归属。 */
+export function isSshAliasQueryEndpoint(pathname: string): boolean {
+  return pathname === '/api/dsh-ssh/ls' || pathname === '/api/dsh-ssh/download' || pathname === '/api/dsh-ssh/upload';
+}
+
+/** 使用 JSON body alias 的 SSH 操作；调用方必须在转发前检查归属。 */
+export function isSshAliasBodyEndpoint(pathname: string): boolean {
+  return pathname === '/api/dsh-ssh/test' || pathname === '/api/dsh-ssh/exec';
+}
+
+/** PTY terminal is a real WebSocket and carries its alias in the query string. */
+export function isSshTerminalEndpoint(pathname: string): boolean {
+  return pathname === '/api/dsh-ssh/terminal';
+}
+
+/** dsh-ssh 客户端只读的静态依赖，不携带 host 凭据或远端资源标识。 */
+export function isSshPublicAssetEndpoint(method: string, pathname: string): boolean {
+  return (method === 'GET' || method === 'HEAD') && pathname.startsWith('/api/dsh-ssh/vendor/');
+}
+
  /** 第三方插件“运维面”端点（仅主用户可访问）：
- *   - dsh-ssh —— SSH 主机清单/隧道/远程文件：含服务器连接信息（host/port/user/auth/keyReady），
- *     泄露即扩大 SSH 凭据面；
+ *   - dsh-ssh 的未纳入子用户 alias 授权的管理能力仍由网关单独拒绝；
+ *     可归属 alias 的 SSH 操作由 allowSsh 和 alias 归属规则控制；
  *   - skin-center —— 皮肤中心（未纳入网关权限模型）；
  *   - modlens —— 模型透镜（未纳入网关权限模型）；
  *   - dsh-uploads —— 共享上传存储的【列表/删除】（F-12）：枚举全部用户上传文件清单
@@ -699,8 +730,6 @@ export function isGitRequest(pathname: string): boolean {
  */
 export function isAdminOnlyPluginEndpoint(method: string, pathname: string): boolean {
   return (
-    pathname === '/api/dsh-ssh' ||
-    pathname.startsWith('/api/dsh-ssh/') ||
     pathname === '/api/skin-center' ||
     pathname.startsWith('/api/skin-center/') ||
     pathname === '/modlens' ||
@@ -799,7 +828,99 @@ export const WORKSPACE_ENDPOINT_RE = /^\/api\/session[.\/](create)([.\/]|$)/;
  * create 无源会话、list 单独做工作区/会话过滤，均不在此列。
  */
 export const SESSION_SCOPED_RE =
-  /^\/api\/(?:session[.\/](?:history|prompt|respond|archive|delete|rename|retitle|title|resume|fork|truncate|export|attachment|updateQueue|cancel|page|openWorkspacePath)|workspace[.\/]archiveSession|commands[.\/](?:list|execute)|subagents[.\/](?:list|prompt|interruptByParent))([.\/]|$)/;
+  /^\/api\/(?:session[.\/](?:history|prompt|respond|archive|delete|rename|retitle|title|resume|fork|truncate|export|attachment|updateQueue|cancel|page|openWorkspacePath)|workspace[.\/](?:archiveSession)|commands[.\/](?:list|execute)|subagents[.\/](?:list|prompt|interruptByParent))([.\/]|$)/;
+
+export type SessionAddress =
+  | { kind: 'session'; sessionId: string }
+  | {
+      kind: 'subagent';
+      parentSessionId: string;
+      childSessionId: string;
+      mode: 'one-shot' | 'continuable';
+    };
+
+/**
+ * Parse the RC.1 SessionAddress without changing any protocol fields. The
+ * gateway uses only the parent identity for authorization; DSH still receives
+ * and validates the complete address.
+ */
+export function parseSessionAddress(value: unknown): SessionAddress | null {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return null;
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) return null;
+  const row = value as Record<string, unknown>;
+  const validId = (id: unknown): id is string =>
+    typeof id === 'string' && id.length > 0 && id.length <= 200;
+  if (row.kind === 'session' && validId(row.sessionId)) {
+    return { kind: 'session', sessionId: row.sessionId };
+  }
+  if (
+    row.kind === 'subagent' &&
+    validId(row.parentSessionId) &&
+    validId(row.childSessionId) &&
+    (row.mode === 'one-shot' || row.mode === 'continuable')
+  ) {
+    return {
+      kind: 'subagent',
+      parentSessionId: row.parentSessionId,
+      childSessionId: row.childSessionId,
+      mode: row.mode,
+    };
+  }
+  return null;
+}
+
+/**
+ * Collect only the session identities that authorize a request. RC.1 child
+ * addresses intentionally contribute their parent ID, while the child ID and
+ * mode remain in the forwarded payload for DSH's own lineage validation.
+ * A malformed structured subagent request returns null so callers can reject
+ * it instead of falling back to recursive, ambiguous ID guessing.
+ */
+export function collectAuthorizedSessionIds(value: unknown): Set<string> | null {
+  const out = new Set<string>();
+  const visit = (current: unknown, depth: number): boolean => {
+    if (depth > 8 || current === null || typeof current !== 'object') return true;
+    if (Array.isArray(current)) return current.every((item) => visit(item, depth + 1));
+    const row = current as Record<string, unknown>;
+    if (Object.hasOwn(row, 'address')) {
+      const address = parseSessionAddress(row.address);
+      if (address === null) return false;
+      if (address.kind === 'session') out.add(address.sessionId);
+      else out.add(address.parentSessionId);
+    }
+    const hasSubagentFields = Object.hasOwn(row, 'parentSessionId') ||
+      Object.hasOwn(row, 'childSessionId');
+    if (hasSubagentFields) {
+      const hasChildFields = Object.hasOwn(row, 'childSessionId') || Object.hasOwn(row, 'mode');
+      if (hasChildFields) {
+        const address = parseSessionAddress({
+          kind: 'subagent',
+          parentSessionId: row.parentSessionId,
+          childSessionId: row.childSessionId,
+          mode: row.mode,
+        });
+        if (address === null || address.kind !== 'subagent') return false;
+        out.add(address.parentSessionId);
+      } else if (typeof row.parentSessionId === 'string') {
+        out.add(row.parentSessionId);
+      } else {
+        return false;
+      }
+    }
+    for (const [key, child] of Object.entries(row)) {
+      if (key === 'address' || key === 'parentSessionId' || key === 'childSessionId' || key === 'mode') continue;
+      if (key === 'sessionId' || key === 'agentId') {
+        if (typeof child !== 'string') return false;
+        out.add(child);
+        continue;
+      }
+      if (!visit(child, depth + 1)) return false;
+    }
+    return true;
+  };
+  return visit(value, 0) ? out : null;
+}
 
 /** 递归查找请求体里的 sessionId（typert wire 字段）；找不到返回 null */
 export function extractSessionId(value: unknown, depth = 0): string | null {
@@ -1075,6 +1196,28 @@ export function filterSessionItems(
     return out;
   }
   return value;
+}
+
+/**
+ * 过滤 rc.1 session.search 的结果项。
+ *
+ * 搜索结果只有 sessionId 与 snippet，没有 cwd；调用方必须先用当前用户的
+ * workspace/session 授权快照建立 keep 谓词。没有可验证 sessionId 的条目直接丢弃，
+ * 不能把未知结构当作可见结果透传。
+ */
+export function filterSessionSearchItems(
+  value: unknown,
+  keep: (id: string) => boolean,
+): unknown[] | null {
+  if (!Array.isArray(value)) return null;
+  const output: unknown[] = [];
+  for (const item of value) {
+    if (item === null || typeof item !== 'object' || Array.isArray(item)) continue;
+    const row = item as Record<string, unknown>;
+    if (typeof row.sessionId !== 'string' || row.sessionId.length === 0 || !keep(row.sessionId)) continue;
+    output.push({ ...row });
+  }
+  return output;
 }
 
 /** 请求体里可能携带目标路径的字段名（按优先级） */

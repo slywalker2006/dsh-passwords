@@ -4,7 +4,7 @@ services:
       context: ..
       dockerfile: docker/Dockerfile.bundled
       args:
-        DSH_VERSION: ${DSH_VERSION:-0.1.2-alpha.5}
+        DSH_VERSION: ${DSH_VERSION:-0.1.2-rc.1}
     restart: unless-stopped
     environment:
       DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:?set DEEPSEEK_API_KEY in docker/.env}

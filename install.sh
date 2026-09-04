@@ -105,8 +105,8 @@ else
   say "未找到 dsh（DeepSeek Harness），正在自动安装…"
   # dsh 依赖原生构建，npm 新版会拦截脚本，先放行再装
   npm config set allow-scripts=@deepseek-ai/dsh-subprocess-local,koffi,node-pty,@google/genai,protobufjs --location=user || true
-  npm install -g @deepseek-ai/dsh@0.1.2-alpha.5 || {
-    err "dsh 自动安装失败，请手动执行：npm install -g @deepseek-ai/dsh@0.1.2-alpha.5"
+  npm install -g @deepseek-ai/dsh@0.1.2-rc.1 || {
+    err "dsh 自动安装失败，请手动执行：npm install -g @deepseek-ai/dsh@0.1.2-rc.1"
     err "然后用 DEEPSEEK_API_KEY=sk-你的key dsh web 先跑一次确认能用，再重跑本脚本。"
     exit 1; }
   ok "dsh ✓"

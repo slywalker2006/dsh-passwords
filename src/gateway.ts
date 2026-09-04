@@ -49,6 +49,12 @@ import {
   isGitRequest,
   isAdminOnlyPluginEndpoint,
   isAdminOnlySidebarEndpoint,
+  isSshPluginEndpoint,
+  isUnscopedSshEndpoint,
+  isSshAliasQueryEndpoint,
+  isSshAliasBodyEndpoint,
+  isSshTerminalEndpoint,
+  isSshPublicAssetEndpoint,
   isAionuiFileRead,
   isAionuiFileWrite,
   isAionuiPanel,
@@ -73,12 +79,15 @@ import {
   SESSION_SCOPED_RE,
   extractSessionId,
   collectSessionIds,
+  collectAuthorizedSessionIds,
+  parseSessionAddress,
   clientConnectionArgs,
   replaceArchivedSessionSnapshot,
   collectArchivedSessionIds,
   filterArchivedSessionIds,
   filterOwnedSessionIds,
   filterSessionItems,
+  filterSessionSearchItems,
   sandboxPresetRank,
   permissionPresetFromCommand,
   presetFromSettingsMutate,
@@ -116,11 +125,18 @@ type Req = Request & {
   dshpwSelectedSessionId?: string;
   /** Preallocated session identity used to bridge the create/follow race. */
   dshpwCreatedSessionId?: string;
+  /** Alias reserved for a subuser's successful SSH host creation. */
+  dshpwSshClaimedAlias?: string;
 };
 
 const AGENT_PRESET_SELECT_RE = /^\/api\/agentPresets?[.\/]select$/;
 const AGENT_PRESET_LIST_RE = /^\/api\/agentPresets?[.\/]list$/;
 const AGENT_PRESET_MUTATION_RE = /^\/api\/agentPresets?[.\/](?:copy|openDocument|remove|read|deletePreset)$/;
+
+/** SSH alias is a plugin-global key; keep it opaque but exclude path/control syntax. */
+function isSafeSshAlias(value: string): boolean {
+  return value.length > 0 && value.length <= 256 && /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(value);
+}
 
 function rpcRequestPayload(value: unknown): Record<string, unknown> | null {
   const args = clientConnectionArgs(value);
@@ -1477,18 +1493,18 @@ export function createGatewayServer(
   // alpha.3 opens session/follow as { args: { request: { address }, maxMessages? } }.
   // It is a single ordinary-session history stream, not an empty control/workspace
   // subscription; accept only its exact address shape before checking its persisted grant.
-  const remoteMuxFollowSessionId = (payload: unknown): string | null => {
+  const remoteMuxFollowAddress = (payload: unknown): ReturnType<typeof parseSessionAddress> => {
     if (!isPlainJsonRecord(payload) || !isPlainJsonRecord(payload.args)) return null;
-    const args = payload.args;
-    const request = args.request;
+    const request = payload.args.request;
     if (!isPlainJsonRecord(request)) return null;
-    const address = request.address;
-    if (!isPlainJsonRecord(address) || address.kind !== 'session' || typeof address.sessionId !== 'string') return null;
-    if (address.sessionId.length === 0 || address.sessionId.length > 200) return null;
+    const address = parseSessionAddress(request.address);
+    if (address === null) return null;
     const maxMessages = request.maxMessages;
     if (maxMessages !== undefined && (typeof maxMessages !== 'number' || !Number.isInteger(maxMessages) || maxMessages < 1 || maxMessages > 1_000)) return null;
-    return address.sessionId;
+    return address;
   };
+  const sessionAuthorizationId = (address: NonNullable<ReturnType<typeof parseSessionAddress>>): string =>
+    address.kind === 'session' ? address.sessionId : address.parentSessionId;
   const remoteMuxEventSessionId = (event: string, args: unknown[]): string | null => {
     if (event === 'api-session/added') {
       const summary = args[0];
@@ -1922,6 +1938,7 @@ export function createGatewayServer(
         daily_minutes_limit: null,
         allow_upload: false,
         allow_workspace_create: false,
+        allow_ssh: false,
         allowed_websocket_paths: [],
         allowed_agent_presets: [],
         // F-12 残余：新子用户默认禁 git 下载（含 dsh-uploads/download 等外带通道），
@@ -2349,6 +2366,7 @@ export function createGatewayServer(
           allowUpload: perms.allow_upload,
           allowGitDownload: perms.allow_git_download,
           allowWorkspaceCreate: perms.allow_workspace_create,
+          allowSsh: perms.allow_ssh,
           allowedWebSocketPaths,
           allowedAgentPresets: perms.allowed_agent_presets,
           banned: perms.banned,
@@ -2560,6 +2578,8 @@ export function createGatewayServer(
     if (allowGitDownload === null) return;
     const allowWorkspaceCreate = readBooleanPermission('allowWorkspaceCreate', body.allowWorkspaceCreate, currentPermissions.allow_workspace_create);
     if (allowWorkspaceCreate === null) return;
+    const allowSsh = readBooleanPermission('allowSsh', body.allowSsh, currentPermissions.allow_ssh);
+    if (allowSsh === null) return;
     const banned = readBooleanPermission('banned', body.banned, currentPermissions.banned);
     if (banned === null) return;
     let sandboxMode: 'read-only' | 'workspace-write' | 'danger-full-access' | null;
@@ -2689,6 +2709,7 @@ export function createGatewayServer(
       allowUpload,
       allowGitDownload,
       allowWorkspaceCreate,
+      allowSsh,
       allowedWebSocketPaths,
       allowedAgentPresets,
       banned,
@@ -2746,6 +2767,7 @@ export function createGatewayServer(
         allowUpload,
         allowGitDownload,
         allowWorkspaceCreate,
+        allowSsh,
         allowedWebSocketPaths,
         allowedAgentPresets,
         banned,
@@ -3095,8 +3117,34 @@ export function createGatewayServer(
           res.status(403).type('html').send(forbiddenPage(lang, t(lang, 'gw.banned')));
           return;
         }
-        // F-09/F-12：第三方插件“运维面”端点（dsh-ssh 主机清单/隧道、skin-center、modlens、
-        // dsh-uploads 列表/删除等）不在网关权限模型内，对子用户一律 403（仅主用户可访问）
+        // 第三方 SSH 插件不是普通的 WebSocket/插件静态资源：它能执行远程命令、
+        // 访问 SFTP 和打开真实 PTY。allowSsh 只打开当前子用户自己创建并认领的
+        // alias 作用域，不能把整个 /api/dsh-ssh/** 变成共享管理员面。
+        if (isSshPluginEndpoint(requestPath)) {
+          const publicAsset = isSshPublicAssetEndpoint(req.method, requestPath);
+          const aliasQuery = parsed.searchParams.get('alias');
+          const aliasQueryValid = aliasQuery !== null && isSafeSshAlias(aliasQuery);
+          const ownedQueryAlias = aliasQueryValid && db.getSshHostOwner(aliasQuery) === user.userId;
+          const hostsList = req.method === 'GET' && requestPath === '/api/dsh-ssh/hosts';
+          const hostsCreate = req.method === 'POST' && requestPath === '/api/dsh-ssh/hosts';
+          const aliasQueryOperation = isSshAliasQueryEndpoint(requestPath);
+          const aliasBodyOperation = isSshAliasBodyEndpoint(requestPath);
+          if (
+            !perms.allow_ssh ||
+            isUnscopedSshEndpoint(requestPath) ||
+            (!publicAsset && !hostsList && !hostsCreate && !aliasQueryOperation && !aliasBodyOperation)
+          ) {
+            res.status(403).type('html').send(forbiddenPage(lang, t(lang, 'gw.adminOnly')));
+            return;
+          }
+          if ((aliasQueryOperation && (!aliasQueryValid || !ownedQueryAlias)) ||
+              (isSshTerminalEndpoint(requestPath) && (!aliasQueryValid || !ownedQueryAlias))) {
+            res.status(403).type('html').send(forbiddenPage(lang, t(lang, 'gw.adminOnly')));
+            return;
+          }
+        }
+        // F-09/F-12：其它第三方插件“运维面”（skin-center、modlens、dsh-uploads
+        // 列表/删除等）不在网关权限模型内，对子用户一律 403。
         if (isAdminOnlyPluginEndpoint(req.method, requestPath) || isAdminOnlySidebarEndpoint(requestPath)) {
           res.status(403).type('html').send(forbiddenPage(lang, t(lang, 'gw.adminOnly')));
           return;
@@ -3523,6 +3571,62 @@ export function createGatewayServer(
           return;
         }
 
+        // ── dsh-ssh 主机响应：子用户只看到自己认领的 alias ──
+        if (reqAs.dshpwUser !== undefined && reqAs.dshpwIsAdmin !== true &&
+            ((req.method === 'GET' && proxyPath === '/api/dsh-ssh/hosts') ||
+              (req.method === 'POST' && proxyPath === '/api/dsh-ssh/hosts'))) {
+          bufferUpstream(upstreamRes, res, (raw) => {
+            try {
+              const status = upstreamRes.statusCode ?? 500;
+              if (status < 200 || status >= 300) {
+                const respHeaders = headersForStreaming(upstreamRes.headers);
+                if (!res.headersSent) res.writeHead(status, respHeaders);
+                if (!res.writableEnded) res.end(raw);
+                return;
+              }
+              const decoded = decodeUpstreamBody(raw, String(upstreamRes.headers['content-encoding'] ?? ''));
+              const parsed: unknown = JSON.parse(decoded.toString('utf8'));
+              if (req.method === 'GET' && proxyPath === '/api/dsh-ssh/hosts') {
+                if (!isPlainJsonRecord(parsed) || !Array.isArray(parsed.hosts)) {
+                  if (!res.headersSent) res.status(502).type('text/plain').send('502 SSH host response unprocessable');
+                  return;
+                }
+                const hosts = parsed.hosts.filter((host): host is Record<string, unknown> =>
+                  isPlainJsonRecord(host) && typeof host.alias === 'string' &&
+                  isSafeSshAlias(host.alias) && db.getSshHostOwner(host.alias) === reqAs.dshpwUser,
+                );
+                const out = Buffer.from(JSON.stringify({ ...parsed, hosts }), 'utf8');
+                const respHeaders = headersForRewrittenBody(upstreamRes.headers);
+                respHeaders['content-length'] = String(out.length);
+                if (!res.headersSent) res.writeHead(upstreamRes.statusCode ?? 200, respHeaders);
+                if (!res.writableEnded) res.end(out);
+                return;
+              }
+              if (req.method === 'POST' && proxyPath === '/api/dsh-ssh/hosts') {
+                const userId = reqAs.dshpwUser;
+                const host = isPlainJsonRecord(parsed) && isPlainJsonRecord(parsed.host) ? parsed.host : null;
+                const alias = typeof host?.alias === 'string' && isSafeSshAlias(host.alias) ? host.alias : null;
+                if (userId === undefined) {
+                  if (!res.headersSent) res.status(502).type('text/plain').send('502 SSH owner context missing');
+                  return;
+                }
+                // dsh-ssh's documented create response is exactly { host: { alias, ... } }.
+                // Do not recursively accept an unrelated alias nested in a plugin error/debug payload.
+                if (alias === null || alias !== reqAs.dshpwSshClaimedAlias || !db.claimSshHost(alias, userId)) {
+                  if (!res.headersSent) res.status(409).type('text/plain').send('409 SSH host alias could not be claimed');
+                  return;
+                }
+              }
+              const respHeaders = headersForStreaming(upstreamRes.headers);
+              if (!res.headersSent) res.writeHead(upstreamRes.statusCode ?? 200, respHeaders);
+              if (!res.writableEnded) res.end(raw);
+            } catch {
+              if (!res.headersSent) res.status(502).type('text/plain').send('502 SSH host response unprocessable');
+            }
+          });
+          return;
+        }
+
         // ── workspace 管理响应：成功后同步工作区登记 ──
         // DSH Remote business failures also use HTTP 200. In particular,
         // workspace/create reports { created: false } when resolving an existing
@@ -3829,6 +3933,71 @@ export function createGatewayServer(
           return;
         }
 
+        // ── session.search 响应过滤：搜索结果携带 Session ID 与消息摘要 ──
+        // rc.1 的搜索是跨会话查询；DSH 上游只知道单一 Host，不知道网关子用户。
+        // 子用户必须等待自己的 workspace/follow 基线，再按显式 grant、禁用状态、
+        // 目录白名单和跨用户工作区所有权过滤结果。管理员保留原始搜索结果。
+        if (
+          reqAs.dshpwPerms !== undefined &&
+          reqAs.dshpwIsAdmin !== true &&
+          req.method === 'POST' &&
+          /^\/api\/session[.\/]search$/.test(proxyPath)
+        ) {
+          bufferUpstream(upstreamRes, res, async (raw) => {
+            try {
+              let body = raw;
+              const enc = String(upstreamRes.headers['content-encoding'] ?? '');
+              if (enc.includes('gzip')) body = gunzipBounded(body);
+              const parsed = JSON.parse(body.toString('utf8')) as unknown;
+              if (!isPlainJsonRecord(parsed) || !isPlainJsonRecord(parsed.result)) throw new Error('invalid search envelope');
+              const result = parsed.result;
+              // 业务失败仍按上游原始结果返回；只有成功结果需要做租户过滤。
+              if (result.ok !== true) {
+                const respHeaders = headersForStreaming(upstreamRes.headers);
+                if (!res.headersSent) res.writeHead(upstreamRes.statusCode ?? 200, respHeaders);
+                if (!res.writableEnded) res.end(raw);
+                return;
+              }
+              if (!isPlainJsonRecord(result.value) || typeof result.value.hasMore !== 'boolean') {
+                throw new Error('invalid search result');
+              }
+              const userId = reqAs.dshpwUser!;
+              if (!(await waitForUserSessionAccess(userId))) throw new Error('session access baseline unavailable');
+              const items = filterSessionSearchItems(
+                result.value.items,
+                (id) => {
+                  const perms = reqAs.dshpwPerms!;
+                  const access = userSessionAccessFor(userId);
+                  const sessionPath = access.get(id);
+                  return sessionPath !== undefined &&
+                    db.hasUserSessionGrant(userId, id) &&
+                    !perms.disabled_sessions.includes(id) &&
+                    folderAllowed(sessionPath, perms.allowed_folders) &&
+                    !workspaceOwnedByAnotherSubuser(userId, sessionPath);
+                },
+              );
+              if (items === null) throw new Error('invalid search items');
+              const filtered = {
+                ...parsed,
+                result: { ...result, value: { ...result.value, items } },
+              };
+              const out = Buffer.from(JSON.stringify(filtered), 'utf8');
+              const respHeaders = headersForRewrittenBody(upstreamRes.headers);
+              respHeaders['content-length'] = String(out.length);
+              if (!res.headersSent) res.writeHead(upstreamRes.statusCode ?? 200, respHeaders);
+              if (!res.writableEnded) res.end(out);
+            } catch (error) {
+              if (!res.headersSent) {
+                const msg = error instanceof OversizeResponseError
+                  ? '502 Upstream response too large'
+                  : '502 Upstream response unprocessable';
+                res.status(502).type('text/plain').send(msg);
+              }
+            }
+          });
+          return;
+        }
+
         // ── Agent preset 成功响应后登记会话当前 preset ──
         // DSH RPC 的业务失败可以使用 HTTP 200，因此必须解析 result.ok，不能只看状态码。
         if (req.method === 'POST' && AGENT_PRESET_SELECT_RE.test(proxyPath) && reqAs.dshpwAgentPreset !== undefined) {
@@ -4060,6 +4229,11 @@ export function createGatewayServer(
       reqAs.dshpwUser !== undefined &&
       (req.method === 'POST' || req.method === 'PATCH' || req.method === 'PUT') &&
       /^\/api\/dsh-ssh[.\/](hosts|test)([.\/]|$)/.test(proxyPath);
+    const needsSshPermissionCheck =
+      reqAs.dshpwUser !== undefined &&
+      reqAs.dshpwIsAdmin !== true &&
+      (req.method === 'POST' || req.method === 'PATCH' || req.method === 'PUT') &&
+      (proxyPath === '/api/dsh-ssh/hosts' || isSshAliasBodyEndpoint(proxyPath));
     // A Remote waterfall result is a separate browser HTTP RPC. Restrict it to
     // the subuser, client generation, and authorized session that received it.
     const needsRemoteEventResultCheck =
@@ -4067,7 +4241,7 @@ export function createGatewayServer(
       req.method === 'POST' &&
       proxyPath === '/api/$events/result';
 
-    if (needsFolderCheck || needsSandboxCheck || needsCommandCheck || needsApprovalCheck || needsOwnershipCheck || needsAgentPresetCheck || needsImageAttachmentCheck || needsSshHostCheck || needsRemoteEventResultCheck) {
+    if (needsFolderCheck || needsSandboxCheck || needsCommandCheck || needsApprovalCheck || needsOwnershipCheck || needsAgentPresetCheck || needsImageAttachmentCheck || needsSshHostCheck || needsSshPermissionCheck || needsRemoteEventResultCheck) {
       const chunks: Buffer[] = [];
       let size = 0;
       let settled = false;
@@ -4124,6 +4298,31 @@ export function createGatewayServer(
           upstreamReq.destroy();
           res.status(403).type('html').send(forbiddenPage(lang, t(lang, 'gw.noUpload')));
           return;
+        }
+
+        if (needsSshPermissionCheck) {
+          const row = isPlainJsonRecord(bodyObj) ? bodyObj : null;
+          const alias = row?.alias;
+          if (typeof alias !== 'string' || !isSafeSshAlias(alias)) {
+            upstreamReq.destroy();
+            res.status(400).type('text/plain').send('400 Invalid SSH alias');
+            return;
+          }
+          const owner = db.getSshHostOwner(alias);
+          if (proxyPath === '/api/dsh-ssh/hosts') {
+            // A host is claimable only after the upstream plugin confirms creation.
+            // An existing claim is never replaceable by another subuser.
+            if (owner !== null && owner !== reqAs.dshpwUser) {
+              upstreamReq.destroy();
+              res.status(403).type('html').send(forbiddenPage(lang, t(lang, 'gw.adminOnly')));
+              return;
+            }
+            reqAs.dshpwSshClaimedAlias = alias;
+          } else if (owner !== reqAs.dshpwUser) {
+            upstreamReq.destroy();
+            res.status(403).type('html').send(forbiddenPage(lang, t(lang, 'gw.adminOnly')));
+            return;
+          }
         }
 
         if (needsRemoteEventResultCheck) {
@@ -4349,7 +4548,7 @@ export function createGatewayServer(
 
         // 会话访问校验：子用户须命中显式授权快照且位于已开启工作区；逐会话关闭优先。
         if (needsOwnershipCheck && bodyObj !== null) {
-          const bodySessionIds = collectSessionIds(bodyObj);
+          const bodySessionIds = collectAuthorizedSessionIds(bodyObj) ?? new Set<string>();
           const querySessionId = parsedUrl.searchParams.get('sessionId');
           if (querySessionId !== null) bodySessionIds.add(querySessionId);
           const perms = reqAs.dshpwPerms!;
@@ -4611,11 +4810,26 @@ export function createGatewayServer(
       socket.destroy();
       return;
     }
-    // 终端/侧栏等运维能力在 HTTP 与 WebSocket 层使用同一管理员边界；
+    // SSH terminal 是第三方插件提供的真实 RFC 6455 PTY。它不走 Remote mux，
+    // 也不能由通用的 userAllowlist 单独放行：子用户必须显式开启 SSH，且 query
+    // alias 必须是该子用户通过网关创建并认领的主机。
+    if (userRole === 'user' && isSshTerminalEndpoint(gatePath)) {
+      const terminalUrl = new URL(req.url ?? '/', `http://${firstHeader(req.headers.host) || 'localhost'}`);
+      const alias = terminalUrl.searchParams.get('alias');
+      const perms = authUserId === null ? null : effectivePermissions(authUserId);
+      if (perms === null || !perms.allow_ssh || alias === null || !isSafeSshAlias(alias) ||
+          db.getSshHostOwner(alias) !== authUserId) {
+        socket.end('HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n');
+        return;
+      }
+    }
+    // 终端/侧栏等其它运维能力在 HTTP 与 WebSocket 层使用同一管理员边界；
     // 仅有路径授权并不意味着其 frame 协议可按工作区安全隔离。
-    if (userRole === 'user' && isAdminOnlySidebarEndpoint(gatePath)) {
-      socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
-      socket.destroy();
+    if (
+      userRole === 'user' &&
+      (isAdminOnlySidebarEndpoint(gatePath) || isAdminOnlyPluginEndpoint(req.method ?? 'GET', gatePath))
+    ) {
+      socket.end('HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n');
       return;
     }
     // rc.2 的 events.host/events.mux 是 downlink-only WebSocket；子用户走网关
@@ -4635,7 +4849,7 @@ export function createGatewayServer(
         // session/control/follow may arrive before workspace/follow. A grant
         // alone has no trustworthy cwd, so defer either session stream until
         // the workspace baseline has established the per-user ownership snapshot.
-        const pendingSessionStreams = new Map<string, { text: string; sessionId: string | null }>();
+        const pendingSessionStreams = new Map<string, { text: string; authorizationSessionId: string | null }>();
         const publishSessionAttachment = (sessionId: string, cwd: string): void => {
           if (!isSubuser || client.readyState !== WebSocket.OPEN) return;
           const perms = effectivePermissions(authUserId!);
@@ -4699,15 +4913,15 @@ export function createGatewayServer(
         const flushPendingSessionStreams = (): void => {
           if (isSubuser && userSessionAccess.get(authUserId!) === undefined) return;
           for (const [streamId, pendingStream] of pendingSessionStreams) {
-            if (isSubuser && pendingStream.sessionId !== null) {
+            if (isSubuser && pendingStream.authorizationSessionId !== null) {
               const perms = effectivePermissions(authUserId!);
               const access = userSessionAccess.get(authUserId!);
-              const sessionPath = access?.get(pendingStream.sessionId);
+              const sessionPath = access?.get(pendingStream.authorizationSessionId);
               if (
                 access === undefined ||
                 sessionPath === undefined ||
-                perms.disabled_sessions.includes(pendingStream.sessionId) ||
-                !db.hasUserSessionGrant(authUserId!, pendingStream.sessionId) ||
+                perms.disabled_sessions.includes(pendingStream.authorizationSessionId) ||
+                !db.hasUserSessionGrant(authUserId!, pendingStream.authorizationSessionId) ||
                 !folderAllowed(sessionPath, perms.allowed_folders) ||
                 workspaceOwnedByAnotherSubuser(authUserId!, sessionPath)
               ) {
@@ -4729,19 +4943,20 @@ export function createGatewayServer(
             if (active.size >= REMOTE_MUX_MAX_STREAMS) { closeBoth(1008, 'too many Remote streams'); return; }
             if (isSubuser) {
               if (frame.endpoint === 'session/follow') {
-                const sessionId = remoteMuxFollowSessionId(frame.payload);
+                const address = remoteMuxFollowAddress(frame.payload);
+                const authorizationSessionId = address === null ? null : sessionAuthorizationId(address);
                 const perms = effectivePermissions(authUserId!);
                 const access = userSessionAccess.get(authUserId!);
-                const sessionPath = sessionId === null || access === undefined ? undefined : access.get(sessionId);
+                const sessionPath = authorizationSessionId === null || access === undefined ? undefined : access.get(authorizationSessionId);
                 const sessionDeniedAfterBaseline =
                   access !== undefined &&
                   (sessionPath === undefined ||
                     !folderAllowed(sessionPath, perms.allowed_folders) ||
                     workspaceOwnedByAnotherSubuser(authUserId!, sessionPath));
                 if (
-                  sessionId === null ||
-                  perms.disabled_sessions.includes(sessionId) ||
-                  !db.hasUserSessionGrant(authUserId!, sessionId) ||
+                  authorizationSessionId === null ||
+                  perms.disabled_sessions.includes(authorizationSessionId) ||
+                  !db.hasUserSessionGrant(authUserId!, authorizationSessionId) ||
                   sessionDeniedAfterBaseline
                 ) {
                   closeBoth(1008, 'Remote session not available for this user');
@@ -4779,7 +4994,12 @@ export function createGatewayServer(
           if (deferUntilWorkspaceBaseline && frame.type === 'open') {
             pendingSessionStreams.set(frame.streamId, {
               text,
-              sessionId: frame.endpoint === 'session/follow' ? remoteMuxFollowSessionId(frame.payload) : null,
+              authorizationSessionId: frame.endpoint === 'session/follow'
+                ? (() => {
+                    const address = remoteMuxFollowAddress(frame.payload);
+                    return address === null ? null : sessionAuthorizationId(address);
+                  })()
+                : null,
             });
             return;
           }
@@ -4864,15 +5084,17 @@ export function createGatewayServer(
       gatePath === '/plugins/events' ||
       gatePath === '/aionui-panel/events' ||
       gatePath.startsWith('/aionui-panel/events/');
-    const wsAccess = webSocketAccessForPath(
-      gatePath,
-      userRole === 'admin'
-        ? [...adminOnlyWebSocketPaths, ...userGrantableWebSocketPaths]
-        : userGrantableWebSocketPaths,
-      userWebSocketGrants,
-      userRole ?? 'user',
-      builtinWsPath,
-    );
+    const wsAccess = userRole === 'user' && isSshTerminalEndpoint(gatePath)
+      ? 'allow'
+      : webSocketAccessForPath(
+        gatePath,
+        userRole === 'admin'
+          ? [...adminOnlyWebSocketPaths, ...userGrantableWebSocketPaths]
+          : userGrantableWebSocketPaths,
+        userWebSocketGrants,
+        userRole ?? 'user',
+        builtinWsPath,
+      );
     if (wsAccess === 'deny') {
       socket.write('HTTP/1.1 404 Not Found\r\n\r\n');
       socket.destroy();

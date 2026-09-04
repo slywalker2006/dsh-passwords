@@ -117,13 +117,17 @@ const SERVICE_NAME_RE = /^[A-Za-z0-9_.@-]+$/;
 const EXIT_DSH_ROOT_UNAVAILABLE = 34;
 const EXIT_ALPHA3_SETTINGS_UNAVAILABLE = 35;
 const EXIT_PATCH_VERIFICATION_FAILED = 36;
+const DSH_REMOTE_COOKIE_BRIDGE_RE =
+  /^0\.1\.2-(?:alpha\.(?:[3-9]|[1-9][0-9]+)|rc\.(?:[1-9][0-9]*))$/;
 
 function requiresCookieBridge(dshRoot: string): boolean {
   try {
     const packageJson = JSON.parse(readFileSync(path.join(dshRoot, 'package.json'), 'utf8')) as { version?: unknown };
-    // alpha.3 changed the client module/connection contract. Its public Host API
-    // still has no cookie export, so a missing private bridge must fail closed.
-    return typeof packageJson.version === 'string' && /^0\.1\.2-alpha\.(?:[3-9]|[1-9][0-9]+)$/.test(packageJson.version);
+    // alpha.3 and the 0.1.2 rc releases changed the client module/connection
+    // contract. Their public Host API still has no cookie export, so a missing
+    // private bridge must fail closed. Keep this range bounded to the known
+    // 0.1.2 layouts instead of forcing an unverified future DSH through it.
+    return typeof packageJson.version === 'string' && DSH_REMOTE_COOKIE_BRIDGE_RE.test(packageJson.version);
   } catch {
     return false;
   }
@@ -270,11 +274,11 @@ async function boot() {
     const status = patchStatus(root);
     if (requiresCookieBridge(root)) {
       if (!status.settingsHostMode) {
-        console.error('[dsh-passwords] alpha.3 settings patch is missing or unsupported; refusing to start the public gateway');
+        console.error('[dsh-passwords] DSH 0.1.2 alpha/rc settings patch is missing or unsupported; refusing to start the public gateway');
         process.exit(EXIT_ALPHA3_SETTINGS_UNAVAILABLE);
       }
       if (status.connectionCookieBridge !== 'patched' && status.connectionCookieBridge !== 'native') {
-        console.error('[dsh-passwords] alpha.3 requires an authenticated Cookie bridge; refusing to start the public gateway');
+        console.error('[dsh-passwords] DSH 0.1.2 alpha/rc requires an authenticated Cookie bridge; refusing to start the public gateway');
         process.exit(33);
       }
     }

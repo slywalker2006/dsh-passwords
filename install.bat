@@ -111,7 +111,7 @@ if not errorlevel 1 goto dsh_ok
 echo [dsh-passwords] dsh (DeepSeek Harness) not found, installing...
 rem dsh needs native builds; newer npm blocks install scripts, allow them first
 call npm config set allow-scripts=@deepseek-ai/dsh-subprocess-local,koffi,node-pty,@google/genai,protobufjs --location=user
-call npm install -g @deepseek-ai/dsh@0.1.2-alpha.5
+call npm install -g @deepseek-ai/dsh@0.1.2-rc.1
 if errorlevel 1 goto dsh_manual
 where dsh >nul 2>nul
 if errorlevel 1 (
@@ -126,7 +126,7 @@ goto prepare_dest
 
 :dsh_manual
 echo [dsh-passwords] dsh auto-install failed. Run it manually:
-echo [dsh-passwords]   npm install -g @deepseek-ai/dsh@0.1.2-alpha.5
+echo [dsh-passwords]   npm install -g @deepseek-ai/dsh@0.1.2-rc.1
 echo [dsh-passwords] then verify with: DEEPSEEK_API_KEY=sk-your-key dsh web
 echo [dsh-passwords] and run this installer again.
 exit /b 1
