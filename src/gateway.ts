@@ -1369,9 +1369,14 @@ export function createGatewayServer(
     return Buffer.from(JSON.stringify(envelope), 'utf8');
   };
 
-  const REMOTE_MUX_MAX_PAYLOAD_BYTES = 1 * 1024 * 1024;
+  // Keep the carrier limit aligned with ws's default and the official DSH RC.1
+  // gateway. History snapshots are one Remote item and can legitimately exceed
+  // 1 MiB after compaction; request queue limits remain independent below.
+  const REMOTE_MUX_MAX_PAYLOAD_BYTES = 100 * 1024 * 1024;
   const REMOTE_MUX_MAX_STREAMS = 64;
   const REMOTE_MUX_MAX_PENDING_BYTES = 2 * 1024 * 1024;
+  const REMOTE_MUX_HEARTBEAT_INTERVAL_MS = 2_000;
+  const REMOTE_MUX_MAX_MISSED_HEARTBEATS = 2;
 
   const upstreamWsOptions = (): {
     headers: Record<string, string>;
@@ -1392,15 +1397,15 @@ export function createGatewayServer(
   });
 
   /**
-   * alpha Remote mux 第一阶段适配：管理员使用经过协议校验的透明 stream bridge。
-   * 子用户不得走此路径，直到完成 streamId→endpoint→资源的完整授权过滤。
-   * 不能把此协议当作普通 WebSocket pipe：未知 endpoint、非法 frame、未知 stream
-   * ID 和上游畸形响应全部 fail-closed。
+   * RC.1 Remote mux bridge. Administrators may use registered Remote endpoints;
+   * subusers additionally pass the per-stream resource filters below.
+   * The carrier is intentionally terminated here so authentication and ownership
+   * checks remain enforceable, while heartbeat and payload limits mirror DSH.
    */
   const remoteMuxStreamEndpoints = new Set(['session/control', 'session/follow', 'workspace/follow', '$events']);
   const isRemoteMuxStreamId = (value: unknown): value is string =>
     typeof value === 'string' && value.length > 0 && value.length <= 200 && /^[A-Za-z0-9_-]+$/.test(value);
-  const parseRemoteMuxClientFrame = (data: Buffer):
+  const parseRemoteMuxClientFrame = (data: Buffer, allowRegisteredEndpoint: boolean):
     | { type: 'open'; streamId: string; endpoint: string; payload: unknown }
     | { type: 'cancel'; streamId: string }
     | null => {
@@ -1413,7 +1418,8 @@ export function createGatewayServer(
     }
     if (
       row.type === 'open' && Object.keys(row).length === 4 && isRemoteMuxStreamId(row.streamId) &&
-      typeof row.endpoint === 'string' && remoteMuxStreamEndpoints.has(row.endpoint) &&
+      typeof row.endpoint === 'string' && row.endpoint.length > 0 &&
+      (allowRegisteredEndpoint || remoteMuxStreamEndpoints.has(row.endpoint)) &&
       row.payload !== undefined
     ) {
       return { type: 'open', streamId: row.streamId, endpoint: row.endpoint, payload: row.payload };
@@ -1452,6 +1458,10 @@ export function createGatewayServer(
     endpoint: 'session/control' | 'session/follow' | 'workspace/follow' | '$events';
     /** Workspace path is retained only to re-check the current permission on each delta. */
     visibleWorkspaces: Map<string, string>;
+    /** Authorized ordinary session or child session identity for session/follow. */
+    followAddress?: ReturnType<typeof parseSessionAddress>;
+    /** Exactly one alpha.1 snapshot must precede history/live frames. */
+    followSnapshotSeen?: boolean;
     /** Last filtered workspace rows, used for a compensating attach after session/create. */
     visibleWorkspaceRows: Map<string, Record<string, unknown>>;
     /** The protocol has one bootstrap item; later ready frames are never data-plane events. */
@@ -1500,11 +1510,34 @@ export function createGatewayServer(
     const address = parseSessionAddress(request.address);
     if (address === null) return null;
     const maxMessages = request.maxMessages;
-    if (maxMessages !== undefined && (typeof maxMessages !== 'number' || !Number.isInteger(maxMessages) || maxMessages < 1 || maxMessages > 1_000)) return null;
+    if (maxMessages !== undefined && (typeof maxMessages !== 'number' || !Number.isSafeInteger(maxMessages) || maxMessages < 1)) return null;
     return address;
   };
   const sessionAuthorizationId = (address: NonNullable<ReturnType<typeof parseSessionAddress>>): string =>
     address.kind === 'session' ? address.sessionId : address.parentSessionId;
+  const sessionFollowTargetId = (address: NonNullable<ReturnType<typeof parseSessionAddress>>): string =>
+    address.kind === 'session' ? address.sessionId : address.childSessionId;
+  const sessionFollowIdentityAllowed = (userId: number, address: NonNullable<ReturnType<typeof parseSessionAddress>>): boolean => {
+    const perms = effectivePermissions(userId);
+    const authorizationId = sessionAuthorizationId(address);
+    const access = userSessionAccess.get(userId);
+    const sessionPath = access?.get(authorizationId);
+    return sessionPath !== undefined &&
+      db.hasUserSessionGrant(userId, authorizationId) &&
+      !perms.disabled_sessions.includes(authorizationId) &&
+      folderAllowed(sessionPath, perms.allowed_folders) &&
+      !workspaceOwnedByAnotherSubuser(userId, sessionPath);
+  };
+  const sessionFollowSnapshotMatches = (address: NonNullable<ReturnType<typeof parseSessionAddress>>, value: unknown): boolean => {
+    if (!isPlainJsonRecord(value) || value.type !== 'snapshot' || !isPlainJsonRecord(value.header)) return false;
+    const header = value.header;
+    const targetId = sessionFollowTargetId(address);
+    if (header.id !== targetId) return false;
+    if (address.kind === 'subagent') {
+      return header.origin === 'subagent' && header.parentSession === address.parentSessionId;
+    }
+    return header.origin !== 'subagent';
+  };
   const remoteMuxEventSessionId = (event: string, args: unknown[]): string | null => {
     if (event === 'api-session/added') {
       const summary = args[0];
@@ -1606,10 +1639,21 @@ export function createGatewayServer(
       const { cwd: _cwd, parentSessionId: _parentSessionId, ...safeSummary } = summary;
       return { ...value, args: [safeSummary, ...value.args.slice(1)] };
     }
-    // session/follow is opened only after its request sessionId was checked
-    // against the user's persisted explicit grant. Keeping this independent of
-    // the transient workspace baseline is necessary during alpha.3 reconnect.
-    if (state.endpoint === 'session/follow') return value;
+    // session/follow is opened only after its request address was checked. The
+    // alpha.1 snapshot still carries the authoritative target header, so verify
+    // it before forwarding any v2 records or assistant-stream state. Later
+    // frames stay bound to the same authorized stream; if the grant is revoked,
+    // the carrier is closed by the permission-save path and this check drops
+    // anything racing behind that close.
+    if (state.endpoint === 'session/follow') {
+      const address = state.followAddress;
+      if (address === null || address === undefined || !sessionFollowIdentityAllowed(userId, address)) return null;
+      if (!state.followSnapshotSeen) {
+        if (!sessionFollowSnapshotMatches(address, value)) return null;
+        state.followSnapshotSeen = true;
+      }
+      return value;
+    }
     const access = userSessionAccess.get(userId);
     const currentGrants = new Set(db.listUserSessionGrants(userId));
     const pending = pendingCreatedSessions.get(userId);
@@ -2669,7 +2713,7 @@ export function createGatewayServer(
       return;
     }
     const previousAllowedSessionIds = db.listUserSessionGrants(userId);
-    const allowedSessionIds = body.allowedSessionIds === undefined
+    let allowedSessionIds = body.allowedSessionIds === undefined
       ? previousAllowedSessionIds
       : [...new Set(body.allowedSessionIds as string[])];
     // Explicit assignment is a security-sensitive write. The DSH plugin owns
@@ -2682,10 +2726,19 @@ export function createGatewayServer(
         res.status(502).json({ ok: false, code: 'RESOURCES_UNAVAILABLE', error: '可分配资源暂不可用' });
         return;
       }
-      const invalidSession = allowedSessionIds.find((id) => !resources.sessions.has(id));
+      const previousGrants = new Set(previousAllowedSessionIds);
+      const staleSessionIds = allowedSessionIds.filter((id) => !resources.sessions.has(id) && previousGrants.has(id));
+      const invalidSession = allowedSessionIds.find((id) => !resources.sessions.has(id) && !previousGrants.has(id));
       if (invalidSession !== undefined) {
         res.status(400).json({ ok: false, code: 'SESSION_NOT_ASSIGNABLE', error: '会话不存在、已归档或当前不可分配' });
         return;
+      }
+      if (staleSessionIds.length > 0) {
+        // 历史 grant 可能在 DSH 中被归档/删除后仍留在数据库，或被旧客户端
+        // 保存回草稿。清理这类永不生效的授权，避免它阻塞同一请求中的有效会话；
+        // 从未授权过的未知 ID 仍在上面 fail-closed，不能借此扩大授权。
+        const stale = new Set(staleSessionIds);
+        allowedSessionIds = allowedSessionIds.filter((id) => !stale.has(id));
       }
       if (!denyAll && allowedFolders.some((folder) => !resources.folders.has(normalizePath(folder)))) {
         res.status(400).json({ ok: false, code: 'WORKSPACE_NOT_ASSIGNABLE', error: '工作区不存在或当前不可分配' });
@@ -3462,6 +3515,22 @@ export function createGatewayServer(
     const upstreamSearch = stripGatewayAuthQuery(req.originalUrl, proxyPath);
     // 请求上挂的用户/权限（子用户才有）
     const reqAs = req as Req;
+    // alpha.1 的 uploadFileBinary 是 Connection 注册的独立原始字节流，
+    // 不会进入后面的 JSON ownership 检查。它必须在 pipe 到上游之前完成
+    // sessionId 授权，否则 allow_upload=true 会变成“可向任意已知会话上传”。
+    if (
+      reqAs.dshpwUser !== undefined &&
+      reqAs.dshpwIsAdmin !== true &&
+      req.method === 'POST' &&
+      proxyPath === '/api/session/uploadFileBinary'
+    ) {
+      const sessionId = parsedUrl.searchParams.get('sessionId');
+      const address = sessionId === null ? null : parseSessionAddress({ kind: 'session', sessionId });
+      if (address === null || !sessionFollowIdentityAllowed(reqAs.dshpwUser, address)) {
+        res.status(403).type('html').send(forbiddenPage(langOf(req), t(langOf(req), 'gw.folderDenied')));
+        return;
+      }
+    }
     // rc.2 client-connection 的统一 carrier 上限：管理员和子用户保持同一平台契约。
     // 先检查声明长度，避免接收必然超限的请求体；无 Content-Length 的请求仍由
     // 下方权限检查分支在实际收包时执行同一上限。
@@ -3980,6 +4049,62 @@ export function createGatewayServer(
               const filtered = {
                 ...parsed,
                 result: { ...result, value: { ...result.value, items } },
+              };
+              const out = Buffer.from(JSON.stringify(filtered), 'utf8');
+              const respHeaders = headersForRewrittenBody(upstreamRes.headers);
+              respHeaders['content-length'] = String(out.length);
+              if (!res.headersSent) res.writeHead(upstreamRes.statusCode ?? 200, respHeaders);
+              if (!res.writableEnded) res.end(out);
+            } catch (error) {
+              if (!res.headersSent) {
+                const msg = error instanceof OversizeResponseError
+                  ? '502 Upstream response too large'
+                  : '502 Upstream response unprocessable';
+                res.status(502).type('text/plain').send(msg);
+              }
+            }
+          });
+          return;
+        }
+
+        // ── sessionReferenceResolver/candidates 响应过滤 ──
+        // The request's agentId only identifies the caller's current Session; the
+        // result is deliberately cross-session discovery. Filter every candidate
+        // against the same persisted grant, cwd and ownership rules as session/search.
+        if (
+          reqAs.dshpwPerms !== undefined &&
+          reqAs.dshpwIsAdmin !== true &&
+          req.method === 'POST' &&
+          proxyPath === '/api/sessionReferenceResolver/candidates'
+        ) {
+          bufferUpstream(upstreamRes, res, (raw) => {
+            try {
+              const body = decodeUpstreamBody(raw, String(upstreamRes.headers['content-encoding'] ?? ''));
+              const parsed = JSON.parse(body.toString('utf8')) as unknown;
+              if (!isPlainJsonRecord(parsed) || !isPlainJsonRecord(parsed.result)) throw new Error('invalid session reference envelope');
+              const result = parsed.result;
+              if (result.ok !== true) {
+                const respHeaders = headersForStreaming(upstreamRes.headers);
+                if (!res.headersSent) res.writeHead(upstreamRes.statusCode ?? 200, respHeaders);
+                if (!res.writableEnded) res.end(raw);
+                return;
+              }
+              if (!Array.isArray(result.value)) throw new Error('invalid session reference result');
+              const userId = reqAs.dshpwUser!;
+              const perms = reqAs.dshpwPerms!;
+              const access = userSessionAccessFor(userId);
+              const visible = result.value.filter((candidate): candidate is Record<string, unknown> => {
+                if (!isPlainJsonRecord(candidate) || typeof candidate.sessionId !== 'string') return false;
+                const sessionPath = access.get(candidate.sessionId);
+                return sessionPath !== undefined &&
+                  db.hasUserSessionGrant(userId, candidate.sessionId) &&
+                  !perms.disabled_sessions.includes(candidate.sessionId) &&
+                  folderAllowed(sessionPath, perms.allowed_folders) &&
+                  !workspaceOwnedByAnotherSubuser(userId, sessionPath);
+              }).map((candidate) => ({ ...candidate }));
+              const filtered = {
+                ...parsed,
+                result: { ...result, value: visible },
               };
               const out = Buffer.from(JSON.stringify(filtered), 'utf8');
               const respHeaders = headersForRewrittenBody(upstreamRes.headers);
@@ -4832,10 +4957,9 @@ export function createGatewayServer(
       socket.end('HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n');
       return;
     }
-    // rc.2 的 events.host/events.mux 是 downlink-only WebSocket；子用户走网关
-    // 协议过滤适配器，remote.mux 在 rc.2 不存在，仍默认拒绝。
-    // alpha.1 的所有 stream Remote 共用 /api/remote.mux。第一阶段只开放管理员；
-    // 子用户必须等完成 workspace/session/preset 逐帧授权后再开放，不能透明放行。
+    // RC.1's Remote streams share one physical /api/remote.mux carrier.
+    // Keep the administrator path compatible with registered plugin streams;
+    // subusers still require the resource-aware filtering below.
     if (gatePath === '/api/remote.mux') {
       const isSubuser = userRole === 'user';
       const wsServer = new WebSocket.WebSocketServer({ noServer: true, maxPayload: REMOTE_MUX_MAX_PAYLOAD_BYTES });
@@ -4844,6 +4968,9 @@ export function createGatewayServer(
         const upstreamWs = new WebSocket.WebSocket(endpointUrl, upstreamWsOptions());
         const active = new Map<string, RemoteMuxUserStreamState | null>();
         let upstreamOpen = false;
+        let clientMissedHeartbeats = 0;
+        let upstreamMissedHeartbeats = 0;
+        let heartbeat: NodeJS.Timeout | undefined;
         const pending: string[] = [];
         let pendingBytes = 0;
         // session/control/follow may arrive before workspace/follow. A grant
@@ -4892,10 +5019,41 @@ export function createGatewayServer(
             remoteMuxClientsByUser.delete(authUserId!);
           }
         };
-        const closeBoth = (code?: number, reason?: string): void => {
-          try { if (client.readyState === WebSocket.OPEN) client.close(code, reason); } catch {}
-          try { upstreamWs.close(); } catch {}
+        const stopHeartbeat = (): void => {
+          if (heartbeat === undefined) return;
+          clearInterval(heartbeat);
+          heartbeat = undefined;
         };
+        const closeBoth = (code?: number, reason?: string): void => {
+          stopHeartbeat();
+          try { if (client.readyState === WebSocket.OPEN) client.close(code, reason); else client.terminate(); } catch {}
+          try { if (upstreamWs.readyState === WebSocket.OPEN) upstreamWs.close(code, reason); else upstreamWs.terminate(); } catch {}
+        };
+        const startHeartbeat = (): void => {
+          if (heartbeat !== undefined) return;
+          heartbeat = setInterval(() => {
+            if (client.readyState === WebSocket.OPEN) {
+              if (clientMissedHeartbeats >= REMOTE_MUX_MAX_MISSED_HEARTBEATS) {
+                closeBoth(1011, 'Remote stream heartbeat timed out');
+                return;
+              }
+              clientMissedHeartbeats += 1;
+              try { client.ping(); } catch { closeBoth(1011, 'Remote stream heartbeat failed'); return; }
+            }
+            if (upstreamWs.readyState === WebSocket.OPEN) {
+              if (upstreamMissedHeartbeats >= REMOTE_MUX_MAX_MISSED_HEARTBEATS) {
+                closeBoth(1011, 'Remote stream heartbeat timed out');
+                return;
+              }
+              upstreamMissedHeartbeats += 1;
+              try { upstreamWs.ping(); } catch { closeBoth(1011, 'Remote stream heartbeat failed'); }
+            }
+          }, REMOTE_MUX_HEARTBEAT_INTERVAL_MS);
+          heartbeat.unref();
+        };
+        client.on('pong', () => { clientMissedHeartbeats = 0; });
+        upstreamWs.on('pong', () => { upstreamMissedHeartbeats = 0; });
+        startHeartbeat();
         const queueUpstreamFrame = (text: string): boolean => {
           const textBytes = Buffer.byteLength(text);
           if (!upstreamOpen || upstreamWs.readyState !== WebSocket.OPEN) {
@@ -4935,7 +5093,7 @@ export function createGatewayServer(
         };
         client.on('message', (data: Buffer, isBinary: boolean) => {
           if (isBinary) { closeBoth(1003, 'text messages required'); return; }
-          const frame = parseRemoteMuxClientFrame(Buffer.from(data));
+          const frame = parseRemoteMuxClientFrame(Buffer.from(data), !isSubuser);
           if (frame === null) { closeBoth(1008, 'invalid Remote stream request'); return; }
           let deferUntilWorkspaceBaseline = false;
           if (frame.type === 'open') {
@@ -4977,6 +5135,7 @@ export function createGatewayServer(
               active.set(frame.streamId, {
                 streamId: frame.streamId,
                 endpoint: frame.endpoint as RemoteMuxUserStreamState['endpoint'],
+                followAddress: frame.endpoint === 'session/follow' ? remoteMuxFollowAddress(frame.payload) : undefined,
                 visibleWorkspaces: new Map(),
                 visibleWorkspaceRows: new Map(),
               });
@@ -5007,6 +5166,7 @@ export function createGatewayServer(
           if (frame.type === 'cancel') active.delete(frame.streamId);
         });
         client.on('close', () => {
+          stopHeartbeat();
           unregisterClient();
           if (isSubuser) {
             const clientIds = new Set<string>();
@@ -5035,6 +5195,13 @@ export function createGatewayServer(
           if (client.readyState !== WebSocket.OPEN) return;
           if (frame.type === 'item' && state !== null) {
             const filtered = filterRemoteMuxUserItem(authUserId!, effectivePermissions(authUserId!), state, frame.value);
+            // A session/follow stream cannot make progress without its opening
+            // snapshot. Treat an invalid/mismatched snapshot as a protocol
+            // failure for the carrier instead of silently hanging the browser.
+            if (filtered === null && state.endpoint === 'session/follow' && state.followSnapshotSeen !== true) {
+              closeBoth(1011, 'invalid session follow snapshot');
+              return;
+            }
             if (filtered === null) return;
             client.send(JSON.stringify({ type: 'item', streamId: frame.streamId, value: filtered }));
             if (
@@ -5050,7 +5217,10 @@ export function createGatewayServer(
           if (frame.type === 'end' || frame.type === 'error') active.delete(frame.streamId);
         });
         upstreamWs.on('error', () => closeBoth(1011, 'upstream error'));
-        upstreamWs.on('close', () => { if (client.readyState === WebSocket.OPEN) client.close(1011, 'upstream closed'); });
+        upstreamWs.on('close', () => {
+          stopHeartbeat();
+          if (client.readyState === WebSocket.OPEN) client.close(1011, 'upstream closed');
+        });
       });
       return;
     }

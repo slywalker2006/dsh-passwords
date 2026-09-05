@@ -69,7 +69,7 @@ async function mountCard(t: TestContext, overrides: Record<string, () => Respons
     '/gateway/api/overview': { me, users: [], availableWebSocketPaths: [] },
     '/api/dsh-passwords/workspaces': { workspaces: [] },
     '/api/dsh-passwords/patch/status': {
-      status: { settingsHostMode: true, whitelist: true, workspaceSearch: true, bindAll: true, connectionCookieBridge: 'patched' },
+      status: { settingsHostMode: true, workspaceSearch: true, bindAll: true, connectionCookieBridge: 'patched' },
     },
     '/api/dsh-passwords/update/status': { status: updateStatus },
     '/api/dsh-passwords/agent-presets': { presets: [] },
@@ -223,7 +223,7 @@ test('settings card stays mounted when login expires during refresh', async (t) 
 for (const [label, payload] of [
   ['missing', {}],
   ['null', { status: null }],
-  ['malformed', { status: { settingsHostMode: 'true', whitelist: true, workspaceSearch: true, bindAll: true, connectionCookieBridge: 'patched' } }],
+  ['malformed', { status: { settingsHostMode: 'true', workspaceSearch: true, bindAll: true, connectionCookieBridge: 'patched' } }],
 ] as const) {
   test(`settings card shows unknown for ${label} patch status`, async (t) => {
     const card = await mountCard(t, {

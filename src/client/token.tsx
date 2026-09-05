@@ -13,7 +13,7 @@
 // 由网关按小时窗口累计后做子用户每小时 token 配额判定。首次观测值只作为基线
 // 不计费（避免重开会话/重挂载重复计费）。组件渲染 null，不影响 dsh 界面。
 import { useEffect, useRef } from 'react';
-import type { UseProjection } from '@deepseek-ai/dsh-client-runtime/client';
+import type { UseProjection } from '@deepseek-ai/dsh-api-session-controller/client';
 
 interface TokenUsageProjection {
   uncachedInputTokens?: number;

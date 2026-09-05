@@ -32,7 +32,7 @@
 - [x] 创建响应必须为同一 `sessionId` 且业务成功；响应身份不一致、业务失败、非 JSON、超限、上游错误或客户端断开都会清理待确认关系，Remote 连接按需关闭。
 - [x] 创建成功后才写入用户显式 session grant/access；权限撤销会清理待确认关系，周期 sweep 和单用户 256 条上限防止临时状态累积。
 - [x] DSH 插件新增 loopback + internal-secret 保护的 `internal/assignable-resources` 资源快照；工作区列表和网关权限保存均以 DSH 当前 registry/session-query 结果为准。
-- [x] 管理员分配列表排除 `missing-dir` 工作区、归档会话、空白会话槽位和明确不存在的持久化会话；存储不可用时返回 502，不回退为 UUID。
+- [x] 管理员分配列表排除 `missing-dir` 工作区、归档会话和明确不存在的持久化会话；已由 DSH registry 登记且可读取的空白会话仍可分配，存储不可用时返回 502，不回退为 UUID。
 - [x] `/gateway/api/permissions` 拒绝不在当前资源快照中的会话/工作区路径；资源权威不可用时 502；空数组和 `__deny__` 仍保留原有语义。
 
 ### A. 先补充失败回归用例

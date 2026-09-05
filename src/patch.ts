@@ -1,13 +1,8 @@
 // 远程设置补丁：强制启用。
 //
-// 背景：dsh 把 settings 等特权面设计成 loopback-only——
-//   1. 客户端（dsh-client-ui-settings/lib/client.js）：
-//      connection.isLoopback ? "host" : "memory" → 远程浏览器走 memory 模式，
-//      设置表单不可用
-//   2. 主机侧（dsh-host-apiproxy/lib/index.js）：
-//      WEB_SETTINGS_NAMESPACES 硬编码白名单，第三方插件命名空间不在其中
-// 网关把 Host/Origin 改写为 127.0.0.1:3080，主机侧栅栏对经网关的流量放行，
-// 所以只需把客户端持久化强制为 host 模式 + 把插件命名空间加进白名单。
+// 背景：dsh 把 settings 等特权面设计成 loopback-only。网关把 Host/Origin
+// 改写为 127.0.0.1:3080，主机侧栅栏对经网关的流量放行，因此需要将客户端
+// 持久化强制为 host 模式。
 //
 // 信任边界：只有通过密码门登录的浏览器能写设置（直连 3080 的局域网浏览器
 // 仍会被主机侧栅栏拒绝）。无论本地直连还是远程，强制打此补丁影响都不大，
@@ -159,8 +154,7 @@ function findDshBundleFile(dshRoot: string, packageName: string, relativePath: s
 
 const SETTINGS_PACKAGE = '@deepseek-ai/dsh-client-ui-settings';
 const SETTINGS_FILE = path.join('lib', 'client.js');
-const WHITELIST_PACKAGE = '@deepseek-ai/dsh-host-apiproxy';
-const WHITELIST_FILE = path.join('lib', 'index.js');
+
 const WORKSPACE_PACKAGE = '@deepseek-ai/dsh-client-ui-workspace';
 const WORKSPACE_FILE = path.join('lib', 'client.js');
 const STARTUP_PACKAGE = '@deepseek-ai/dsh-web-app';
@@ -276,10 +270,6 @@ const SEARCH_DEPS_TO = '$1remoteSearch, $2';
 const SEARCH_DEPS_PATCHED_RE =
   /\},\s*\[\s*remoteSearch\s*,\s*normalizedQuery\s*,\s*wide\s*,\s*searchExpanded/;
 
-function hasSettingsNamespace(content: string, namespace: string): boolean {
-  const escaped = namespace.replace(/[.*+?^${}()|[\[\]\\]/g, '\\$&');
-  return new RegExp(`["']${escaped}["']`).test(content);
-}
 
 // dsh 上游行为：搜索输入框无 autocomplete/name 属性——浏览器密码管理器在页面出现
 // 密码框时会用启发式找用户名框（DOM 里密码框之前最近的文本框），侧栏搜索框会被
@@ -298,17 +288,6 @@ const SEARCH_AUTOFILL_V2_RE =
 const SEARCH_AUTOFILL_V2_TO =
   '$1"search"$2\n\t\t\t\t\t\t\treadOnly: !searchExpanded,\n\t\t\t\t\t\t\t\'data-dshpw-autofill-harden\': "v2",\n\t\t\t\t\t\t\t\'data-lpignore\': "true",\n\t\t\t\t\t\t\t\'data-1p-ignore\': "true",\n\t\t\t\t\t\t\t\'data-bwignore\': "true",';
 
-/**
- * 命名空间白名单补丁是否适用当前 dsh。
- * dsh 0.1.0-rc.7+ 移除了主机侧硬编码 WEB_SETTINGS_NAMESPACES 白名单
- * （改用 settings.describe() 动态枚举命名空间），此时无对象可打 →
- * 视为原生支持，无需（也无法）再插 "dsh-passwords"。
- * 旧版 dsh（<=rc.6）仍需要追加白名单，走插入分支；
- * 当前 rc.8 属 rc.7+ 行为，原生支持，走不到该分支。
- */
-function whitelistPatchApplicable(content: string): boolean {
-  return /WEB_SETTINGS_NAMESPACES\s*=/.test(content);
-}
 
 /** 找到 dsh 安装根目录（@deepseek-ai/dsh），找不到返回 null */
 export function findDshRoot(explicit: string): string | null {
@@ -344,16 +323,14 @@ export function patchStatus(
   dshRoot: string,
 ): {
   settingsHostMode: boolean;
-  whitelist: boolean;
+
   workspaceSearch: boolean;
   bindAll: boolean;
   connectionCookieBridge: 'patched' | 'native' | 'missing' | 'unsupported';
 } {
   const settingsFile = findDshBundleFile(dshRoot, SETTINGS_PACKAGE, SETTINGS_FILE);
-  const wlFile = findDshBundleFile(dshRoot, WHITELIST_PACKAGE, WHITELIST_FILE);
   const wsFile = findDshBundleFile(dshRoot, WORKSPACE_PACKAGE, WORKSPACE_FILE);
   let settingsHostMode = false;
-  let whitelist = false;
   let workspaceSearch = false;
   let connectionCookieBridge: 'patched' | 'native' | 'missing' | 'unsupported' = 'missing';
   try {
@@ -364,16 +341,7 @@ export function patchStatus(
       !s.includes(SETTINGS_ALPHA_FROM) &&
       s.includes(SETTINGS_TO);
   } catch { /* 文件缺失按未打处理 */ }
-  try {
-    // rc.7+ / alpha 的 @Remote gateway 已移除旧 ApiProxy 白名单；旧包缺失
-    // 本身就是原生动态注册机制，不应阻断其他独立补丁。
-    if (wlFile === null) {
-      whitelist = true;
-    } else {
-      const w = readFileSync(wlFile, 'utf8');
-      whitelist = !whitelistPatchApplicable(w) || hasSettingsNamespace(w, 'dsh-passwords');
-    }
-  } catch { /* 同上 */ }
+
   try {
     if (wsFile === null) throw new Error('workspace bundle not found');
     const ws = readFileSync(wsFile, 'utf8');
@@ -416,43 +384,15 @@ export function patchStatus(
   } catch {
     bindAll = false;
   }
-  return { settingsHostMode, whitelist, workspaceSearch, bindAll, connectionCookieBridge };
+  return { settingsHostMode, workspaceSearch, bindAll, connectionCookieBridge };
 }
 
 /** 应用补丁（幂等）：返回 'applied'（本次有改动）或 'unchanged' 或 'missing'（目标文件不在） */
 export function applyRemotePatch(dshRoot: string): 'applied' | 'unchanged' | 'missing' {
   const settingsFile = findDshBundleFile(dshRoot, SETTINGS_PACKAGE, SETTINGS_FILE);
-  const wlFile = findDshBundleFile(dshRoot, WHITELIST_PACKAGE, WHITELIST_FILE);
   const connectionFile = findDshBundleFile(dshRoot, CONNECTION_PACKAGE, CONNECTION_FILE);
   if (settingsFile === null) return 'missing';
   let changed = false;
-
-  // 旧 ApiProxy 白名单目标在 alpha 已删除；其缺失表示采用 @Remote 动态注册，
-  // 不能阻断 settings/workspace/startup 等独立目标。只有目标存在时才尝试旧补丁。
-  let w = '';
-  let whitelistPatched: string | null = null;
-  if (wlFile !== null) {
-    w = readFileSync(wlFile, 'utf8');
-    migrateLegacyBackup(wlFile, w, (original) => {
-      if (!whitelistPatchApplicable(original) || hasSettingsNamespace(original, 'dsh-passwords')) return null;
-      const re = /const WEB_SETTINGS_NAMESPACES = \[([\s\S]*?)\];/;
-      const match = re.exec(original);
-      if (!match) return null;
-      const inserted = match[1].replace(/(\s*[\'\"][^\'\"]+[\'\"])/, `$1,\n\t"dsh-passwords"`);
-      return original.replace(re, `const WEB_SETTINGS_NAMESPACES = [${inserted}];`);
-    });
-    if (whitelistPatchApplicable(w) && !hasSettingsNamespace(w, 'dsh-passwords')) {
-      const re = /const WEB_SETTINGS_NAMESPACES = \[([\s\S]*?)\];/;
-      const match = re.exec(w);
-      if (!match) return 'missing';
-      const currentBlock = match[1];
-      const existing = [...currentBlock.matchAll(/[\'\"]([^\'\"]+)[\'\"]/g)].map((m) => m[1]);
-      if (!existing.includes('dsh-passwords')) {
-        const inserted = currentBlock.replace(/(\s*[\'\"][^\'\"]+[\'\"])/, `$1,\n\t"dsh-passwords"`);
-        whitelistPatched = w.replace(re, `const WEB_SETTINGS_NAMESPACES = [${inserted}];`);
-      }
-    }
-  }
 
   // alpha.1 connection：为 dsh-passwords 的同进程 Host 插件提供受信任的
   // authority-bound Cookie 派生入口。首次启动后会在磁盘上完成补丁；后续
@@ -489,14 +429,7 @@ export function applyRemotePatch(dshRoot: string): 'applied' | 'unchanged' | 'mi
     changed = true;
   }
 
-  // 2) 白名单补齐（仅 rc.6 及以下适用）。rc.7+（含当前 rc.8）已移除该机制，预检结果为 null。
-  if (whitelistPatched !== null && wlFile !== null) {
-    ensureOriginalBackup(wlFile, w, whitelistPatched);
-    writeFileSync(wlFile, whitelistPatched);
-    changed = true;
-  }
-
-  // 3) 工作区侧栏搜索两个子补丁（可选：目标文件不存在则跳过，不影响 1/2）
+  // 2) 工作区侧栏搜索两个子补丁（可选：目标文件不存在则跳过，不影响 1/2）
   //    ① 无结果搜索点击别处自动收起并清空（消除「无匹配会话」死状态滞留）
   //    ② 搜索框 autocomplete="off" + 中性 name（阻断密码管理器把搜索框当用户名框自动填充）
   const wsFile = findDshBundleFile(dshRoot, WORKSPACE_PACKAGE, WORKSPACE_FILE);
@@ -591,12 +524,11 @@ export function applyRemotePatch(dshRoot: string): 'applied' | 'unchanged' | 'mi
  */
 export function rollbackPatch(dshRoot: string): 'rolled-back' | 'no-backup' | 'missing' | 'modified' {
   const settingsFile = findDshBundleFile(dshRoot, SETTINGS_PACKAGE, SETTINGS_FILE);
-  const wlFile = findDshBundleFile(dshRoot, WHITELIST_PACKAGE, WHITELIST_FILE);
   if (settingsFile === null) return 'missing';
   const wsFile = findDshBundleFile(dshRoot, WORKSPACE_PACKAGE, WORKSPACE_FILE);
   const stFile = findDshBundleFile(dshRoot, STARTUP_PACKAGE, STARTUP_FILE);
   const connectionFile = findDshBundleFile(dshRoot, CONNECTION_PACKAGE, CONNECTION_FILE);
-  const targets = [settingsFile, wlFile, wsFile, stFile, connectionFile].filter((target): target is string => target !== null);
+  const targets = [settingsFile, wsFile, stFile, connectionFile].filter((target): target is string => target !== null);
 
   // Preflight every target before writing any file. A partial rollback would leave
   // DSH in an undocumented mixed state when another tool has changed one bundle.

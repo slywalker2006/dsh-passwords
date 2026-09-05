@@ -16,7 +16,7 @@ import {
 } from '../src/permissions.js';
 
 test('F-25：SESSION_SCOPED_RE 命中会读取/写入会话的 RPC，但不命中 create/list', () => {
-  for (const m of ['history', 'prompt', 'respond', 'archive', 'delete', 'rename', 'retitle', 'title', 'resume', 'fork', 'truncate', 'export', 'attachment', 'updateQueue', 'cancel', 'page', 'openWorkspacePath']) {
+  for (const m of ['history', 'prompt', 'respond', 'archive', 'delete', 'rename', 'retitle', 'title', 'resume', 'fork', 'truncate', 'export', 'attachment', 'updateQueue', 'cancel', 'page', 'openWorkspacePath', 'selectModel']) {
     assert.equal(SESSION_SCOPED_RE.test(`/api/session.${m}`), true, `session.${m} 应归属校验`);
     assert.equal(SESSION_SCOPED_RE.test(`/api/session/${m}`), true, `session/${m} 应归属校验`);
   }
@@ -25,7 +25,16 @@ test('F-25：SESSION_SCOPED_RE 命中会读取/写入会话的 RPC，但不命�
   assert.equal(SESSION_SCOPED_RE.test('/api/session.create'), false, 'create 无源会话');
   assert.equal(SESSION_SCOPED_RE.test('/api/session.list'), false, 'list 单独过滤');
   assert.equal(SESSION_SCOPED_RE.test('/api/workspace.create'), false, '创建工作区不属于会话作用域');
-  for (const endpoint of ['commands/execute', 'commands/list', 'subagents/list', 'subagents/prompt', 'subagents/interruptByParent']) {
+  for (const endpoint of [
+    'commands/execute', 'commands/list', 'subagents/list', 'subagents/prompt', 'subagents/interruptByParent',
+    'fileUploads/upload', 'fileReferences/list', 'sessionReferenceResolver/candidates',
+    'skills/list', 'messageFeedback/list', 'messageFeedback/put', 'messageFeedback/delete',
+    'goals/clear', 'goals/complete', 'goals/create', 'goals/edit', 'goals/pause', 'goals/resume',
+    'dynamicCordisRunner/getClientCode', 'dynamicCordisRunner/reportClientGuardFailure',
+    'dynamicCordisRunner/reportRenderFailure', 'dynamicCordisRunner/resolveInspectQuery',
+    'dynamicCordisRunner/runHostHalf', 'dynamicCordisRunner/settleUserRun',
+    'dynamicCordisRunner/stopFromPanel', 'dynamicCordisRunner/undefineFromPanel',
+  ]) {
     assert.equal(SESSION_SCOPED_RE.test(`/api/${endpoint}`), true, `${endpoint} 应归属校验`);
   }
 });

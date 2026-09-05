@@ -160,9 +160,7 @@ function runPatch(argv: string[]): void {
     console.log(
       `  ${tr('cli.hostMode')}: ${status.settingsHostMode ? tr('cli.patched') : tr('cli.notPatched')}`,
     );
-    console.log(
-      `  ${tr('cli.whitelist')}: ${status.whitelist ? tr('cli.patched') : tr('cli.notPatched')}`,
-    );
+
     console.log(
       `  ${tr('cli.workspaceSearch')}: ${status.workspaceSearch ? tr('cli.patched') : tr('cli.notPatched')}`,
     );

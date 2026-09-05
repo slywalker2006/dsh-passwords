@@ -97,7 +97,7 @@ if (!existsSync(pkgPath)) {
   process.exit(1);
 }
 
-// ── 1. Node.js（与 DSH 0.1.2-rc.1 官方 engines 对齐） ──
+// ── 1. Node.js（与 DSH 0.1.3-alpha.1 官方 engines 对齐） ──
 const [nodeMajor, nodeMinor] = process.versions.node.split('.').map(Number);
 if ((nodeMajor === 22 && nodeMinor < 19) || nodeMajor < 22 || nodeMajor === 23) {
   err(`Node.js 版本不受支持（当前 v${process.versions.node}），需要 22.19+ 或 24+。`);

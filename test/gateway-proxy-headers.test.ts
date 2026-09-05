@@ -88,6 +88,9 @@ let assignableResources = {
 let assignableResourcesUnavailable = false;
 let remoteMuxOpenEndpoints: string[] = [];
 let remoteMuxOpenFrames: Array<Record<string, unknown>> = [];
+let remoteMuxHistoryPayloadBytes = 0;
+let lastRawUploadBody = Buffer.alloc(0);
+let lastSelectModelBody: Record<string, unknown> | null = null;
 let lastScopedRequestBody: Record<string, unknown> | null = null;
 let mockSshHosts: Array<{ alias: string; host: string }> = [
   { alias: 'admin-host', host: '198.51.100.10' },
@@ -183,6 +186,21 @@ function startMockUpstream(): Promise<http.Server> {
           return;
         }
         if (frame.endpoint === 'session/follow') {
+          if (remoteMuxHistoryPayloadBytes > 0) {
+            client.send(JSON.stringify({
+              type: 'item',
+              streamId: frame.streamId,
+              value: {
+                type: 'snapshot',
+                header: { id: 'session-visible' },
+                cursor: 1,
+                records: [{ type: 'event', event: { type: 'user/message', seq: 1, time: 1, data: 'x'.repeat(remoteMuxHistoryPayloadBytes) } }],
+                hasMore: false,
+                projections: { asOfSeq: 1, values: {} },
+              },
+            }));
+            return;
+          }
           const payload = frame.payload as Record<string, unknown> | undefined;
           const args = payload?.args as Record<string, unknown> | undefined;
           const request = args?.request as Record<string, unknown> | undefined;
@@ -193,6 +211,7 @@ function startMockUpstream(): Promise<http.Server> {
               streamId: frame.streamId,
               value: {
                 type: 'snapshot',
+                header: { id: address.childSessionId, origin: 'subagent', parentSession: address.parentSessionId },
                 cursor: 17,
                 records: [{ type: 'event', event: { type: 'message', seq: 17, text: 'child history' } }],
                 projections: { model: 'test-model' },
@@ -208,7 +227,14 @@ function startMockUpstream(): Promise<http.Server> {
             client.send(JSON.stringify({
               type: 'item',
               streamId: frame.streamId,
-              value: { events: [{ type: 'message', text: 'authorized session history' }] },
+              value: {
+                type: 'snapshot',
+                header: { id: 'session-visible' },
+                cursor: 1,
+                records: [{ type: 'event', event: { type: 'user/message', seq: 1, time: 1, data: 'authorized session history' } }],
+                hasMore: false,
+                projections: { asOfSeq: 1, values: {} },
+              },
             }));
           }
           return;
@@ -250,6 +276,26 @@ function startMockUpstream(): Promise<http.Server> {
       } else if ((req.url ?? '').startsWith('/api/dsh-passwords/internal/assignable-resources')) {
         res.writeHead(assignableResourcesUnavailable ? 503 : 200, { 'content-type': 'application/json' });
         res.end(assignableResourcesUnavailable ? JSON.stringify({ ok: false }) : JSON.stringify({ ok: true, ...assignableResources }));
+      } else if ((req.url ?? '').startsWith('/api/session/uploadFileBinary')) {
+        const requestChunks: Buffer[] = [];
+        req.on('data', (chunk: Buffer) => requestChunks.push(chunk));
+        req.on('end', () => {
+          lastRawUploadBody = Buffer.concat(requestChunks);
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, uploaded: lastRawUploadBody.length }));
+        });
+      } else if (/^\/api\/session(?:[.]|\/)selectModel(?:[?]|$)/.test(req.url ?? '')) {
+        const requestChunks: Buffer[] = [];
+        req.on('data', (chunk: Buffer) => requestChunks.push(chunk));
+        req.on('end', () => {
+          try {
+            lastSelectModelBody = JSON.parse(Buffer.concat(requestChunks).toString('utf8')) as Record<string, unknown>;
+          } catch {
+            lastSelectModelBody = null;
+          }
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ result: { ok: true, value: { accepted: true } } }));
+        });
       } else if ((req.url ?? '').startsWith('/api/session.create')) {
         const requestChunks: Buffer[] = [];
         req.on('data', (chunk: Buffer) => requestChunks.push(chunk));
@@ -328,6 +374,12 @@ function startMockUpstream(): Promise<http.Server> {
           res.writeHead(405, { 'content-type': 'application/json' });
           res.end(JSON.stringify({ error: 'method not allowed' }));
         });
+      } else if ((req.url ?? '').startsWith('/api/sessionReferenceResolver/candidates')) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ result: { ok: true, value: [
+          { sessionId: 'session-visible', label: 'Visible session', cwd: '/workspaces/visible', createdAt: 1, mention: '@visible' },
+          { sessionId: 'session-hidden', label: 'Hidden session', cwd: '/workspaces/hidden', createdAt: 1, mention: '@hidden' },
+        ] } }));
       } else if ((req.url ?? '').startsWith('/api/session.search')) {
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(sessionSearchResponseMode === 'malformed'
@@ -941,6 +993,35 @@ test('Issue #25：权限保存拒绝当前资源快照中不存在的会话', as
   }
 });
 
+test('Issue #25：保存权限时清理历史失效会话并保留新授权', async () => {
+  const subUser = db.createUser('issue-25-stale-existing-grant', '$2a$10$dummyhashdummyhashdummyhashdu', 'user');
+  db.setPermissions(subUser.id, {
+    allowedFolders: ['/workspaces/visible'], hourlyTokenLimit: null, dailyMinutesLimit: null,
+    allowUpload: false, allowGitDownload: false, allowWorkspaceCreate: false, allowedWebSocketPaths: [],
+    allowedAgentPresets: null, banned: false, sandboxMode: null, disabledSessions: [],
+    allowedSessionIds: ['archived-session'],
+  });
+  const originalResources = assignableResources;
+  assignableResources = { folders: ['/workspaces/visible'], sessions: ['session-visible'] };
+  try {
+    const response = await gatewayReq(
+      'POST',
+      '/gateway/api/permissions',
+      { 'content-type': 'application/json' },
+      JSON.stringify({
+        userId: subUser.id,
+        allowedFolders: ['/workspaces/visible'],
+        allowedSessionIds: ['archived-session', 'session-visible'],
+      }),
+    );
+    assert.equal(response.status, 200, response.body);
+    assert.deepEqual(db.listUserSessionGrants(subUser.id), ['session-visible']);
+    assert.deepEqual(JSON.parse(response.body).allowedSessionIds, ['session-visible']);
+  } finally {
+    assignableResources = originalResources;
+  }
+});
+
 test('Issue #25：资源核验不可用时权限保存 fail-closed', async () => {
   const subUser = db.createUser('issue-25-resource-outage', '$2a$10$dummyhashdummyhashdummyhashdu', 'user');
   db.setPermissions(subUser.id, {
@@ -1330,6 +1411,53 @@ test('Issue #26：子用户收到自己会话的提问与审批 waterfall，且�
   }
 });
 
+test('Remote mux 浏览器腿发送 heartbeat ping，避免前置代理按空闲连接回收', async () => {
+  const connection = await openRemoteMux({ cookie, origin: 'http://127.0.0.1', host: '127.0.0.1' });
+  let pings = 0;
+  connection.client.on('ping', () => { pings += 1; });
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 2_500));
+    assert.ok(pings >= 1, `expected at least one browser-leg ping, got ${String(pings)}`);
+  } finally {
+    connection.client.close();
+  }
+});
+
+test('Remote mux 转发超过 1MiB 的 RC.1 历史快照单帧', async () => {
+  remoteMuxHistoryPayloadBytes = 2 * 1024 * 1024;
+  try {
+    const connection = await openRemoteMux({ cookie, origin: 'http://127.0.0.1', host: '127.0.0.1' });
+    try {
+      connection.client.send(JSON.stringify({
+        type: 'open', streamId: 'large-history', endpoint: 'session/follow', payload: { args: {} },
+      }));
+      const frame = await connection.nextFrame();
+      const value = frame.value as { header?: { id?: string }; records?: Array<{ event?: { data?: string } }> };
+      assert.equal(frame.type, 'item');
+      assert.equal(value.header?.id, 'session-visible');
+      assert.equal((value.records?.[0]?.event?.data as string | undefined)?.length, remoteMuxHistoryPayloadBytes);
+    } finally {
+      connection.client.close();
+    }
+  } finally {
+    remoteMuxHistoryPayloadBytes = 0;
+  }
+});
+
+test('管理员 Remote mux 接受官方协议的合法扩展 endpoint', async () => {
+  remoteMuxOpenEndpoints = [];
+  const connection = await openRemoteMux({ cookie, origin: 'http://127.0.0.1', host: '127.0.0.1' });
+  try {
+    connection.client.send(JSON.stringify({
+      type: 'open', streamId: 'official-extension', endpoint: 'feed/follow', payload: { args: {} },
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.deepEqual(remoteMuxOpenEndpoints, ['feed/follow']);
+  } finally {
+    connection.client.close();
+  }
+});
+
 test('Issue #25：alpha.3 只允许子用户订阅被明确授予的 session/follow', async () => {
   const subUser = db.createUser('issue-25-follow-user', '$2a$10$dummyhashdummyhashdummyhashdu', 'user');
   db.setPermissions(subUser.id, {
@@ -1355,9 +1483,9 @@ test('Issue #25：alpha.3 只允许子用户订阅被明确授予的 session/fol
     const workspace = await connection.nextFrame();
     const authorized = await connection.nextFrame();
     assert.equal(workspace.streamId, 'follow-workspace');
-    assert.deepEqual(authorized, {
-      type: 'item', streamId: 'follow-visible', value: { events: [{ type: 'message', text: 'authorized session history' }] },
-    });
+    assert.equal(authorized.type, 'item');
+    assert.equal((authorized.value as any).type, 'snapshot');
+    assert.equal((authorized.value as any).header.id, 'session-visible');
     assert.deepEqual(remoteMuxOpenEndpoints, ['workspace/follow', 'session/follow']);
   } finally {
     connection.client.close();
@@ -1411,7 +1539,9 @@ test('RC.1 子代理 session/follow 沿用 parent 授权并原样保留地址与
     });
     assert.deepEqual(snapshot, {
       type: 'item', streamId: 'subagent-follow', value: {
-        type: 'snapshot', cursor: 17,
+        type: 'snapshot',
+        header: { id: childId, origin: 'subagent', parentSession: 'session-visible' },
+        cursor: 17,
         records: [{ type: 'event', event: { type: 'message', seq: 17, text: 'child history' } }],
         projections: { model: 'test-model' }, hasMore: true,
       },
@@ -1707,6 +1837,163 @@ test('权限：禁用上传时，上传端点和工作区文件写入均在网�
     for (const target of ['/api/dsh-uploads', '/api/filePathBridge/importFile', '/aionui-panel/write']) {
       const response = await gatewayReq('POST', target, { 'content-type': 'application/json' }, '{}');
       assert.equal(response.status, 403, `${target} must be denied when uploads are disabled`);
+    }
+  } finally {
+    cookie = originalCookie;
+  }
+});
+
+test('RC.1 Agent-scope RPC：未授权 session 在到达 DSH 前拒绝', async () => {
+  const subUser = db.createUser('scoped-rpc-denied-user', '$2a$10$dummyhashdummyhashdummyhashdu', 'user');
+  db.setPermissions(subUser.id, {
+    allowedFolders: ['/workspaces/visible'], hourlyTokenLimit: null, dailyMinutesLimit: null,
+    allowUpload: true, allowGitDownload: true, allowWorkspaceCreate: false, allowedWebSocketPaths: [],
+    allowedAgentPresets: null, banned: false, sandboxMode: null, disabledSessions: [],
+    allowedSessionIds: ['session-visible'],
+  });
+  db.markSessionGrantsSeeded(subUser.id);
+  const originalCookie = cookie;
+  const subCookie = `dsh_gateway_token=${jwt.sign({ sub: String(subUser.id), username: subUser.username, cv: 0 }, 'test-secret', { expiresIn: '12h' })}`;
+  cookie = subCookie;
+  try {
+    const connection = await openRemoteMux({ cookie: subCookie, origin: 'http://127.0.0.1', host: '127.0.0.1' });
+    try {
+      connection.client.send(JSON.stringify({
+        type: 'open', streamId: 'scoped-rpc-baseline', endpoint: 'workspace/follow', payload: { args: {} },
+      }));
+      assert.equal((await connection.nextFrame()).streamId, 'scoped-rpc-baseline');
+      const envelope = (endpoint: string, sessionId: string) => JSON.stringify({
+        type: 'client-request', rpcId: `scoped-${endpoint}-${sessionId}`, method: endpoint,
+        payload: { args: { agentId: sessionId, request: { sessionId } } },
+      });
+      for (const endpoint of [
+        '/api/fileUploads/upload',
+        '/api/fileReferences/list',
+        '/api/skills/list',
+        '/api/messageFeedback/list',
+        '/api/goals/create',
+        '/api/dynamicCordisRunner/getClientCode',
+      ]) {
+        const response = await gatewayReq('POST', endpoint, { 'content-type': 'application/json' }, envelope(endpoint.slice('/api/'.length), 'session-hidden'));
+        assert.equal(response.status, 403, `${endpoint} must reject an unowned session`);
+      }
+    } finally {
+      connection.client.close();
+    }
+  } finally {
+    cookie = originalCookie;
+  }
+});
+
+test('RC.1 sessionReferenceResolver 结果只返回子用户已授权会话', async () => {
+  const subUser = db.createUser('scoped-reference-user', '$2a$10$dummyhashdummyhashdummyhashdu', 'user');
+  db.setPermissions(subUser.id, {
+    allowedFolders: ['/workspaces/visible'], hourlyTokenLimit: null, dailyMinutesLimit: null,
+    allowUpload: false, allowGitDownload: false, allowWorkspaceCreate: false, allowedWebSocketPaths: [],
+    allowedAgentPresets: null, banned: false, sandboxMode: null, disabledSessions: [],
+    allowedSessionIds: ['session-visible'],
+  });
+  db.markSessionGrantsSeeded(subUser.id);
+  const originalCookie = cookie;
+  const subCookie = `dsh_gateway_token=${jwt.sign({ sub: String(subUser.id), username: subUser.username, cv: 0 }, 'test-secret', { expiresIn: '12h' })}`;
+  cookie = subCookie;
+  try {
+    const connection = await openRemoteMux({ cookie: subCookie, origin: 'http://127.0.0.1', host: '127.0.0.1' });
+    try {
+      connection.client.send(JSON.stringify({
+        type: 'open', streamId: 'scoped-reference-baseline', endpoint: 'workspace/follow', payload: { args: {} },
+      }));
+      await connection.nextFrame();
+      const response = await gatewayReq(
+        'POST', '/api/sessionReferenceResolver/candidates', { 'content-type': 'application/json' },
+        JSON.stringify({
+          type: 'client-request', rpcId: 'reference-candidates', method: 'sessionReferenceResolver/candidates',
+          payload: { args: { agentId: 'session-visible', query: 'session' } },
+        }),
+      );
+      assert.equal(response.status, 200, response.body);
+      const value = (JSON.parse(response.body) as { result: { value: Array<{ sessionId: string }> } }).result.value;
+      assert.deepEqual(value.map((item) => item.sessionId), ['session-visible']);
+      assert.doesNotMatch(response.body, /Hidden session|session-hidden|@hidden/);
+    } finally {
+      connection.client.close();
+    }
+  } finally {
+    cookie = originalCookie;
+  }
+});
+
+test('权限：alpha.1 原始 session 上传要求已授权会话并保留字节流', async () => {
+  const subUser = db.createUser('raw-upload-contract', '$2a$10$dummyhashdummyhashdummyhashdu', 'user');
+  db.setPermissions(subUser.id, {
+    allowedFolders: ['/workspaces/visible'], hourlyTokenLimit: null, dailyMinutesLimit: null,
+    allowUpload: true, allowGitDownload: true, allowWorkspaceCreate: false, allowedWebSocketPaths: [],
+    allowedAgentPresets: null, banned: false, sandboxMode: null, disabledSessions: [],
+    allowedSessionIds: ['session-visible'],
+  });
+  db.markSessionGrantsSeeded(subUser.id);
+  const originalCookie = cookie;
+  const subCookie = `dsh_gateway_token=${jwt.sign({ sub: String(subUser.id), username: subUser.username, cv: 0 }, 'test-secret', { expiresIn: '12h' })}`;
+  cookie = subCookie;
+  const headers = { cookie: subCookie, origin: 'http://127.0.0.1', host: '127.0.0.1' };
+  try {
+    const missingSession = await gatewayReq('POST', '/api/session/uploadFileBinary', {
+      'content-type': 'application/octet-stream',
+    }, 'bytes');
+    assert.equal(missingSession.status, 403, missingSession.body);
+
+    const hiddenSession = await gatewayReq('POST', '/api/session/uploadFileBinary?sessionId=session-hidden', {
+      'content-type': 'application/octet-stream',
+    }, 'bytes');
+    assert.equal(hiddenSession.status, 403, hiddenSession.body);
+
+    const connection = await openRemoteMux(headers);
+    try {
+      connection.client.send(JSON.stringify({
+        type: 'open', streamId: 'raw-upload-baseline', endpoint: 'workspace/follow', payload: { args: {} },
+      }));
+      assert.equal((await connection.nextFrame()).streamId, 'raw-upload-baseline');
+      const uploaded = await gatewayReq('POST', '/api/session/uploadFileBinary?sessionId=session-visible&name=note.txt', {
+        'content-type': 'application/octet-stream',
+      }, 'bytes');
+      assert.equal(uploaded.status, 200, uploaded.body);
+      assert.deepEqual(lastRawUploadBody, Buffer.from('bytes'));
+    } finally {
+      connection.client.close();
+    }
+  } finally {
+    cookie = originalCookie;
+  }
+});
+
+test('权限：alpha.1 selectModel 仅允许已授权会话', async () => {
+  const subUser = db.createUser('select-model-contract', '$2a$10$dummyhashdummyhashdummyhashdu', 'user');
+  db.setPermissions(subUser.id, {
+    allowedFolders: ['/workspaces/visible'], hourlyTokenLimit: null, dailyMinutesLimit: null,
+    allowUpload: true, allowGitDownload: true, allowWorkspaceCreate: false, allowedWebSocketPaths: [],
+    allowedAgentPresets: null, banned: false, sandboxMode: null, disabledSessions: [],
+    allowedSessionIds: ['session-visible'],
+  });
+  db.markSessionGrantsSeeded(subUser.id);
+  const originalCookie = cookie;
+  cookie = `dsh_gateway_token=${jwt.sign({ sub: String(subUser.id), username: subUser.username, cv: 0 }, 'test-secret', { expiresIn: '12h' })}`;
+  const body = (sessionId: string) => JSON.stringify({
+    sessionId, provider: 'test-provider', model: 'test-model', reasoningEffort: 'low',
+  });
+  try {
+    const connection = await openRemoteMux({ cookie, origin: 'http://127.0.0.1', host: '127.0.0.1' });
+    try {
+      connection.client.send(JSON.stringify({
+        type: 'open', streamId: 'select-model-baseline', endpoint: 'workspace/follow', payload: { args: {} },
+      }));
+      assert.equal((await connection.nextFrame()).streamId, 'select-model-baseline');
+      const hidden = await gatewayReq('POST', '/api/session/selectModel', { 'content-type': 'application/json' }, body('session-hidden'));
+      assert.equal(hidden.status, 403, hidden.body);
+      const visible = await gatewayReq('POST', '/api/session/selectModel', { 'content-type': 'application/json' }, body('session-visible'));
+      assert.equal(visible.status, 200, visible.body);
+      assert.deepEqual(lastSelectModelBody, JSON.parse(body('session-visible')));
+    } finally {
+      connection.client.close();
     }
   } finally {
     cookie = originalCookie;

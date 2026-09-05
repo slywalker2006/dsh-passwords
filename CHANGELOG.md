@@ -1,5 +1,29 @@
 # Changelog
 
+## 2.6.11 - 2026-09-05
+
+### 中文
+
+更新公告：
+
+1. 兼容 DSH `0.1.2` 与 `0.1.3` 的接口和运行时结构，bundled Docker 继续以内置 DSH `0.1.2-rc.1` 为主目标。
+2. 修复 Issue #29 相关的 Remote mux 历史加载可靠性：浏览器连接增加 heartbeat，支持 DSH `0.1.2`/`0.1.3` 的大历史快照，并校验 `session/follow` 快照身份后再转发。
+3. 补齐新会话 API 的子用户资源授权：文件上传与引用、Skill、消息反馈、目标、动态 Cordis runner、模型选择和会话引用检索均在到达 DSH 前按当前会话授权过滤。
+4. 优化多用户资源分配：保存权限时清理已失效的历史会话授权，但仍拒绝从未验证过的会话 ID，避免陈旧授权阻塞有效分配。
+
+验证：275/275 本地回归测试、TypeScript 构建、npm 官方 registry 生产依赖审计、发布包内容和 Git 差异检查通过。Docker 镜像发布前以 DSH `0.1.2-rc.1` 构建并核验。
+
+### English
+
+Release notes:
+
+1. Adds compatibility with the DSH `0.1.2` and `0.1.3` API and runtime boundaries; bundled Docker continues to target the included DSH `0.1.2-rc.1` runtime.
+2. Fixes Remote mux history-loading reliability related to Issue #29: browser connections now send heartbeats, large DSH `0.1.2`/`0.1.3` history snapshots are supported, and `session/follow` snapshot identity is verified before forwarding.
+3. Completes subuser resource authorization for newer session APIs. File uploads and references, Skills, message feedback, goals, dynamic Cordis runner calls, model selection, and session-reference lookup are filtered against the current session grant before reaching DSH.
+4. Improves multi-user assignment saves: stale historical session grants are removed while never-validated session IDs remain rejected, so obsolete grants no longer block valid assignments.
+
+Validation: 275/275 local regression tests, the TypeScript build, the official-registry production dependency audit, package-content checks, and Git whitespace checks passed. The Docker image is built with DSH `0.1.2-rc.1` and verified before publication.
+
 ## 2.6.10 - 2026-09-04
 
 ### 中文

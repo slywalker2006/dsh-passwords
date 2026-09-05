@@ -38,9 +38,9 @@ test('WebSocket 白名单只支持精确路径和显式子路径', () => {
   assert.equal(webSocketAccessForPath('/plugin/ws/run', ['/plugin/ws/*'], ['/plugin/ws/*'], 'user', false), 'authenticated');
   assert.equal(webSocketAccessForPath('/plugin/ws/run', ['/plugin/ws/*'], [], 'admin', false), 'authenticated');
   assert.equal(webSocketAccessForPath('/api/events.mux', [], [], 'user', true), 'authenticated');
-  assert.equal(webSocketAccessForPath('/unknown', [], 'admin', false), 'deny');
+  assert.equal(webSocketAccessForPath('/unknown', [], [], 'admin', false), 'deny');
   for (const value of ['/gateway/x', '/api/dsh-passwords/internal/x', '/*', '/x/../y', '/x%2fy', '/x?y=1']) {
-    assert.throws(() => parseWebSocketAllowlist(value, 'TEST'), value);
+    assert.throws(() => parseWebSocketAllowlist(value, 'TEST'));
   }
 });
 

@@ -24,10 +24,8 @@ const result = await build({
   // react* 同理：dsh 前端把自己的 react 作为静态模块共享给所有插件（必须共用
   // 同一份 React，否则 hooks 在渲染器里拿不到 dispatcher 会直接崩溃）
   external: [
-    '@deepseek-ai/dsh-client-runtime/client',
-    '@deepseek-ai/dsh-client-ui-slots/client',
-    '@deepseek-ai/dsh-client-ui-settings/client',
-    '@deepseek-ai/dsh-client-locale/client',
+    // React 由 DSH 客户端模块表提供；其他 DSH imports 均为 type-only，
+    // 已在 esbuild 阶段擦除，不应在产物中保留不存在的运行时入口。
     'react*',
   ],
   logLevel: 'info',

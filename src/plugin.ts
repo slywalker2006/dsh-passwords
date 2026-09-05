@@ -39,7 +39,6 @@ import { Database, type UserListRow } from './db.js';
 import { createFieldCrypto } from './encrypt.js';
 import { AuthService, AuthError, assertNoSqlInjection, type AuthedUser, type RequestMeta } from './auth.js';
 import { findDshRoot, patchStatus } from './patch.js';
-import { isDisplayableDshSession, isDisplayableDshSurface } from './permissions.js';
 
 /** 稳定 cordis 插件名（insert 进 cordis.yml 时用同一个名字） */
 export const name = 'dsh-passwords';
@@ -677,6 +676,71 @@ function startGateway(ctx: Context, cfg: PlatformConfig): void {
   );
 }
 
+export type AssignableWorkspace = {
+  path: string;
+  title: string;
+  sessions: Array<{ id: string; title: string }>;
+};
+
+type AssignableWorkspaceRegistry = {
+  list(): Array<{ path: string; title: string; sessionIds: readonly string[]; status(): Promise<'ok' | 'missing-dir'> }>;
+  archivedSessionIds: readonly string[];
+};
+
+type AssignableSessions = { get(id: string): unknown };
+type AssignableSessionTitles = { get(session: unknown): { title?: string } | undefined };
+type AssignableSessionQuery = {
+  readSurface(id: string): Promise<{ events: readonly unknown[] }>;
+  readTitle?(id: string): Promise<{ title?: string } | undefined>;
+};
+
+export function isDefiniteMissingSession(error: unknown): boolean {
+  if (error === null || typeof error !== 'object') return false;
+  const code = (error as { code?: unknown }).code;
+  const message = (error as { message?: unknown }).message;
+  return code === 'SESSION_QUERY_SESSION_NOT_FOUND' || code === 'SESSION_QUERY_EVENT_NOT_FOUND' ||
+    (typeof message === 'string' && /session.*not found/i.test(message));
+}
+
+/**
+ * DSH-owned assignment inventory. Blank sessions are valid immediately after
+ * session.create(); only registry membership, archive state, and persistence
+ * existence determine whether a session may be assigned.
+ */
+export async function listAssignableWorkspaces(
+  reg: AssignableWorkspaceRegistry,
+  sessions: AssignableSessions | undefined,
+  sessionTitle: AssignableSessionTitles | undefined,
+  sessionQuery: AssignableSessionQuery | undefined,
+): Promise<AssignableWorkspace[]> {
+  const archived = new Set(reg.archivedSessionIds.map((id) => String(id)));
+  const output: AssignableWorkspace[] = [];
+  for (const workspace of reg.list()) {
+    if (await workspace.status() !== 'ok') continue;
+    const entries: Array<{ id: string; title: string }> = [];
+    for (const rawId of workspace.sessionIds) {
+      const id = String(rawId);
+      if (archived.has(id)) continue;
+      const live = sessions?.get(id);
+      if (live !== undefined) {
+        entries.push({ id, title: sessionTitle?.get(live)?.title || id });
+        continue;
+      }
+      if (sessionQuery === undefined) throw new Error('session query unavailable');
+      try {
+        await sessionQuery.readSurface(id);
+        const title = await sessionQuery.readTitle?.(id);
+        entries.push({ id, title: title?.title || id });
+      } catch (error) {
+        if (isDefiniteMissingSession(error)) continue;
+        throw error;
+      }
+    }
+    output.push({ path: workspace.path, title: workspace.title, sessions: entries });
+  }
+  return output;
+}
+
 export function apply(ctx: Context): void {
   let cfg: PlatformConfig;
   try {
@@ -815,74 +879,7 @@ export function apply(ctx: Context): void {
     return a.length === b.length && timingSafeEqual(a, b);
   };
 
-  type AssignableWorkspace = {
-    path: string;
-    title: string;
-    sessions: Array<{ id: string; title: string }>;
-  };
 
-  const isDefiniteMissingSession = (error: unknown): boolean => {
-    if (error === null || typeof error !== 'object') return false;
-    const code = (error as { code?: unknown }).code;
-    const message = (error as { message?: unknown }).message;
-    return code === 'SESSION_QUERY_SESSION_NOT_FOUND' || code === 'SESSION_QUERY_EVENT_NOT_FOUND' ||
-      (typeof message === 'string' && /session.*not found/i.test(message));
-  };
-
-  /**
-   * DSH-owned assignment inventory. This is deliberately evaluated on every
-   * request: workspace deletion/archive and session persistence changes must
-   * not remain assignable through a stale gateway cache.
-   */
-  const listAssignableWorkspaces = async (): Promise<AssignableWorkspace[]> => {
-    const reg = ctx.get('workspaceRegistry') as unknown as
-      | {
-          list(): Array<{ path: string; title: string; sessionIds: readonly string[]; status(): Promise<'ok' | 'missing-dir'> }>;
-          archivedSessionIds: readonly string[];
-        }
-      | undefined;
-    if (reg === undefined) throw new Error('workspace registry unavailable');
-    const sessions = ctx.get('sessions') as unknown as
-      | { get(id: string): unknown }
-      | undefined;
-    const sessionTitle = ctx.get('sessionTitle') as unknown as
-      | { get(session: unknown): { title?: string } | undefined }
-      | undefined;
-    const sessionQuery = ctx.get('sessionQuery') as unknown as
-      | {
-          readSurface(id: string): Promise<{ events: readonly unknown[] }>;
-          readTitle?(id: string): Promise<{ title?: string } | undefined>;
-        }
-      | undefined;
-    const archived = new Set(reg.archivedSessionIds.map((id) => String(id)));
-    const output: AssignableWorkspace[] = [];
-    for (const workspace of reg.list()) {
-      if (await workspace.status() !== 'ok') continue;
-      const entries: Array<{ id: string; title: string }> = [];
-      for (const rawId of workspace.sessionIds) {
-        const id = String(rawId);
-        if (archived.has(id)) continue;
-        const live = sessions?.get(id);
-        if (live !== undefined) {
-          if (!isDisplayableDshSession(live)) continue;
-          entries.push({ id, title: sessionTitle?.get(live)?.title || id });
-          continue;
-        }
-        if (sessionQuery === undefined) throw new Error('session query unavailable');
-        try {
-          const surface = await sessionQuery.readSurface(id);
-          if (!isDisplayableDshSurface(surface.events)) continue;
-          const title = await sessionQuery.readTitle?.(id);
-          entries.push({ id, title: title?.title || id });
-        } catch (error) {
-          if (isDefiniteMissingSession(error)) continue;
-          throw error;
-        }
-      }
-      output.push({ path: workspace.path, title: workspace.title, sessions: entries });
-    }
-    return output;
-  };
 
   // ── /api/dsh-passwords/* 路由（exact 路由先于连接插件的 /api 前缀命中） ──
   const routes: WebRoute[] = [
@@ -1190,7 +1187,12 @@ export function apply(ctx: Context): void {
           return;
         }
         try {
-          writeJson(res, 200, { ok: true, workspaces: await listAssignableWorkspaces() });
+          const registry = ctx.get('workspaceRegistry') as unknown as AssignableWorkspaceRegistry | undefined;
+          if (registry === undefined) throw new Error('workspace registry unavailable');
+          const sessions = ctx.get('sessions') as unknown as AssignableSessions | undefined;
+          const sessionTitle = ctx.get('sessionTitle') as unknown as AssignableSessionTitles | undefined;
+          const sessionQuery = ctx.get('sessionQuery') as unknown as AssignableSessionQuery | undefined;
+          writeJson(res, 200, { ok: true, workspaces: await listAssignableWorkspaces(registry, sessions, sessionTitle, sessionQuery) });
         } catch (error) {
           writeJson(res, 502, {
             ok: false,
@@ -1210,7 +1212,12 @@ export function apply(ctx: Context): void {
         }
         if (!requireMethod(req, res, 'GET')) return;
         try {
-          const workspaces = await listAssignableWorkspaces();
+          const registry = ctx.get('workspaceRegistry') as unknown as AssignableWorkspaceRegistry | undefined;
+          if (registry === undefined) throw new Error('workspace registry unavailable');
+          const sessions = ctx.get('sessions') as unknown as AssignableSessions | undefined;
+          const sessionTitle = ctx.get('sessionTitle') as unknown as AssignableSessionTitles | undefined;
+          const sessionQuery = ctx.get('sessionQuery') as unknown as AssignableSessionQuery | undefined;
+          const workspaces = await listAssignableWorkspaces(registry, sessions, sessionTitle, sessionQuery);
           writeJson(res, 200, {
             ok: true,
             folders: workspaces.map((workspace) => workspace.path),

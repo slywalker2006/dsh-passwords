@@ -12,7 +12,13 @@ import {
   filterSessionSearchItems,
   sandboxPresetRank,
   parseSessionAddress,
+  isUploadRequest,
 } from '../src/permissions.js';
+
+test('alpha.1：原始 session 上传路径纳入上传权限门卫', () => {
+  assert.equal(isUploadRequest('POST', '/api/session/uploadFileBinary'), true);
+  assert.equal(isUploadRequest('GET', '/api/session/uploadFileBinary'), false);
+});
 
 // ── RC.1 SessionAddress（普通会话与子代理地址） ─────────────────
 
@@ -32,12 +38,14 @@ test('parseSessionAddress：保留普通会话与完整 subagent 地址', () => 
     childSessionId: 'child-visible',
     mode: 'continuable',
   });
-  assert.deepEqual(parseSessionAddress({
+  const oneShot = parseSessionAddress({
     kind: 'subagent',
     parentSessionId: 'parent-visible',
     childSessionId: 'child-one-shot',
     mode: 'one-shot',
-  })?.mode, 'one-shot');
+  });
+  assert.equal(oneShot?.kind, 'subagent');
+  assert.equal(oneShot?.mode, 'one-shot');
 });
 
 test('parseSessionAddress：拒绝不完整或伪造的子代理地址', () => {

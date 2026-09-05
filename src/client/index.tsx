@@ -4,9 +4,27 @@
 //   - 远程设置补丁状态（所有用户可见）+ "重载补丁"按钮（仅主用户可触发；补丁强制启用）
 //   - 用户管理（改密/改名/子用户） → fetch /api/dsh-passwords/*（网关
 //     JWT cookie 鉴权）
-import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client';
-import type {} from '@deepseek-ai/dsh-client-ui-slots/client';
+import type { Context as ClientContext } from '@deepseek-ai/cordis';
+import type {} from '@deepseek-ai/dsh-api-session-controller/client';
+import type {} from '@deepseek-ai/dsh-api-workspace-controller/client';
 import type {} from '@deepseek-ai/dsh-client-locale/client';
+import type {} from '@deepseek-ai/dsh-client-ui-conversation/client';
+import type {} from '@deepseek-ai/dsh-client-ui-layout/client';
+import type {} from '@deepseek-ai/dsh-client-ui-renderer/client';
+import type {} from '@deepseek-ai/dsh-client-ui-settings/client';
+import type {} from '@deepseek-ai/dsh-client-ui-settings-general/client';
+import type {} from '@deepseek-ai/dsh-client-ui-slots';
+
+// dsh-passwords owns these extension slots; keep their declarations local so
+// the compiler verifies the same registration keys used by the runtime.
+declare module '@deepseek-ai/dsh-client-ui-slots' {
+  interface SlotMap {
+    'dsh-passwords.plugin.item': {
+      kind: 'list';
+      scope: 'root';
+    };
+  }
+}
 import { DshPasswordsCard } from './card';
 import { DshPasswordsSection } from './section';
 import { ChatLauncher } from './chat';
@@ -122,7 +140,6 @@ export function apply(ctx: ClientContext): void {
       {
         name: 'settings.section',
         id: 'dsh-passwords',
-        key: 'dsh-passwords',
         order: 105,
         label: () => ctx.locale.bind('dshpw')('sectionTitle'),
         locale: 'dshpw',
@@ -138,10 +155,8 @@ export function apply(ctx: ClientContext): void {
       {
         name: 'dsh-passwords.plugin.item',
         id: 'dsh-passwords-card',
-        key: 'dsh-passwords-card',
         order: 55,
         locale: 'dshpw',
-        inject: () => ({}),
       },
       DshPasswordsCard,
     ),
@@ -153,10 +168,8 @@ export function apply(ctx: ClientContext): void {
       {
         name: 'shell.overlay',
         id: 'dsh-passwords-chat',
-        key: 'dsh-passwords-chat',
         order: 100,
         locale: 'dshpw',
-        inject: () => ({}),
       },
       ChatLauncher,
     ),
@@ -166,7 +179,7 @@ export function apply(ctx: ClientContext): void {
   // 读取 dsh 的 tokenUsage 投影并把增量上报给密码门，用于子用户每小时 token 配额。
   ctx.slots.inject('conversation.composer.dock', () =>
     ctx.slots.register(
-      { name: 'conversation.composer.dock', id: 'dsh-passwords-token', key: 'dsh-passwords-token', order: 90 },
+      { name: 'conversation.composer.dock', id: 'dsh-passwords-token', order: 90 },
       TokenReporter,
     ),
   );

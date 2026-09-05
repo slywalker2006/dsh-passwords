@@ -102,19 +102,18 @@ for (const code of ['DOWNLOAD_IN_PROGRESS', 'INSTALL_IN_PROGRESS']) {
 test('patch status normalization rejects missing and malformed flags', () => {
   for (const payload of [
     undefined, null, [], {}, { status: null }, { status: [] }, { status: {} },
-    { status: { settingsHostMode: true, whitelist: true } },
-    { status: { settingsHostMode: 'true', whitelist: true, workspaceSearch: true, bindAll: true, connectionCookieBridge: 'patched' } },
-    { status: { settingsHostMode: true, whitelist: 1, workspaceSearch: true, bindAll: true, connectionCookieBridge: 'patched' } },
-    { status: { settingsHostMode: true, whitelist: true, workspaceSearch: 'false', bindAll: true, connectionCookieBridge: 'patched' } },
-    { status: { settingsHostMode: true, whitelist: true, workspaceSearch: true, bindAll: true, connectionCookieBridge: 'invalid' } },
+    { status: { settingsHostMode: true } },
+    { status: { settingsHostMode: 'true', workspaceSearch: true, bindAll: true, connectionCookieBridge: 'patched' } },
+    { status: { settingsHostMode: true, workspaceSearch: 'false', bindAll: true, connectionCookieBridge: 'patched' } },
+    { status: { settingsHostMode: true, workspaceSearch: true, bindAll: true, connectionCookieBridge: 'invalid' } },
   ]) assert.equal(readPatchState(payload), null);
 });
 
 test('patch status normalization preserves valid true and false flags', () => {
   for (const status of [
-    { settingsHostMode: true, whitelist: true, workspaceSearch: true, bindAll: true, connectionCookieBridge: 'patched' },
-    { settingsHostMode: false, whitelist: false, workspaceSearch: false, bindAll: false, connectionCookieBridge: 'missing' },
-    { settingsHostMode: true, whitelist: false, workspaceSearch: true, bindAll: true, connectionCookieBridge: 'native' },
-    { settingsHostMode: true, whitelist: true, workspaceSearch: true, bindAll: true, connectionCookieBridge: 'unsupported' },
+    { settingsHostMode: true, workspaceSearch: true, bindAll: true, connectionCookieBridge: 'patched' },
+    { settingsHostMode: false, workspaceSearch: false, bindAll: false, connectionCookieBridge: 'missing' },
+    { settingsHostMode: true, workspaceSearch: true, bindAll: true, connectionCookieBridge: 'native' },
+    { settingsHostMode: true, workspaceSearch: true, bindAll: true, connectionCookieBridge: 'unsupported' },
   ]) assert.deepEqual(readPatchState({ status }), status);
 });

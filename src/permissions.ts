@@ -662,7 +662,9 @@ export function isUploadRequest(method: string, pathname: string): boolean {
     pathname === '/api/dsh-uploads' ||
     pathname.startsWith('/api/dsh-uploads/') ||
     pathname === '/api/filePathBridge/importFile' ||
-    pathname === '/api/dsh-ssh/upload'
+    pathname === '/api/dsh-ssh/upload' ||
+    pathname === '/api/session/uploadFileBinary' ||
+    pathname === '/api/fileUploads/upload'
   );
 }
 
@@ -828,7 +830,7 @@ export const WORKSPACE_ENDPOINT_RE = /^\/api\/session[.\/](create)([.\/]|$)/;
  * create 无源会话、list 单独做工作区/会话过滤，均不在此列。
  */
 export const SESSION_SCOPED_RE =
-  /^\/api\/(?:session[.\/](?:history|prompt|respond|archive|delete|rename|retitle|title|resume|fork|truncate|export|attachment|updateQueue|cancel|page|openWorkspacePath)|workspace[.\/](?:archiveSession)|commands[.\/](?:list|execute)|subagents[.\/](?:list|prompt|interruptByParent))([.\/]|$)/;
+  /^\/api\/(?:session[.\/](?:history|prompt|respond|archive|delete|rename|retitle|title|resume|fork|truncate|export|attachment|updateQueue|cancel|page|openWorkspacePath|selectModel)|workspace[.\/](?:archiveSession)|commands[.\/](?:list|execute)|subagents[.\/](?:list|prompt|interruptByParent)|fileUploads[.\/](?:upload)|fileReferences[.\/](?:list)|sessionReferenceResolver[.\/](?:candidates)|skills[.\/](?:list)|messageFeedback[.\/](?:list|put|delete)|goals[.\/](?:clear|complete|create|edit|pause|resume)|dynamicCordisRunner[.\/](?:getClientCode|reportClientGuardFailure|reportRenderFailure|resolveInspectQuery|runHostHalf|settleUserRun|stopFromPanel|undefineFromPanel))([.\/]|$)/;
 
 export type SessionAddress =
   | { kind: 'session'; sessionId: string }
@@ -977,30 +979,6 @@ export function collectSessionIds(value: unknown, out: Set<string> = new Set(), 
   return out;
 }
 
-/**
- * 判断 dsh 会话是否有可展示内容。
- *
- * Workspace.sessionIds 保留空白会话槽位，供 dsh 侧恢复工作区排序；这些槽位
- * 不是可配置的历史会话。只有运行时明确提供 deriveMessages() 且结果为空时才
- * 判定为空白。旧版本/持久化会话没有该方法时保守保留，避免兼容性升级误删正常会话。
- */
-export function isDisplayableDshSession(session: unknown): boolean {
-  if (session === null || typeof session !== 'object') return true;
-  const deriveMessages = (session as { deriveMessages?: unknown }).deriveMessages;
-  if (typeof deriveMessages !== 'function') return true;
-  try {
-    const messages = deriveMessages.call(session);
-    return !Array.isArray(messages) || messages.length > 0;
-  } catch {
-    // 会话投影异常不应让设置页静默丢失可配置项。
-    return true;
-  }
-}
-
-/** sessionQuery.readSurface() 的 current surface 为空时表示空白恢复槽位。 */
-export function isDisplayableDshSurface(events: unknown): boolean {
-  return !Array.isArray(events) || events.length > 0;
-}
 
 /** 归档会话快照容量上限：超过时拒绝更新，不能截断后把遗漏会话错误放行。 */
 export const MAX_ARCHIVED_SESSION_IDS = 10_000;
