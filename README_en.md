@@ -350,8 +350,9 @@ Current version: 2.6.10. The current development and deployment baseline is DSH 
 
 ## Contributing
 
-- Issues are welcome for bugs and feature requests; keep PRs focused and include test evidence
-- Run `npm test && npm run build` before submitting; CI runs automatically on Node 22/24
+- Before opening an issue, read the [community checklist](docs/community-checklist.md) and use the [bug](.github/ISSUE_TEMPLATE/bug_report.md) or [feature](.github/ISSUE_TEMPLATE/feature_request.md) template
+- For code contributions, read [CONTRIBUTING.md](CONTRIBUTING.md) and use the [PR template](.github/PULL_REQUEST_TEMPLATE.md); keep changes focused and include test evidence
+- Run `npm ci && npm run build && npm test` before submitting; CI runs automatically on Node 22/24
 
 ## Contributors
 

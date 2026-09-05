@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability / 安全漏洞
+    url: https://github.com/slywalker2006/dsh-passwords/security/advisories/new
+    about: Report vulnerabilities privately; do not publish secrets or exploit details / 请私下报告漏洞，不要公开密钥或可利用细节
+  - name: DSH upstream issues / DSH 上游问题
+    url: https://github.com/deepseek-ai/deepseek-harness/issues
+    about: Check the official DSH project for core runtime and protocol issues / DSH 核心运行时和协议问题请先查看官方项目
+  - name: GitHub Discussions / GitHub 讨论
+    url: https://github.com/slywalker2006/dsh-passwords/discussions
+    about: Ask questions and discuss deployment or broad ideas / 用于提问、部署经验和开放性建议

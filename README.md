@@ -350,8 +350,9 @@ curl -so /dev/null -w "TLS:%{time_appconnect}s\n" https://地址/gateway/login
 
 ## 参与贡献
 
-- 欢迎 Issue 报告问题与需求，PR 请保持改动聚焦并附测试证据
-- 提交前跑 `npm test && npm run build`，CI 会在 Node 22/24 上自动执行
+- 提交问题前请阅读 [社区规范清单](docs/community-checklist.md)，并使用 [问题模板](.github/ISSUE_TEMPLATE/bug_report.md) 或 [功能模板](.github/ISSUE_TEMPLATE/feature_request.md)
+- 代码贡献请阅读 [CONTRIBUTING.md](CONTRIBUTING.md)，使用 [PR 模板](.github/PULL_REQUEST_TEMPLATE.md)，保持改动聚焦并附测试证据
+- 提交前跑 `npm ci && npm run build && npm test`，CI 会在 Node 22/24 上自动执行
 
 ## 贡献者
 
