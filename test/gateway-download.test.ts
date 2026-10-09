@@ -180,6 +180,9 @@ before(async () => {
     jwtSecret: 'test-secret', internalSecret: 'test-internal',
     patch: { dshRoot: '', restartService: '' },
     endpointRules: [],
+    // 选择器浏览根显式限定到夹具所在的临时目录：默认根是 os.homedir()，而 POSIX 的
+    // os.tmpdir()（/tmp）不在家目录内，管理员选择器会按设计 fail-closed 回 403。
+    directoryPickerRoots: [os.tmpdir()],
   };
   const tokenFor = (user: { id: number; username: string }) =>
     `dsh_gateway_token=${jwt.sign({ sub: String(user.id), username: user.username, cv: 0 }, config.jwtSecret, { expiresIn: '12h' })}`;

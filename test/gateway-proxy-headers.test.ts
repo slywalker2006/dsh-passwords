@@ -7636,7 +7636,14 @@ test('Issue #38：home 落点无授权时一律不回放既有目录', async () 
     assert.equal(filtered.status, 200, filtered.body);
     const filteredEntries = entryPaths(filtered.body);
     assert.equal(filteredEntries.some((entry) => entry.includes('home-existing-dir')), false, '未授权 home 不得回放既有目录');
-    assert.deepEqual(filteredEntries, [], 'home 落点只保留通往授权根的导航，上游无关目录被过滤');
+    // 平台无关：授权根位于 home 子树内时走导航分支（当前层无条目，需逐级下钻）；授权根在
+    // 另一棵树（如 POSIX 的 /tmp）时，按初始 picker 设计回放该授权根作为可点击入口。两种
+    // 情形都不得回放 home 的既有目录。
+    assert.ok(
+      filteredEntries.length === 0 ||
+        (filteredEntries.length === 1 && issue38Norm(filteredEntries[0] ?? '') === issue38Norm(rootPath)),
+      `home 落点只保留通往授权根的导航，实得：${JSON.stringify(filteredEntries)}`,
+    );
 
     // __deny__（无可读根）：条目为空，既不回放上游内容也不返回 403。
     const legacy = db.createUser('issue38-home-legacy-user', '$2a$10$dummyhashdummyhashdummyhashdu', 'user');
@@ -7920,16 +7927,27 @@ test('Issue #38：文件系统根浏览不枚举全局目录，只保留通往�
     cookie = issue38Cookie(subUser);
 
     // 上游在根下回一堆全局目录：全部不得回放（根是授权根的祖先，仅导航）。
+    const firstHop = issue38Norm(path.join(fsRoot, issue38Norm(wsRoot).split('/').filter((segment) => segment !== '')[0] ?? ''));
     directoryListEntriesOverride = [
       { path: `${fsRoot}global-top-secret` },
       { path: issue38Norm(`${fsRoot}another-global`) },
+      { path: firstHop },
     ];
     const res = await list(fsRoot, 'fsroot-list');
     assert.equal(res.status, 200, res.body);
     const entries = entryPaths(res.body);
-    // 根是授权根的祖先：上游全局目录全部不回放，只留可进入的授权根入口。
-    assert.deepEqual(entries, [issue38Norm(wsRoot)], '文件系统根只回放授权根入口');
+    // 根是授权根的祖先：上游全局目录全部不回放，只保留通往授权根的导航入口。
+    // 平台无关：POSIX 的 `/` 是授权根的祖先，走导航分支只留下一跳（如 /tmp）；Windows 盘符
+    // 根不满足祖先判定，转而注入完整授权根。两者都必须通往授权根。
     assert.equal(entries.some((entry) => entry.includes('global-top-secret') || entry.includes('another-global')), false, '文件系统根不得枚举全局目录');
+    const target = issue38Norm(wsRoot).replace(/\/+$/, '');
+    assert.ok(
+      entries.some((entry) => {
+        const normalized = entry.replace(/\/+$/, '');
+        return normalized === target || target.startsWith(`${normalized}/`);
+      }),
+      `文件系统根只保留通往授权根的导航，实得：${JSON.stringify(entries)}`,
+    );
   } finally {
     directoryListEntriesOverride = null;
     cookie = originalCookie;
