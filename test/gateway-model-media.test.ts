@@ -425,7 +425,7 @@ before(async () => {
         duringAssignableResources = null;
         hook?.();
         res.writeHead(200, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, folders: ['/workspaces/visible'], sessions: assignableSessionIds }));
+        res.end(JSON.stringify({ ok: true, folders: ['/workspaces/visible'], sessions: assignableSessionIds, retainedSessions: [] }));
         return;
       }
       if (url.startsWith('/api/workspace.list')) {
@@ -1149,6 +1149,55 @@ test('媒体上传：上传其他用户的 upload ID 被拒绝（IDOR）', async
   assert.notEqual(db.getMediaAsset(mediaId)?.state, 'ready', '越权上传不得把资产变为 ready');
 });
 
+// ═══════════════════════════════════════════════════════
+// 五之一、媒体上传并发准入（MEDIA_MAX_CONCURRENT_UPLOADS）
+// ═══════════════════════════════════════════════════════
+
+const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** 打开一个不结束 body 的 PUT（chunked），保持连接占用一个并发槽位。 */
+function openHeldPut(url: string, cookieValue: string, firstChunk: Buffer): { destroy: () => void } {
+  const r = http.request({
+    host: '127.0.0.1',
+    port: gatewayPort,
+    method: 'PUT',
+    path: url,
+    headers: { cookie: cookieValue, 'content-type': 'image/png', 'transfer-encoding': 'chunked' },
+  });
+  r.on('error', () => { /* 用例结束时主动 destroy，忽略 */ });
+  r.write(firstChunk);
+  return { destroy: () => { try { r.destroy(); } catch { /* 已关闭 */ } } };
+}
+
+test('媒体上传：并发 PUT 超过上限时按 MEDIA_BUSY 拒绝（PUT 入口准入，而非只依赖 init）', async () => {
+  const user = freshMediaUser('media-busy');
+  // 先一次签发 4 个 pending 资产：此时没有打开的 PUT，init 的并发检查不会拦。
+  const ids: string[] = [];
+  for (let i = 0; i < 4; i += 1) {
+    const init = await initMedia(user.cookie, `busy-${String(i)}.png`);
+    assert.equal(init.status, 200, init.body);
+    ids.push(uploadIdOf(init));
+  }
+  const held: Array<{ destroy: () => void }> = [];
+  try {
+    // 打开 3 个不结束的 PUT：服务端收到请求头即占用并发槽位。
+    for (let i = 0; i < 3; i += 1) {
+      held.push(openHeldPut(`/gateway/api/message-media/${encodeURIComponent(ids[i]!)}`, user.cookie, PNG_BYTES.subarray(0, 8)));
+    }
+    await delay(200); // 等 3 个请求头到达并被处理器计数
+    const busy = await putBytes(`/gateway/api/message-media/${encodeURIComponent(ids[3]!)}`, PNG_BYTES, {
+      cookie: user.cookie,
+      headers: { 'content-type': 'image/png' },
+    });
+    assert.equal(busy.status, 429, `第 4 个并发 PUT 必须被拒：${busy.body}`);
+    assert.equal(busy.json.code, 'MEDIA_BUSY', '并发超限应回 MEDIA_BUSY');
+    // 被拒的资产必须仍是 pending（可重试），不得被标记 failed。
+    assert.equal(db.getMediaAsset(ids[3]!)?.state, 'pending', '并发背压不得失败化上传资产');
+  } finally {
+    for (const handle of held) handle.destroy();
+  }
+});
+
 // ══════════════════════════════════════════════════════════════════════
 // 五之二、媒体上传配额（MEDIA_MAX_PENDING_ASSETS_PER_USER）
 // ══════════════════════════════════════════════════════════════════════
@@ -1337,6 +1386,11 @@ test('视频 Range：图片不参与 Range（避免无意义的攻击面）', as
   });
   assert.equal(res.status, 200, '图片带 Range 头仍返回完整 200');
   assert.equal(Number(res.headers['content-length']), PNG_BYTES.length);
+  assert.equal(
+    res.headers['accept-ranges'],
+    undefined,
+    '图片未实现 Range，不得声明 Accept-Ranges（否则下载器误以为支持断点续传）',
+  );
 });
 
 test('媒体读取：客户端中途断开必须销毁源流（不泄漏 fd）', async () => {

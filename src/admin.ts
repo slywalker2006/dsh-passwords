@@ -36,6 +36,7 @@ import {
   statSync,
   writeFileSync,
 } from 'node:fs';
+import { opendir } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { spawn, spawnSync } from 'node:child_process';
 import os from 'node:os';
@@ -54,9 +55,10 @@ import {
   type UserPermissionsRow,
   type WorkspaceCleanupIntent,
 } from './db.js';
-import { folderAllowed, normalizePath, todayLocal, SANDBOX_RANK } from './permissions.js';
+import { folderAllowed, isFilesystemRootPath, isFullyQualifiedPath, normalizePath, todayLocal, SANDBOX_RANK } from './permissions.js';
 import { findDshRoot } from './patch.js';
 import { isContainerRuntime } from './update.js';
+import { createSensitivePathChecker } from './sensitive-paths.js';
 
 /** 规范化后的 `provider/model` 允许项；与 gateway 内部 AllowedModelSpec 结构一致。 */
 export interface AllowedModelSpec {
@@ -96,7 +98,8 @@ const WebSocket = require('ws') as {
 /** 上游 assignable-resources 探针结果（与 gateway 内 AssignableResources 结构一致）。 */
 export interface AssignableResources {
   folders: Set<string>;
-  sessions: Set<string>;
+  assignableSessions: Set<string>;
+  retainedSessions: Set<string>;
 }
 
 /**
@@ -214,6 +217,137 @@ export interface AdminRoutesHandle {
    * 保持拆分的零行为变化；权限改配额时本模块也会在此表上 delete。
    */
   usageReportThrottle: Map<number, number>;
+}
+
+// ── 管理员目录选择器：browse roots 纯函数 ────────────────────────────
+// 与文件系统无关的判定抽成模块级纯函数便于直接测试；真实存在性/敏感基/符号链接越界
+// 由路由在使用前按当前文件系统状态校验（fail-closed）。
+
+/** 归一化比较键：normalizePath + win32 折叠大小写（与敏感路径判定同口径）。 */
+export function directoryPickerPathKey(value: string): string {
+  const normalized = normalizePath(value);
+  return process.platform === 'win32' ? normalized.toLowerCase() : normalized;
+}
+
+/** candidate 是否位于 base 子树内（含相等），按路径段边界比较；base='/' 或 'X:/' 均可。 */
+export function directoryPickerPathWithin(base: string, candidate: string): boolean {
+  const baseSegments = directoryPickerPathKey(base).split('/').filter((segment) => segment !== '');
+  const candidateSegments = directoryPickerPathKey(candidate).split('/').filter((segment) => segment !== '');
+  if (baseSegments.length > candidateSegments.length) return false;
+  return baseSegments.every((segment, index) => segment === candidateSegments[index]);
+}
+
+/**
+ * 若 ancestor 是 descendant 的严格祖先（按段边界与大小写口径一致），返回从 ancestor
+ * 通往 descendant 的直接子路径（归一化形态，保留 descendant 的实际段大小写）；否则 null。
+ * 用于「祖先路径只返回通往安全 root 的条目」：不枚举祖先目录的其它兄弟。
+ */
+export function directoryPickerChildToward(ancestor: string, descendant: string): string | null {
+  const ancestorNorm = normalizePath(ancestor);
+  const descendantNorm = normalizePath(descendant);
+  if (directoryPickerPathKey(ancestorNorm) === directoryPickerPathKey(descendantNorm)) return null;
+  if (!directoryPickerPathWithin(ancestorNorm, descendantNorm)) return null;
+  const depth = directoryPickerPathKey(ancestorNorm).split('/').filter((segment) => segment !== '').length;
+  const descendantSegments = descendantNorm.split('/').filter((segment) => segment !== '');
+  const segment = descendantSegments[depth];
+  if (segment === undefined || segment === '') return null;
+  return normalizePath(ancestorNorm.endsWith('/') ? `${ancestorNorm}${segment}` : `${ancestorNorm}/${segment}`);
+}
+
+/** 已校验的 browse root：词法路径与 canonical（realpath）路径（均为归一化形态）。 */
+export interface DirectoryPickerRootRef {
+  lexical: string;
+  real: string;
+}
+
+/** 请求路径相对 browse roots 的位置。 */
+export interface DirectoryPickerScope {
+  kind: 'root' | 'inside' | 'ancestor' | 'outside';
+  /** kind 为 root/inside 时命中的 browse root 下标；否则 -1。 */
+  rootIndex: number;
+  /** kind 为 ancestor 时通往各安全 root 的直接子路径（归一化、已排序）；否则空数组。 */
+  ancestorEntries: string[];
+}
+
+/**
+ * 分类请求路径相对 browse roots 的位置。选择最具体的 root：先看是否等于某个 root
+ * （parentPath 将为 null），再看是否位于某个 root 子树内（词法与 canonical 必须同时命中
+ * 同一 root，否则视为符号链接逃逸）；都不命中且是某 root 的祖先时归为 ancestor（只回
+ * 通往 root 的直接子条目）；否则 outside（拒绝，不把用户 path 当作新的 browse root）。
+ */
+export function classifyDirectoryPickerTarget(
+  target: DirectoryPickerRootRef,
+  roots: readonly DirectoryPickerRootRef[],
+): DirectoryPickerScope {
+  let bestIndex = -1;
+  let bestDepth = -1;
+  let exact = false;
+  for (let index = 0; index < roots.length; index += 1) {
+    const root = roots[index];
+    if (!directoryPickerPathWithin(root.lexical, target.lexical)) continue;
+    if (!directoryPickerPathWithin(root.real, target.real)) continue;
+    const depth = directoryPickerPathKey(root.lexical).split('/').filter((segment) => segment !== '').length;
+    if (directoryPickerPathKey(root.lexical) === directoryPickerPathKey(target.lexical)) {
+      exact = true;
+      bestIndex = index;
+      break;
+    }
+    if (depth > bestDepth) {
+      bestDepth = depth;
+      bestIndex = index;
+    }
+  }
+  if (bestIndex >= 0) {
+    return { kind: exact ? 'root' : 'inside', rootIndex: bestIndex, ancestorEntries: [] };
+  }
+  const ancestorEntries: string[] = [];
+  for (const root of roots) {
+    const child = directoryPickerChildToward(target.lexical, root.lexical);
+    if (child !== null && !ancestorEntries.includes(child)) ancestorEntries.push(child);
+  }
+  if (ancestorEntries.length > 0) {
+    ancestorEntries.sort();
+    return { kind: 'ancestor', rootIndex: -1, ancestorEntries };
+  }
+  return { kind: 'outside', rootIndex: -1, ancestorEntries: [] };
+}
+
+/** 选择器条目标签：取归一化路径最后一段；根路径（无段）回退整串。 */
+export function directoryPickerEntryName(candidate: string): string {
+  const trimmed = normalizePath(candidate).replace(/\/+$/, '');
+  const segments = trimmed.split('/').filter((segment) => segment !== '');
+  return segments.length > 0 ? segments[segments.length - 1] : trimmed;
+}
+
+/**
+ * 校验并归一化 browse roots：丢弃非平台合规绝对路径、全盘根、不存在/非目录、词法或
+ * canonical 命中敏感基的候选；按归一化词法路径去重。绝不因某个候选非法而放宽到全盘根。
+ */
+export function resolveDirectoryPickerBrowseRoots(
+  configured: readonly string[],
+  isSensitive: (candidate: string) => boolean,
+): DirectoryPickerRootRef[] {
+  const roots: DirectoryPickerRootRef[] = [];
+  const seen = new Set<string>();
+  for (const candidate of configured) {
+    if (candidate.includes('\u0000') || !isFullyQualifiedPath(candidate)) continue;
+    const lexical = path.resolve(candidate);
+    if (isFilesystemRootPath(lexical)) continue;
+    let real: string;
+    try {
+      if (!statSync(lexical).isDirectory()) continue;
+      real = realpathSync(lexical);
+    } catch {
+      continue;
+    }
+    if (isFilesystemRootPath(real)) continue;
+    if (isSensitive(lexical) || isSensitive(real)) continue;
+    const key = directoryPickerPathKey(lexical);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    roots.push({ lexical: normalizePath(lexical), real: normalizePath(real) });
+  }
+  return roots;
 }
 
 /**
@@ -593,39 +727,36 @@ export function registerAdminRoutes(app: Application, deps: AdminRouteDeps): Adm
     });
   });
 
-  // ── 敏感目录基列表（下载与目录删除共用）────────────────────
-  // 部署根（盖 .env/dist/scripts）、数据库及其 data/ 父两级、DSH 安装根、
-  // DSH 家目录（会话/设置/凭据）、本机 SSH 凭据、OS 系统目录。
-  const sensitivePathBases = (): string[] => {
-    const dbReal = (() => {
-      try {
-        return realpathSync(config.dbPath);
-      } catch {
-        return path.resolve(config.dbPath);
-      }
-    })();
-    const home = os.homedir();
-    const dshHome = process.env.DSH_HOME !== undefined && process.env.DSH_HOME !== ''
-      ? path.resolve(process.env.DSH_HOME)
-      : path.join(home, '.dsh');
-    // dsh 安装根：显式配置或自动探测（npm root -g/@deepseek-ai/dsh）；
-    // 用 findDshRoot 而不是直接读 config.patch.dshRoot，因为它可能是空（自动探测）
-    const resolvedDshRoot = findDshRoot(config.patch.dshRoot);
-    return [
-      gatewayRoot,
-      configuredRoot,
-      dbReal,
-      path.dirname(dbReal),
-      // 部署目录（dbPath 的 data/ 再上一级）：盖住 .env / dist / scripts
-      path.dirname(path.dirname(dbReal)),
-      resolvedDshRoot !== null ? resolvedDshRoot : '',
-      dshHome,
-      path.join(home, '.ssh'),
-      ...(process.platform === 'win32' ? [] : ['/etc', '/proc', '/sys', '/dev', '/boot']),
-    ].filter((p) => p !== '');
+  // ── 敏感目录基列表（下载与目录删除共用；实现与 gateway 同源）──────
+  const { isSensitivePath, sensitivePathBases } = createSensitivePathChecker({
+    dbPath: config.dbPath,
+    dshRoot: config.patch.dshRoot,
+    gatewayRoot,
+    configuredRoot,
+  });
+
+  // ── 创建根/创建位置的共用路径判定 ─────────────────────────────
+  /**
+   * 平台合规的完全限定路径：Windows 必须 drive-qualified；/foo 与 \\foo 会按当前盘解析，
+   * 属于含糊输入，必须拒绝。共享 helper 同时供保存校验与目录选择器使用。
+   */
+  const isPlatformAbsolutePath = isFullyQualifiedPath;
+  /**
+   * 真实存在、为目录、非根，且词法与 canonical 均非敏感的本地目录。
+   * 供 allowedFolders 回退分配使用：DSH registry 是正向分配的权威来源，但目录选择器
+   * 允许主用户显式分配一个尚未登记进 registry 的本地真实目录（不新增 DB 字段）。
+   */
+  const isAssignableRealDirectory = (candidate: string): boolean => {
+    let real: string;
+    try {
+      if (!statSync(candidate).isDirectory()) return false;
+      real = realpathSync(candidate);
+    } catch {
+      return false;
+    }
+    if (isFilesystemRootPath(candidate) || isFilesystemRootPath(real)) return false;
+    return !isSensitivePath(candidate) && !isSensitivePath(real);
   };
-  const isSensitivePath = (p: string): boolean =>
-    sensitivePathBases().some((base) => p === base || p.startsWith(base + path.sep));
 
   // ── 远程文件下载（Issue #4）──────────────────────────────────
   // 经网关远程访问时，点击对话里的“生成文件”标签不再在服务器容器里执行
@@ -680,7 +811,7 @@ export function registerAdminRoutes(app: Application, deps: AdminRouteDeps): Adm
 
     // 4) 敏感路径屏蔽：DSH_HOME（会话/设置/凭据）、数据库、部署目录（盖 .env/data/dist）、
     //    本机 SSH 凭据、OS 系统目录（/etc /proc /sys /dev —— 永不会是工作区文件）
-    if (isSensitivePath(real)) {
+    if (isSensitivePath(abs) || isSensitivePath(real)) {
       res.status(403).json({ ok: false, code: 'FORBIDDEN', error: '敏感文件不可下载' });
       return;
     }
@@ -721,7 +852,195 @@ export function registerAdminRoutes(app: Application, deps: AdminRouteDeps): Adm
       if (!res.headersSent) res.status(500).json({ ok: false, code: 'INTERNAL', error: '读取失败' });
       else res.destroy();
     });
+    // 客户端中途断开时 pipe 只 unpipe、不销毁源流，被挂住的 ReadStream 会永久占着
+    // fd；订阅响应 close，在【未写完】时显式 destroy（正常写完走 autoClose 关 fd）。
+    res.once('close', () => {
+      if (!res.writableFinished) stream.destroy();
+    });
     stream.pipe(res);
+  });
+
+  // ── 管理员目录选择器：为 allowedFolders 浏览可选目录 ──────────
+  // 仅主用户可用。响应统一为：
+  //   { ok:true, currentPath:string|null, parentPath:string|null, selectable:boolean,
+  //     entries:{ name, path, selectable }[], truncated:boolean,
+  //     rootPath?:string, rootPaths:string[] }
+  // browse roots（唯一授权浏览范围）：
+  //   · 由 MCP_GATEWAY_DIRECTORY_PICKER_ROOTS（逗号/换行分隔的绝对路径）给出；未配置时唯一
+  //     安全起点为 os.homedir()。全盘根（/ 或盘符根）永不作为起点——绝不从整机根枚举。
+  //   · 每个 root 使用前按当前文件系统状态校验：存在、为目录、词法与 canonical 均非敏感且
+  //     非全盘根；校验失败的候选直接丢弃（fail-closed），绝不因配置错误放宽到更宽的路径。
+  // 契约：
+  //   · 无 path：返回安全 roots 的入口条目（不下钻到 root 的子目录），currentPath/parentPath=null。
+  //   · 有 path：必须平台合规绝对路径，且词法与 canonical 同时位于某个 browse root，或位于
+  //     某个 root 的祖先链上（祖先只返回通往安全 root 的直接子条目，不枚举兄弟）。
+  //   · root 自身 parentPath=null；子树内其它目录按真实父目录回溯，parentPath 绝不越过 root。
+  //   · 绝不返回文件名/符号链接/非目录；敏感路径与 canonical 落到敏感基的一并过滤。
+  //   · 用户传入的 path 永远不会被当作新的 browse root；不在范围内一律拒绝。
+  //   · 目录读取错误回 HTTP 错误（不是 Express 未捕获）；响应 no-store。
+  //   · 用 opendir 有界读取并回传 truncated，避免超大目录阻塞；结果排序。
+  const DIRECTORY_PICKER_MAX_ENTRIES = 2000;
+  const DIRECTORY_PICKER_SCAN_LIMIT = 4000;
+  type DirectoryPickerEntry = { name: string; path: string; selectable: boolean };
+
+  /** 每请求求值一次的安全 roots；config 已按平台默认/环境变量解析，未配置时为家目录。 */
+  const directoryPickerRoots = (): DirectoryPickerRootRef[] =>
+    resolveDirectoryPickerBrowseRoots(config.directoryPickerRoots ?? [os.homedir()], isSensitivePath);
+
+  /**
+   * 敏感基快照：与 createSensitivePathChecker 的 isSensitivePath 完全一致（normalizePath +
+   * win32 折叠大小写）。每请求按当前文件系统状态求值一次，供目录项逐条复用，避免重复 realpath。
+   */
+  const directoryPickerSensitiveKeys = (): ((candidate: string) => boolean) => {
+    const caseFold = process.platform === 'win32'
+      ? (value: string): string => value.toLowerCase()
+      : (value: string): string => value;
+    const normalizedBases = sensitivePathBases().map((base) => caseFold(normalizePath(base)));
+    return (candidate: string): boolean => {
+      const normalized = caseFold(normalizePath(candidate));
+      return normalizedBases.some((base) => normalized === base || normalized.startsWith(`${base}/`));
+    };
+  };
+
+  /** 收集 dir 的直接子目录（限同一 root 内），过滤敏感项、符号链接与 canonical 逃逸。 */
+  const collectSubdirectories = async (
+    dir: string,
+    root: DirectoryPickerRootRef,
+  ): Promise<{ entries: DirectoryPickerEntry[]; truncated: boolean }> => {
+    const isSensitive = directoryPickerSensitiveKeys();
+    const entries: DirectoryPickerEntry[] = [];
+    let truncated = false;
+    let scanned = 0;
+    const handle = await opendir(dir);
+    try {
+      for await (const dirent of handle) {
+        if (scanned >= DIRECTORY_PICKER_SCAN_LIMIT) { truncated = true; break; }
+        scanned += 1;
+        // 符号链接条目一律不返回：链接目标可能跳出 browse root（fail-closed）。
+        if (dirent.isSymbolicLink() || !dirent.isDirectory()) continue;
+        const lexicalPath = path.join(dir, dirent.name);
+        let real: string;
+        try {
+          if (!statSync(lexicalPath).isDirectory()) continue;
+          real = realpathSync(lexicalPath);
+        } catch {
+          continue;
+        }
+        if (isSensitive(lexicalPath) || isSensitive(real)) continue;
+        // canonical 必须仍在同一 root 内：junction/挂载/链接逃逸一律丢弃。
+        if (!directoryPickerPathWithin(root.lexical, lexicalPath) || !directoryPickerPathWithin(root.real, real)) continue;
+        entries.push({ name: dirent.name, path: normalizePath(lexicalPath), selectable: true });
+      }
+    } finally {
+      await handle.close().catch(() => { /* 关闭失败不影响已读取结果 */ });
+    }
+    entries.sort((left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : 0));
+    if (entries.length > DIRECTORY_PICKER_MAX_ENTRIES) {
+      truncated = true;
+      entries.length = DIRECTORY_PICKER_MAX_ENTRIES;
+    }
+    return { entries, truncated };
+  };
+  app.get('/gateway/api/directory-picker/list', async (req, res) => {
+    const me = apiAuth(req, res, true);
+    if (!me) return;
+    res.setHeader('Cache-Control', 'no-store');
+    try {
+      const rawQuery = req.query.path;
+      if (rawQuery !== undefined && typeof rawQuery !== 'string') {
+        res.status(400).json({ ok: false, code: 'INVALID', error: 'path 无效' });
+        return;
+      }
+      const rawPath = rawQuery === undefined ? '' : rawQuery;
+      const roots = directoryPickerRoots();
+      const rootPaths = roots.map((root) => root.lexical);
+      // 无 path：返回安全 roots 的入口，不下钻到 root 的子目录。
+      if (rawPath === '') {
+        const entries: DirectoryPickerEntry[] = roots.map((root) => ({
+          name: directoryPickerEntryName(root.lexical),
+          path: root.lexical,
+          selectable: true,
+        }));
+        res.json({ ok: true, currentPath: null, parentPath: null, selectable: false, entries, truncated: false, rootPaths });
+        return;
+      }
+      // 有 path：必须是平台合规的绝对路径；相对路径与 Windows 默认盘形态一律拒绝。
+      if (rawPath.includes('\u0000') || !isPlatformAbsolutePath(rawPath)) {
+        res.status(400).json({ ok: false, code: 'INVALID', error: 'path 必须是绝对路径' });
+        return;
+      }
+      const abs = path.resolve(rawPath);
+      let real: string;
+      let st;
+      try {
+        real = realpathSync(abs);
+        st = statSync(abs);
+      } catch {
+        res.status(404).json({ ok: false, code: 'NOT_FOUND', error: '目录不存在' });
+        return;
+      }
+      if (!st.isDirectory()) {
+        res.status(400).json({ ok: false, code: 'INVALID', error: '不是目录' });
+        return;
+      }
+      // 词法与 canonical 都不敏感：管理员也不能浏览 DSH 会话/凭据/部署目录。
+      if (isSensitivePath(abs) || isSensitivePath(real)) {
+        res.status(403).json({ ok: false, code: 'FORBIDDEN', error: '敏感路径不可浏览' });
+        return;
+      }
+      const scope = classifyDirectoryPickerTarget(
+        { lexical: normalizePath(abs), real: normalizePath(real) },
+        roots,
+      );
+      if (scope.kind === 'outside') {
+        // 用户传入的 path 永远不会被当作新的 browse root。
+        res.status(403).json({ ok: false, code: 'FORBIDDEN', error: '不在允许浏览的范围内' });
+        return;
+      }
+      if (scope.kind === 'ancestor') {
+        // 祖先路径只返回通往安全 root 的直接子条目：既不枚举兄弟目录，也不可作为落点。
+        const isSensitive = directoryPickerSensitiveKeys();
+        const entries: DirectoryPickerEntry[] = [];
+        for (const childPath of scope.ancestorEntries) {
+          let childReal: string;
+          try {
+            if (!statSync(childPath).isDirectory()) continue;
+            childReal = realpathSync(childPath);
+          } catch {
+            continue;
+          }
+          if (isSensitive(childPath) || isSensitive(childReal)) continue;
+          entries.push({ name: directoryPickerEntryName(childPath), path: childPath, selectable: false });
+        }
+        const parentPath = isFilesystemRootPath(abs) ? null : normalizePath(path.dirname(abs));
+        res.json({ ok: true, currentPath: normalizePath(abs), parentPath, selectable: false, entries, truncated: false, rootPaths });
+        return;
+      }
+      const root = roots[scope.rootIndex];
+      let listing: { entries: DirectoryPickerEntry[]; truncated: boolean };
+      try {
+        listing = await collectSubdirectories(abs, root);
+      } catch {
+        res.status(500).json({ ok: false, code: 'INTERNAL', error: '目录读取失败' });
+        return;
+      }
+      // root 自身 parentPath=null；子树内目录按真实父目录回溯，绝不越过 root。
+      const parentPath = scope.kind === 'root' ? null : normalizePath(path.dirname(abs));
+      res.json({
+        ok: true,
+        currentPath: normalizePath(abs),
+        parentPath,
+        selectable: true,
+        entries: listing.entries,
+        truncated: listing.truncated,
+        rootPath: root.lexical,
+        rootPaths,
+      });
+    } catch {
+      // 兜底：任何未预期异常都回 HTTP 错误，而不是 Express 未捕获的 rejected promise。
+      if (!res.headersSent) res.status(500).json({ ok: false, code: 'INTERNAL', error: '目录读取失败' });
+      else res.end();
+    }
   });
 
   // ── 目录删除联动：上游 workspace registry 快照与删除 ─────────────
@@ -1553,6 +1872,16 @@ export function registerAdminRoutes(app: Application, deps: AdminRouteDeps): Adm
     if (allowGitDownload === null) return;
     const allowWorkspaceCreate = readBooleanPermission('allowWorkspaceCreate', body.allowWorkspaceCreate, currentPermissions.allow_workspace_create);
     if (allowWorkspaceCreate === null) return;
+    // workspaceCreationRoots 已退役：allowedFolders 是唯一的工作区/创建范围。旧客户端仍可能
+    // 提交该字段；显式 400（而非静默忽略）避免管理员误以为旧的创建根设置已生效。
+    if (body.workspaceCreationRoots !== undefined) {
+      res.status(400).json({
+        ok: false,
+        code: 'INVALID',
+        error: 'workspaceCreationRoots 已停用；工作区范围（含可创建位置）统一由 allowedFolders 配置',
+      });
+      return;
+    }
     const allowSsh = readBooleanPermission('allowSsh', body.allowSsh, currentPermissions.allow_ssh);
     if (allowSsh === null) return;
     const banned = readBooleanPermission('banned', body.banned, currentPermissions.banned);
@@ -1676,15 +2005,25 @@ export function registerAdminRoutes(app: Application, deps: AdminRouteDeps): Adm
     // the live registry and archive state, so a gateway cache or client draft
     // cannot authorize a deleted/archived session. A missing authority is a
     // 502, never an implicit allow.
-    if (body.allowedSessionIds !== undefined || allowedFolders.length > 0 && !denyAll) {
+    // 只有显式提交 allowedSessionIds 或 allowedFolders 时才需要这份权威核验。
+    // 未提交 allowedFolders 时它只是被部分更新保留的既有值：不能因为当前存在目录
+    // 就强制探测资源，否则探针不可用会把 banned/quota 等无关字段的保存变成 502。
+    const foldersSubmitted = body.allowedFolders !== undefined;
+    if (body.allowedSessionIds !== undefined || (foldersSubmitted && allowedFolders.length > 0 && !denyAll)) {
       const resources = await fetchAssignableResources();
       if (resources === null) {
         res.status(502).json({ ok: false, code: 'RESOURCES_UNAVAILABLE', error: '可分配资源暂不可用' });
         return;
       }
       const previousGrants = new Set(previousAllowedSessionIds);
-      const staleSessionIds = allowedSessionIds.filter((id) => !resources.sessions.has(id) && previousGrants.has(id));
-      const invalidSession = allowedSessionIds.find((id) => !resources.sessions.has(id) && !previousGrants.has(id));
+      const assignableSessions = resources.assignableSessions;
+      const retainedSessions = resources.retainedSessions;
+      const staleSessionIds = allowedSessionIds.filter((id) =>
+        !assignableSessions.has(id) && !retainedSessions.has(id) && previousGrants.has(id),
+      );
+      const invalidSession = allowedSessionIds.find((id) =>
+        !assignableSessions.has(id) && !previousGrants.has(id),
+      );
       if (invalidSession !== undefined) {
         res.status(400).json({ ok: false, code: 'SESSION_NOT_ASSIGNABLE', error: '会话不存在、已归档或当前不可分配' });
         return;
@@ -1700,10 +2039,15 @@ export function registerAdminRoutes(app: Application, deps: AdminRouteDeps): Adm
         const submitted = new Set(allowedSessionIds);
         const disabled = new Set(disabledSessions);
         unackedDroppedGrants = previousAllowedSessionIds.filter((id) =>
-          resources.sessions.has(id) && !submitted.has(id) && !disabled.has(id),
+          assignableSessions.has(id) && !submitted.has(id) && !disabled.has(id),
         );
       }
-      if (!denyAll && allowedFolders.some((folder) => !resources.folders.has(normalizePath(folder)))) {
+      if (foldersSubmitted && !denyAll && allowedFolders.some((folder) =>
+        !resources.folders.has(normalizePath(folder)) && !isAssignableRealDirectory(folder),
+      )) {
+        // DSH registry 是正向分配的权威来源：命中即放行（含测试 fixture 的假路径）。
+        // 未登记时仅回退到「真实存在 / 目录 / 非根 / 词法+canonical 非敏感」的本地目录；
+        // 未知、不存在、敏感与根一律拒绝——绝不用任意目录绕过授权，也不自动 grant 会话。
         res.status(400).json({ ok: false, code: 'WORKSPACE_NOT_ASSIGNABLE', error: '工作区不存在或当前不可分配' });
         return;
       }
@@ -1725,9 +2069,9 @@ export function registerAdminRoutes(app: Application, deps: AdminRouteDeps): Adm
     const quotaChanged =
       prevPerms.hourly_token_limit !== hourlyTokenLimit || prevPerms.daily_minutes_limit !== dailyMinutesLimit;
     const sameStringSet = (left: readonly string[], right: readonly string[]): boolean => {
-      if (left.length !== right.length) return false;
       const a = new Set(left);
-      return right.every((value) => a.has(value));
+      const b = new Set(right);
+      return a.size === b.size && [...a].every((value) => b.has(value));
     };
     const sameFolderSet = (left: readonly string[], right: readonly string[]): boolean => {
       const normalize = (value: string): string => value === '__deny__' ? value : normalizePath(value);
@@ -1754,6 +2098,13 @@ export function registerAdminRoutes(app: Application, deps: AdminRouteDeps): Adm
       mediaChanged ||
       modelsChanged ||
       !sameNullableStringSet(prevPerms.allowed_agent_presets, allowedAgentPresets);
+    // pending 目录信任窗口（gateway.ts，30 分钟 TTL）是「按创建时权限授予的临时登记
+    // 授权」：撤权（foldersChanged）或关闭新建（allowWorkspaceCreate true→false）后必须
+    // 立即作废，不能靠 TTL 慢慢过期，否则旧 pending 仍会替 workspace/create 放行登记
+    // （登记门禁本身不看 allowWorkspaceCreate）。目录删除的逐树清理语义不受影响，仍由
+    // fs/delete-directory 分支按被删树逐条清理。
+    const workspaceCreateClosed = prevPerms.allow_workspace_create && !allowWorkspaceCreate;
+    const workspaceCreateAuthorityChanged = foldersChanged || workspaceCreateClosed;
     try {
       db.setPermissions(userId, {
         allowedFolders,
@@ -1810,9 +2161,26 @@ export function registerAdminRoutes(app: Application, deps: AdminRouteDeps): Adm
       }
       throw error;
     }
-    // DB 已提交后先设版本栅栏：后续沙盒收紧存在 await，不能让旧请求快照的
-    // create/fork 响应在该窗口把新会话写回刚保存的授权集合。
-    if (accessChanged) fenceUserAccessEpoch(userId);
+    // DB 已提交后立即作废该用户的 pending 目录信任窗口：放在沙盒 await 之前，
+    // 确保在途创建/登记请求不能借旧窗口继续放行。目录删除的逐树清理仍由
+    // fs/delete-directory 分支负责；这里按用户整表清理只处理权限收紧/关闭新建。
+    if (workspaceCreateAuthorityChanged) {
+      pendingCreatedDirectories.delete(userId);
+      // 关闭 allowWorkspaceCreate 时推进 epoch：proxy 的迟到回包防线用「请求开始时 epoch」
+      // 复核，只有 epoch 变化才能阻止在途 createDirectory 回包把已清除的 pending 目录重新记账。
+      if (workspaceCreateClosed) fenceUserAccessEpoch(userId);
+    }
+    // DB 已提交后立即切断旧订阅：后续沙盒收紧存在 await，不能让旧的
+    // legacy events.mux / Remote carrier 在等待窗口继续发送已撤回业务帧。
+    // epoch 栅栏仍用于阻止旧请求快照在 await 后回写授权集合。
+    if (accessChanged || sshChanged || otherPermissionChanged) {
+      if (accessChanged) {
+        fenceUserAccessEpoch(userId);
+        invalidateUserSessionAccess(userId);
+      }
+      if (accessChanged || sshChanged) closeUserRemoteMuxClients(userId);
+      closeUserWebSocketClients(userId);
+    }
     // alpha.3 在每次工具执行时从 session log 的 sandbox/mode 折叠真实策略。
     // 因此受限子用户的每个会话授权都必须先把 log 里的 sandbox 档位注入到授权级
     // 别，绝不由权限保存隐式提升旧 session。
@@ -1843,21 +2211,23 @@ export function registerAdminRoutes(app: Application, deps: AdminRouteDeps): Adm
         // 只回收被沙盒策略拒绝的会话；整表替换会抹掉本次 await 期间子用户
         // session/create 并发追加（且并未被拒绝）的会话授权。
         db.deleteUserSessionGrants(userId, sandboxRevokedSessionIds);
+        // 上面的 await 窗口里 carrier 已被切断并重连，DSH 可能已凭“grant 仍在 DB”
+        // 重建过 workspace baseline；HTTP prompt 只信该内存快照（不复查 DB grant），
+        // 会据此继续转发刚被回收的会话。所以删除权威 grant 后必须再次失效快照并
+        // 关闭 carrier，让 control baseline、prompt 与列表投影统统从删除后的权威
+        // 权限集合重建，绝不允许旧快照在沙盒回收后继续转发。
+        invalidateUserSessionAccess(userId);
+        closeUserRemoteMuxClients(userId);
+        closeUserWebSocketClients(userId);
       }
     }
     // 只有显式提交会话集合时才完成一次性旧数据迁移/初始化；该标记已与权限行和
     // grant 集合在同一事务提交，避免沙盒 await 窗口被首次 baseline 全表种子覆盖。
     // 仅在实际影响会话可见性的权限变化后失效旧快照；同值保存必须是 no-op，
     // 否则设置页的重复提交会反复撕裂 Remote mux 并触发 DSH 无限重连。
-    if (accessChanged || sshChanged) {
-      if (accessChanged) invalidateUserSessionAccess(userId);
-      // Remote mux 现在也承载官方 terminal 流。SSH 开关变化必须关闭旧 carrier，
-      // 让 DSH 重新认证并重新建立允许的逻辑流，避免撤销后继续持有宿主终端。
-      closeUserRemoteMuxClients(userId);
-    }
-    // SSH 开关变化、封禁或其它实际权限变化都要撤销旧的 legacy/登记 WS；
-    // 没有实际变化时不触碰连接。
-    if (accessChanged || otherPermissionChanged) closeUserWebSocketClients(userId);
+    // 连接已在 DB 提交后、沙盒 await 前切断；本处不再重复关闭（同值保存无需撕裂
+    // carrier）。只有沙盒失败真正回收 grant 时，才在上方沙盒分支里定向重新失效
+    // 快照并关闭 carrier，让删除后的权威 grant 重建 baseline/prompt/投影。
     if (quotaChanged) {
       db.resetUsage(userId);
       // 清掉内存节流缓存：否则 15 秒节流可能跳过新记录的创建，配额暂时不生效
@@ -1866,7 +2236,11 @@ export function registerAdminRoutes(app: Application, deps: AdminRouteDeps): Adm
     }
     db.audit('permissions_changed', {
       username: target.username,
+      ip: req.ip,
+      userAgent: req.headers['user-agent'] ?? null,
       detail: JSON.stringify({
+        // actor：本次变更的操作者（主用户），username 保留为被改权限的子用户以兼容既有事件格式
+        actor: me.username,
         allowedFolders,
         hourlyTokenLimit,
         dailyMinutesLimit,

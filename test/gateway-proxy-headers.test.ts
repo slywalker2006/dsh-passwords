@@ -15,7 +15,7 @@ import http from 'node:http';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
-import { mkdtempSync, rmSync, writeFileSync, symlinkSync, realpathSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync, symlinkSync, realpathSync } from 'node:fs';
 import jwt from 'jsonwebtoken';
 import { createRequire } from 'node:module';
 
@@ -86,6 +86,7 @@ let db: Database;
 let auth: AuthService;
 let upstream: http.Server;
 let gateway: http.Server;
+let gatewayConfig: PlatformConfig;
 let gatewayPort = 0;
 let cookie = '';
 /** 会话 JWT 明文（Cookie Chaos 回归测试用：构造 Unicode 前缀的伪同名 cookie） */
@@ -103,6 +104,10 @@ let promptUpstreamCount = 0;
 let workspaceCreateMakesNewWorkspace = false;
 /** 回归用：createDirectory 让上游回一个请求父目录之外的路径（模拟上游被替换/回归）。 */
 let directoryCreateEscapePath: string | null = null;
+/** 回归用：directoryPicker/list 精确注入条目（覆盖忠实回放的子目录），验证敏感/他人子树的逐条过滤。 */
+let directoryListEntriesOverride: Array<{ name?: string; path: string; hidden?: boolean }> | null = null;
+/** 回归用：directoryPicker/list 回一个缺 entries/crumbs 的畸形 value，验证 502 fail-closed。 */
+let directoryListMalformed = false;
 let failNextSessionCreate = false;
 let workspaceOrderResponseWorkspaceId = 'ws-visible';
 let delaySessionCreateResponse = false;
@@ -115,9 +120,10 @@ let createdSessionIdForMock = 'created-session';
 let wireCreatedSessionId = '';
 let delayedWorkspaceClient: any = null;
 let delayedWorkspaceStreamId = '';
-let assignableResources = {
+let assignableResources: { folders: string[]; sessions: string[]; retainedSessions: string[] } = {
   folders: ['/workspaces/visible'],
   sessions: ['session-visible', 'session-hidden', 'session-newly-shared'],
+  retainedSessions: [],
 };
 let assignableResourcesUnavailable = false;
 let assignableResourcesDelayMs = 0;
@@ -130,6 +136,8 @@ let remoteMuxUplinkFrames: Array<Record<string, unknown>> = [];
 let remoteMuxBaselinePinnedSessionIds: unknown[] | null = null;
 /** 回归用：baseline 之后追加的 pinned 增量集合（null = 不发送）。 */
 let remoteMuxPinnedIncrement: unknown[] | null = null;
+/** 回归用：baseline 之后追加的 archived 增量集合（null = 不发送）。 */
+let remoteMuxArchivedIncrement: unknown[] | null = null;
 let remoteMuxHistoryPayloadBytes = 0;
 /** 回归用：workspace/follow baseline 的「可见工作区」路径（默认与旧用例一致）。 */
 let remoteMuxBaselineVisiblePath = '/workspaces/visible';
@@ -276,6 +284,13 @@ function startMockUpstream(): Promise<http.Server> {
               type: 'item',
               streamId: frame.streamId,
               value: { type: 'pinned', pinnedSessionIds: remoteMuxPinnedIncrement },
+            }));
+          }
+          if (remoteMuxArchivedIncrement !== null) {
+            client.send(JSON.stringify({
+              type: 'item',
+              streamId: frame.streamId,
+              value: { type: 'archived', archivedSessionIds: remoteMuxArchivedIncrement },
             }));
           }
           // The Host publishes the durable attach once the delayed create
@@ -441,11 +456,16 @@ function startMockUpstream(): Promise<http.Server> {
           } catch {
             // keep default mock path
           }
+          // 真实 workspace/create 以 fs.realpath 归一回包（dsh-workspace 的 realpathNormalize）：
+          // 路径存在则回真实路径（词法链接路径也会归一到 canonical），缺失则保持原样
+          // （测试里大量 POSIX 假路径并不存在）。
+          let resolvedPath = requestedPath;
+          try { resolvedPath = realpathSync(requestedPath); } catch { /* 不存在：保持原样 */ }
           res.writeHead(200, { 'content-type': 'application/json' });
           res.end(JSON.stringify({ result: { ok: true, value: {
             workspace: {
               workspaceId: `ws-${requestedPath.replace(/[^A-Za-z0-9]+/g, '-')}`,
-              path: requestedPath,
+              path: resolvedPath,
               title: 'Mock workspace',
               sessionIds: workspaceCreateResponseSessionIds ?? [],
             },
@@ -475,28 +495,45 @@ function startMockUpstream(): Promise<http.Server> {
         const chunks: Buffer[] = [];
         req.on('data', (chunk: Buffer) => chunks.push(chunk));
         req.on('end', () => {
-          let requested = '/root';
+          let requested = '';
           try {
             const parsed = JSON.parse(Buffer.concat(chunks).toString('utf8')) as Record<string, unknown>;
             const args = (parsed as { payload?: { args?: { path?: unknown } } }).payload?.args;
             if (typeof args?.path === 'string' && args.path.length > 0) requested = args.path;
           } catch {
-            // default home listing
+            // 缺 path = 后端默认 home 落点
+          }
+          // 忠实回放：列出请求目录的直接子目录（真实 browse 后端行为）；
+          // 测试可用 directoryListEntriesOverride 精确注入条目。
+          const target = requested === '' ? os.homedir() : requested;
+          if (directoryListMalformed) {
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ result: { ok: true, value: { path: target, home: os.homedir() } } }));
+            return;
+          }
+          const base = target.replace(/[\\/]+$/, '');
+          const entries = (directoryListEntriesOverride ?? [
+            { path: `${base}/aaa-dir` },
+            { path: `${base}/bbb-dir` },
+          ]).map((entry) => ({
+            name: entry.name ?? entry.path.slice(entry.path.lastIndexOf('/') + 1),
+            path: entry.path,
+            hidden: entry.hidden ?? false,
+          }));
+          const crumbs: Array<{ name: string; path: string; hidden: boolean }> = [];
+          let current = target;
+          for (;;) {
+            const parent = path.dirname(current);
+            crumbs.unshift({ name: parent === current ? current : path.basename(current), path: current, hidden: false });
+            if (parent === current) break;
+            current = parent;
           }
           res.writeHead(200, { 'content-type': 'application/json' });
           res.end(JSON.stringify({ result: { ok: true, value: {
-            path: requested,
-            home: '/root',
-            crumbs: [
-              { name: '/', path: '/', hidden: false },
-              { name: 'root', path: '/root', hidden: false },
-            ],
-            entries: [
-              { name: '33', path: '/root/33', hidden: false },
-              { name: 'other-user', path: '/root/other-user', hidden: false },
-              { name: 'visible', path: '/workspaces/visible', hidden: false },
-              { name: 'other', path: '/workspaces/other', hidden: false },
-            ],
+            path: target,
+            home: os.homedir(),
+            crumbs,
+            entries,
             truncated: false,
           } } }));
         });
@@ -892,16 +929,20 @@ function chunkedGatewayRequest(
 
 before(async () => {
   tempDir = mkdtempSync(path.join(os.tmpdir(), 'dshpw-test-'));
-  db = new Database(path.join(tempDir, 'test.db'), createFieldCrypto('testkey', 'testkey'));
+  // 与生产布局一致：DB 位于 <部署根>/data/ 下，使「部署根」敏感基恰好是 tempDir，
+  // 而不是其父级 os.tmpdir()（否则测试临时工作区会整体落入部署根内，被 workspaceFiles
+  // 的敏感路径保护拦下，与真实部署中工作区不在部署根内的前提不符）。
+  mkdirSync(path.join(tempDir, 'data'));
+  db = new Database(path.join(tempDir, 'data', 'test.db'), createFieldCrypto('testkey', 'testkey'));
   db.init(); // 建表（构造函数不建表）
   const user = db.createUser('admin', '$2a$10$dummyhashdummyhashdummyhashdu', 'admin');
 
   upstream = await startMockUpstream();
   const upstreamPort = (upstream.address() as { port: number }).port;
 
-  const config: PlatformConfig = {
+  gatewayConfig = {
     setupKey: 'test-setup-key',
-    dbPath: path.join(tempDir, 'test.db'),
+    dbPath: path.join(tempDir, 'data', 'test.db'),
     dbEncKey: 'testkey',
     gateway: {
       host: '127.0.0.1',
@@ -935,13 +976,13 @@ before(async () => {
     ],
   };
 
-  auth = new AuthService(config, db);
-  gateway = createGatewayServer(config, auth, db);
+  auth = new AuthService(gatewayConfig, db);
+  gateway = createGatewayServer(gatewayConfig, auth, db);
   await new Promise<void>((resolve) => gateway.listen(0, '127.0.0.1', () => resolve()));
   gatewayPort = (gateway.address() as { port: number }).port;
 
   // 直接签一个合法会话（等价于登录成功后的 cookie），cv=0 与新建用户一致
-  const token = jwt.sign({ sub: String(user.id), username: user.username, cv: 0 }, config.jwtSecret, {
+  const token = jwt.sign({ sub: String(user.id), username: user.username, cv: 0 }, gatewayConfig.jwtSecret, {
     expiresIn: '12h',
   });
   tokenValue = token;
@@ -1017,9 +1058,9 @@ function websocketFrame(
   });
 }
 
-function openRemoteMux(headers: Record<string, string>): Promise<{ client: any; nextFrame: () => Promise<Record<string, unknown>> }> {
+function openRemoteMux(headers: Record<string, string>, port = gatewayPort): Promise<{ client: any; nextFrame: () => Promise<Record<string, unknown>> }> {
   return new Promise((resolve, reject) => {
-    const client = new NodeWebSocket(`ws://127.0.0.1:${String(gatewayPort)}/api/remote.mux`, { headers });
+    const client = new NodeWebSocket(`ws://127.0.0.1:${String(port)}/api/remote.mux`, { headers });
     const pending: Array<(value: Record<string, unknown>) => void> = [];
     const received: Record<string, unknown>[] = [];
     const timer = setTimeout(() => {
@@ -1592,8 +1633,12 @@ test('一次 session/create 业务失败不关闭同用户的工作区 mux，后
 
 test('D1 工作流：刚创建目录可登记、精确分配可登记、预存在未分配拒绝、登记后立即可建会话', async () => {
   const subUser = db.createUser('d1-workflow-user', '$2a$10$dummyhashdummyhashdummyhashdu', 'user');
+  // 统一读/创建范围：创建与读取都以真实存在的授权目录为准。旧 /workspaces/visible 假路径
+  // 在 Windows 非完全限定且不存在，无法作为 createDirectory 落点；改用 platform-aware 真实临时根。
+  const visibleRoot = realpathSync(mkdtempSync(path.join(os.tmpdir(), 'dshpw-d1-visible-')));
+  const visiblePath = issue38Slash(visibleRoot);
   db.setPermissions(subUser.id, {
-    allowedFolders: ['/workspaces/visible'], hourlyTokenLimit: null, dailyMinutesLimit: null,
+    allowedFolders: [visiblePath], hourlyTokenLimit: null, dailyMinutesLimit: null,
     allowUpload: false, allowGitDownload: false, allowWorkspaceCreate: true,
     allowedAgentPresets: null, banned: false, sandboxMode: null, disabledSessions: [],
   });
@@ -1616,24 +1661,24 @@ test('D1 工作流：刚创建目录可登记、精确分配可登记、预存�
 
     // 2) 主用户显式分配的精确目录 → 200（created:false 解析既有工作区，不登记所有权）。
     workspaceCreateMakesNewWorkspace = false;
-    response = await gatewayReq('POST', '/api/workspace/create', json, workspaceCreateBody('/workspaces/visible', 'd1-exact'));
+    response = await gatewayReq('POST', '/api/workspace/create', json, workspaceCreateBody(visiblePath, 'd1-exact'));
     assert.equal(response.status, 200, response.body);
-    assert.equal(db.listUserWorkspacePaths(subUser.id).includes('/workspaces/visible'), false);
+    assert.equal(db.listUserWorkspacePaths(subUser.id).includes(issue38Norm(visiblePath)), false);
 
     // 3) 刚通过目录选择器创建的目录 → 登记成功，原子写入所有权与白名单。
     const mkdir = await gatewayReq('POST', '/api/directoryPicker/createDirectory', json, JSON.stringify({
       type: 'client-request', rpcId: 'd1-mkdir', method: 'directoryPicker/createDirectory',
-      payload: { args: { path: '/workspaces/visible', name: 'fresh-dir' } },
+      payload: { args: { path: visiblePath, name: 'fresh-dir' } },
     }));
     assert.equal(mkdir.status, 200, mkdir.body);
     workspaceCreateMakesNewWorkspace = true;
-    const register = await gatewayReq('POST', '/api/workspace/create', json, workspaceCreateBody('/workspaces/visible/fresh-dir', 'd1-register'));
+    const register = await gatewayReq('POST', '/api/workspace/create', json, workspaceCreateBody(`${visiblePath}/fresh-dir`, 'd1-register'));
     assert.equal(register.status, 200, register.body);
     const registerValue = (JSON.parse(register.body) as { result?: { value?: { workspace?: { workspaceId?: unknown } } } }).result?.value;
     const workspaceId = registerValue?.workspace?.workspaceId;
     assert.equal(typeof workspaceId, 'string', '登记响应必须带 workspaceId 供后续 session.create 解析');
-    assert.equal(db.listUserWorkspacePaths(subUser.id).includes('/workspaces/visible/fresh-dir'), true);
-    assert.equal(db.getPermissions(subUser.id)?.allowed_folders.includes('/workspaces/visible/fresh-dir'), true);
+    assert.equal(db.listUserWorkspacePaths(subUser.id).includes(issue38Norm(`${visiblePath}/fresh-dir`)), true);
+    assert.equal(db.getPermissions(subUser.id)?.allowed_folders.includes(issue38Norm(`${visiblePath}/fresh-dir`)), true);
 
     // 4) 登记后立即用 workspaceId 新建会话 → 200（映射已同步，不再被 403）。
     const sessionCreate = await gatewayReq('POST', '/api/session.create', json, JSON.stringify({
@@ -1648,26 +1693,27 @@ test('D1 工作流：刚创建目录可登记、精确分配可登记、预存�
     // 5) 另一子用户不能用别人的 pending 目录登记，也不得伸进他人子树。
     const other = db.createUser('d1-other-user', '$2a$10$dummyhashdummyhashdummyhashdu', 'user');
     db.setPermissions(other.id, {
-      allowedFolders: ['/workspaces/visible'], hourlyTokenLimit: null, dailyMinutesLimit: null,
+      allowedFolders: [visiblePath], hourlyTokenLimit: null, dailyMinutesLimit: null,
       allowUpload: false, allowGitDownload: false, allowWorkspaceCreate: true,
       allowedAgentPresets: null, banned: false, sandboxMode: null, disabledSessions: [],
     });
     cookie = `dsh_gateway_token=${jwt.sign({ sub: String(other.id), username: other.username, cv: 0 }, 'test-secret', { expiresIn: '12h' })}`;
-    const otherRegister = await gatewayReq('POST', '/api/workspace/create', json, workspaceCreateBody('/workspaces/visible/fresh-dir', 'd1-other-register'));
+    const otherRegister = await gatewayReq('POST', '/api/workspace/create', json, workspaceCreateBody(`${visiblePath}/fresh-dir`, 'd1-other-register'));
     assert.equal(otherRegister.status, 403, 'pending 目录与所有权子树均按用户隔离');
     const otherMkdirInside = await gatewayReq('POST', '/api/directoryPicker/createDirectory', json, JSON.stringify({
       type: 'client-request', rpcId: 'd1-other-mkdir', method: 'directoryPicker/createDirectory',
-      payload: { args: { path: '/workspaces/visible/fresh-dir', name: 'nested' } },
+      payload: { args: { path: `${visiblePath}/fresh-dir`, name: 'nested' } },
     }));
     assert.equal(otherMkdirInside.status, 403, '不得在另一子用户创建的工作区子树内建目录');
     const otherMkdirSibling = await gatewayReq('POST', '/api/directoryPicker/createDirectory', json, JSON.stringify({
       type: 'client-request', rpcId: 'd1-other-sibling', method: 'directoryPicker/createDirectory',
-      payload: { args: { path: '/workspaces/visible', name: 'sibling-dir' } },
+      payload: { args: { path: visiblePath, name: 'sibling-dir' } },
     }));
     assert.equal(otherMkdirSibling.status, 200, '共享分配根下建兄弟目录不受他人子树影响');
   } finally {
     workspaceCreateMakesNewWorkspace = false;
     cookie = originalCookie;
+    try { rmSync(visibleRoot, { recursive: true, force: true }); } catch { /* Windows 文件句柄尽力而为 */ }
   }
 });
 
@@ -1740,18 +1786,23 @@ test('权限：A 被分配父目录时不得伸进 B 拥有的子工作区子树
 
 test('D1 工作流：孤儿所有权行（已删除用户残留）不阻断分配目录的可见性与登记', async () => {
   const subUser = db.createUser('d1-orphan-owner-user', '$2a$10$dummyhashdummyhashdummyhashdu', 'user');
+  // 统一读/创建范围：用 platform-aware 真实临时根替代旧 POSIX 假路径（Windows 非完全限定）。
+  const visibleRoot = realpathSync(mkdtempSync(path.join(os.tmpdir(), 'dshpw-d1-orphan-')));
+  const visiblePath = issue38Slash(visibleRoot);
   db.setPermissions(subUser.id, {
-    allowedFolders: ['/workspaces/visible'], hourlyTokenLimit: null, dailyMinutesLimit: null,
+    allowedFolders: [visiblePath], hourlyTokenLimit: null, dailyMinutesLimit: null,
     allowUpload: false, allowGitDownload: false, allowWorkspaceCreate: true,
     allowedAgentPresets: null, banned: false, sandboxMode: null, disabledSessions: [],
   });
   db.markSessionGrantsSeeded(subUser.id);
   // 模拟 112233 事故：已删除用户的残留所有权行指向同一目录。
   (db as unknown as { db: import('node:sqlite').DatabaseSync }).db.exec(
-    "INSERT INTO user_workspaces (user_id, path) VALUES (424242, '/workspaces/visible')",
+    `INSERT INTO user_workspaces (user_id, path) VALUES (424242, '${issue38Norm(visiblePath)}')`,
   );
   const subCookie = `dsh_gateway_token=${jwt.sign({ sub: String(subUser.id), username: subUser.username, cv: 0 }, 'test-secret', { expiresIn: '12h' })}`;
   const originalCookie = cookie;
+  const previousVisiblePath = remoteMuxBaselineVisiblePath;
+  remoteMuxBaselineVisiblePath = visiblePath;
   cookie = subCookie;
   const json = { 'content-type': 'application/json' };
   try {
@@ -1764,7 +1815,7 @@ test('D1 工作流：孤儿所有权行（已删除用户残留）不阻断分�
       const frame = await connection.nextFrame();
       const baseline = (frame as { value?: { value?: { items?: Array<{ path?: string }> } } }).value?.value;
       const paths = (baseline?.items ?? []).map((item) => item.path);
-      assert.ok(paths.includes('/workspaces/visible'), '孤儿所有权行不得隐藏已分配工作区');
+      assert.ok(paths.includes(visiblePath), '孤儿所有权行不得隐藏已分配工作区');
     } finally {
       connection.client.close();
     }
@@ -1773,29 +1824,33 @@ test('D1 工作流：孤儿所有权行（已删除用户残留）不阻断分�
     workspaceCreateMakesNewWorkspace = false;
     const register = await gatewayReq('POST', '/api/workspace/create', json, JSON.stringify({
       type: 'client-request', rpcId: 'orphan-register', method: 'workspace/create',
-      payload: { args: { request: { path: '/workspaces/visible' } } },
+      payload: { args: { request: { path: visiblePath } } },
     }));
     assert.equal(register.status, 200, register.body);
 
     // 3) directoryPicker/createDirectory：孤儿行不得阻断在已分配根下建目录。
     const mkdir = await gatewayReq('POST', '/api/directoryPicker/createDirectory', json, JSON.stringify({
       type: 'client-request', rpcId: 'orphan-mkdir', method: 'directoryPicker/createDirectory',
-      payload: { args: { path: '/workspaces/visible', name: 'orphan-sibling' } },
+      payload: { args: { path: visiblePath, name: 'orphan-sibling' } },
     }));
     assert.equal(mkdir.status, 200, mkdir.body);
   } finally {
     workspaceCreateMakesNewWorkspace = false;
+    remoteMuxBaselineVisiblePath = previousVisiblePath;
     cookie = originalCookie;
     (db as unknown as { db: import('node:sqlite').DatabaseSync }).db.exec(
       "DELETE FROM user_workspaces WHERE user_id = 424242",
     );
+    try { rmSync(visibleRoot, { recursive: true, force: true }); } catch { /* Windows 文件句柄尽力而为 */ }
   }
 });
 
 test('D1 工作流：directoryPicker/list 目录浏览按授权根过滤与拦截', async () => {
+  const wsRoot = realpathSync(mkdtempSync(path.join(os.tmpdir(), 'dshpw-d1-list-root-')));
+  const elsewhere = realpathSync(mkdtempSync(path.join(os.tmpdir(), 'dshpw-d1-list-elsewhere-')));
   const subUser = db.createUser('d1-list-user', '$2a$10$dummyhashdummyhashdummyhashdu', 'user');
   db.setPermissions(subUser.id, {
-    allowedFolders: ['/workspaces/visible'], hourlyTokenLimit: null, dailyMinutesLimit: null,
+    allowedFolders: [issue38Slash(wsRoot)], hourlyTokenLimit: null, dailyMinutesLimit: null,
     allowUpload: false, allowGitDownload: false, allowWorkspaceCreate: false,
     allowedAgentPresets: null, banned: false, sandboxMode: null, disabledSessions: [],
   });
@@ -1808,63 +1863,80 @@ test('D1 工作流：directoryPicker/list 目录浏览按授权根过滤与拦�
   });
   const entryPaths = (body: string): string[] => {
     const value = (JSON.parse(body) as { result?: { value?: { entries?: Array<{ path?: unknown }> } } }).result?.value;
-    return (value?.entries ?? []).map((entry) => String(entry.path));
+    return (value?.entries ?? []).map((entry) => issue38Norm(String(entry.path)));
   };
   try {
-    // 1) 授权子树内 → 完整列表（不过滤）。
-    const inside = await gatewayReq('POST', '/api/directoryPicker/list', json, listBody('/workspaces/visible', 'd1-list-inside'));
+    // 1) 授权子树内 → 回放该目录的直接子目录（mock 忠实回放），内容保留。
+    const inside = await gatewayReq('POST', '/api/directoryPicker/list', json, listBody(issue38Slash(wsRoot), 'd1-list-inside'));
     assert.equal(inside.status, 200, inside.body);
-    assert.equal(entryPaths(inside.body).length, 4, '授权子树内的列表保持原样');
+    const insideEntries = entryPaths(inside.body);
+    assert.equal(insideEntries.length, 2, '授权子树内回放该目录子目录');
+    assert.ok(insideEntries.every((entry) => entry.startsWith(issue38Norm(wsRoot) + '/')), '条目必须落在授权根内');
 
-    // 2) 祖先导航 → 只保留通往授权根的条目，其余目录名隐藏。
-    const ancestor = await gatewayReq('POST', '/api/directoryPicker/list', json, listBody('/workspaces', 'd1-list-ancestor'));
+    // 2) 祖先导航 → 只保留通往授权根的条目，兄弟目录名隐藏。
+    directoryListEntriesOverride = [
+      { path: issue38Slash(wsRoot) },
+      { path: `${issue38Slash(path.dirname(wsRoot))}/sibling-dir` },
+    ];
+    const ancestor = await gatewayReq('POST', '/api/directoryPicker/list', json, listBody(issue38Slash(path.dirname(wsRoot)), 'd1-list-ancestor'));
     assert.equal(ancestor.status, 200, ancestor.body);
-    assert.deepEqual(entryPaths(ancestor.body).sort(), ['/workspaces/visible'], '祖先层只保留通往授权根的路径');
+    assert.deepEqual(entryPaths(ancestor.body), [issue38Norm(wsRoot)], '祖先层只保留通往授权根的路径');
 
-    // 3) 白名单外且非祖先：只返回授权根入口，不回放 /etc 内容。
-    const outside = await gatewayReq('POST', '/api/directoryPicker/list', json, listBody('/etc', 'd1-list-outside'));
+    // 3) 白名单外且非祖先：只返回授权根入口，不回放无关目录内容。
+    directoryListEntriesOverride = null;
+    const outside = await gatewayReq('POST', '/api/directoryPicker/list', json, listBody(issue38Slash(elsewhere), 'd1-list-outside'));
     assert.equal(outside.status, 200, outside.body);
-    assert.deepEqual(entryPaths(outside.body), ['/workspaces/visible']);
+    assert.deepEqual(entryPaths(outside.body), [issue38Norm(wsRoot)]);
 
     // 4) 无 path（默认 home）且 home 不在授权根树时：返回可进入的授权根，
-    // 但不回放 home 的未过滤目录名，避免 Windows 多盘符/非 home 工作区被误判 403。
+    // 不回放 home 的未过滤目录名（mock 额外回一个真实 home 子目录，必须被过滤）。
+    directoryListEntriesOverride = [
+      { path: issue38Slash(wsRoot) },
+      { path: `${issue38Slash(os.homedir())}/home-visible-dir` },
+    ];
     const home = await gatewayReq('POST', '/api/directoryPicker/list', json, listBody(null, 'd1-list-home'));
     assert.equal(home.status, 200, home.body);
-    assert.deepEqual(entryPaths(home.body), ['/workspaces/visible']);
+    assert.deepEqual(entryPaths(home.body), [issue38Norm(wsRoot)], 'home 落点只回授权根，不回放 home 目录名');
 
     // 5) alpha.2 ClientConnection 只消费 payload.args。信封外层 path 仍不能作为
     // 授权依据；这里最多返回已授权根入口，不得回放外层 path 对应的完整目录。
     const decoy = await gatewayReq('POST', '/api/directoryPicker/list', json, JSON.stringify({
       type: 'client-request', rpcId: 'd1-list-decoy', method: 'directoryPicker/list',
-      payload: { args: {} }, path: '/workspaces/visible',
+      payload: { args: {} }, path: issue38Slash(wsRoot),
     }));
     assert.equal(decoy.status, 200, decoy.body);
-    assert.deepEqual(entryPaths(decoy.body), ['/workspaces/visible']);
+    assert.deepEqual(entryPaths(decoy.body), [issue38Norm(wsRoot)]);
   } finally {
+    directoryListEntriesOverride = null;
     cookie = originalCookie;
+    try { rmSync(wsRoot, { recursive: true, force: true }); } catch { /* Windows 句柄未释放：交给系统回收 */ }
+    try { rmSync(elsewhere, { recursive: true, force: true }); } catch { /* 同上 */ }
   }
 });
 
-test('D1 工作流：主目录可直接新建文件夹并登记；__deny__ 不开放任何创建通道', async () => {
+test('D1 工作流：授权根内可直接新建文件夹并登记；主目录与文件系统根不开放创建', async () => {
+  const visibleRoot = realpathSync(mkdtempSync(path.join(os.tmpdir(), 'dshpw-d1-home-')));
+  const rootPath = issue38Slash(visibleRoot);
+  const newDir = issue38Slash(path.join(visibleRoot, 'd1-home-e2e-dir'));
   const home = os.homedir().replace(/\\/g, '/').replace(/\/+$/, '');
-  const newDir = `${home}/d1-home-e2e-dir`;
   // 与网关 normalizePath 同口径（盘符小写）比较 DB 内的路径。
   const norm = (p: string) => p.replace(/^([A-Za-z]):/, (m) => m.toLowerCase());
   const subUser = db.createUser('d1-home-flow-user', '$2a$10$dummyhashdummyhashdummyhashdu', 'user');
   db.setPermissions(subUser.id, {
-    allowedFolders: ['/workspaces/visible'], hourlyTokenLimit: null, dailyMinutesLimit: null,
+    allowedFolders: [rootPath], hourlyTokenLimit: null, dailyMinutesLimit: null,
     allowUpload: false, allowGitDownload: false, allowWorkspaceCreate: true,
     allowedAgentPresets: null, banned: false, sandboxMode: null, disabledSessions: [],
   });
+  db.markSessionGrantsSeeded(subUser.id);
   const subCookie = `dsh_gateway_token=${jwt.sign({ sub: String(subUser.id), username: subUser.username, cv: 0 }, 'test-secret', { expiresIn: '12h' })}`;
   const originalCookie = cookie;
   cookie = subCookie;
   const json = { 'content-type': 'application/json' };
   try {
-    // 1) 主目录新建文件夹（picker 落点，D1 工作流第一步）。
+    // 1) 授权根内新建文件夹（picker 落点，D1 工作流第一步）。
     const mkdir = await gatewayReq('POST', '/api/directoryPicker/createDirectory', json, JSON.stringify({
       type: 'client-request', rpcId: 'd1h-mkdir', method: 'directoryPicker/createDirectory',
-      payload: { args: { path: home, name: 'd1-home-e2e-dir' } },
+      payload: { args: { path: rootPath, name: 'd1-home-e2e-dir' } },
     }));
     assert.equal(mkdir.status, 200, mkdir.body);
 
@@ -1889,7 +1961,16 @@ test('D1 工作流：主目录可直接新建文件夹并登记；__deny__ 不�
       true,
     );
 
-    // 3) 根目录（'/'）不是主目录，仍拒绝创建。
+    // 3) 主目录不在 allowed_folders 内：创建必须拒绝（home 创建例外已删除），且不触上游。
+    const beforeHome = lastUpstreamUrl;
+    const mkdirHome = await gatewayReq('POST', '/api/directoryPicker/createDirectory', json, JSON.stringify({
+      type: 'client-request', rpcId: 'd1h-mkdir-home', method: 'directoryPicker/createDirectory',
+      payload: { args: { path: home, name: 'should-deny' } },
+    }));
+    assert.equal(mkdirHome.status, 403, '主目录不是授权创建父目录');
+    assert.equal(lastUpstreamUrl, beforeHome, '主目录越界创建不得触达上游');
+
+    // 4) 文件系统根（'/'）同样不是创建父目录。
     const mkdirRoot = await gatewayReq('POST', '/api/directoryPicker/createDirectory', json, JSON.stringify({
       type: 'client-request', rpcId: 'd1h-mkdir-root', method: 'directoryPicker/createDirectory',
       payload: { args: { path: '/', name: 'should-deny' } },
@@ -1898,10 +1979,11 @@ test('D1 工作流：主目录可直接新建文件夹并登记；__deny__ 不�
   } finally {
     workspaceCreateMakesNewWorkspace = false;
     cookie = originalCookie;
+    try { rmSync(visibleRoot, { recursive: true, force: true }); } catch { /* Windows 句柄尽力而为 */ }
   }
 });
 
-test('D1 工作流：仅新建工作区权限可从主目录创建并登记自建目录', async () => {
+test('D1 工作流：__deny__ + allow_workspace_create 不开放任何创建通道', async () => {
   const home = os.homedir().replace(/\\/g, '/').replace(/\/+$/, '');
   const denyUser = db.createUser('d1-deny-user', '$2a$10$dummyhashdummyhashdummyhashdu', 'user');
   db.setPermissions(denyUser.id, {
@@ -1913,20 +1995,21 @@ test('D1 工作流：仅新建工作区权限可从主目录创建并登记自�
   cookie = `dsh_gateway_token=${jwt.sign({ sub: String(denyUser.id), username: denyUser.username, cv: 0 }, 'test-secret', { expiresIn: '12h' })}`;
   const json = { 'content-type': 'application/json' };
   try {
+    // __deny__ 表示没有可读/可创建根：即使 allowWorkspaceCreate 打开也不得创建，且不触上游。
+    const beforeMkdir = lastUpstreamUrl;
     const mkdir = await gatewayReq('POST', '/api/directoryPicker/createDirectory', json, JSON.stringify({
       type: 'client-request', rpcId: 'd1d-mkdir', method: 'directoryPicker/createDirectory',
       payload: { args: { path: home, name: 'deny-dir' } },
     }));
-    assert.equal(mkdir.status, 200, mkdir.body);
+    assert.equal(mkdir.status, 403, mkdir.body);
+    assert.equal(lastUpstreamUrl, beforeMkdir, '__deny__ 创建不得触达上游');
+
     const register = await gatewayReq('POST', '/api/workspace/create', json, JSON.stringify({
       type: 'client-request', rpcId: 'd1d-register', method: 'workspace/create',
       payload: { args: { request: { path: `${home}/deny-dir` } } },
     }));
-    assert.equal(register.status, 200, register.body);
-    const initialize = await gatewayReq('POST', '/api/workspace/initializeDefault', json, JSON.stringify({
-      type: 'client-request', rpcId: 'd1d-initialize', method: 'workspace/initializeDefault', payload: { args: {} },
-    }));
-    assert.equal(initialize.status, 200, initialize.body);
+    assert.equal(register.status, 403, register.body);
+    assert.deepEqual(db.listUserWorkspacePaths(denyUser.id), [], '__deny__ 不得登记任何工作区');
   } finally {
     cookie = originalCookie;
   }
@@ -2075,7 +2158,7 @@ test('Issue #25：权限保存拒绝当前资源快照中不存在的会话', as
   const originalCookie = cookie;
   const originalResources = assignableResources;
   cookie = originalCookie;
-  assignableResources = { folders: ['/workspaces/visible'], sessions: ['session-visible'] };
+  assignableResources = { folders: ['/workspaces/visible'], sessions: ['session-visible'], retainedSessions: [] };
   const payload = JSON.stringify({
     userId: subUser.id,
     allowedFolders: ['/workspaces/visible'],
@@ -2091,16 +2174,19 @@ test('Issue #25：权限保存拒绝当前资源快照中不存在的会话', as
   }
 });
 
-test('Issue #25：保存权限时清理历史失效会话并保留新授权', async () => {
+test('Issue #25：保存权限时保留既有归档授权、清理真正失效会话并保留新授权', async () => {
   const subUser = db.createUser('issue-25-stale-existing-grant', '$2a$10$dummyhashdummyhashdummyhashdu', 'user');
   db.setPermissions(subUser.id, {
     allowedFolders: ['/workspaces/visible'], hourlyTokenLimit: null, dailyMinutesLimit: null,
     allowUpload: false, allowGitDownload: false, allowWorkspaceCreate: false,
     allowedAgentPresets: null, banned: false, sandboxMode: null, disabledSessions: [],
-    allowedSessionIds: ['archived-session'],
+    allowedSessionIds: ['archived-session', 'gone-session'],
   });
   const originalResources = assignableResources;
-  assignableResources = { folders: ['/workspaces/visible'], sessions: ['session-visible'] };
+  // 归档（retained）与删除语义不同：archived-session 的既有授权必须保留，
+  // 但归档会话不可新增分配；gone-session 既不可分配也未归档（真正失效），
+  // 其既有授权必须清理；session-visible 可分配，新授权必须保留。
+  assignableResources = { folders: ['/workspaces/visible'], sessions: ['session-visible'], retainedSessions: ['archived-session'] };
   try {
     const response = await gatewayReq(
       'POST',
@@ -2109,12 +2195,12 @@ test('Issue #25：保存权限时清理历史失效会话并保留新授权', as
       JSON.stringify({
         userId: subUser.id,
         allowedFolders: ['/workspaces/visible'],
-        allowedSessionIds: ['archived-session', 'session-visible'],
+        allowedSessionIds: ['archived-session', 'gone-session', 'session-visible'],
       }),
     );
     assert.equal(response.status, 200, response.body);
-    assert.deepEqual(db.listUserSessionGrants(subUser.id), ['session-visible']);
-    assert.deepEqual(JSON.parse(response.body).allowedSessionIds, ['session-visible']);
+    assert.deepEqual(db.listUserSessionGrants(subUser.id), ['archived-session', 'session-visible']);
+    assert.deepEqual(JSON.parse(response.body).allowedSessionIds, ['archived-session', 'session-visible']);
   } finally {
     assignableResources = originalResources;
   }
@@ -2159,6 +2245,32 @@ test('Issue #25：资源核验不可用时权限保存 fail-closed', async () =>
     assignableResources = originalResources;
     assignableResourcesUnavailable = originalResourcesUnavailable;
     cookie = originalCookie;
+  }
+});
+
+test('Issue #25：未提交 allowedFolders 时不因既有目录强制探测资源，非目录字段仍可保存并保留目录', async () => {
+  const subUser = db.createUser('issue-25-partial-update-folders', '$2a$10$dummyhashdummyhashdummyhashdu', 'user');
+  db.setPermissions(subUser.id, {
+    allowedFolders: ['/workspaces/visible'], hourlyTokenLimit: null, dailyMinutesLimit: null,
+    allowUpload: false, allowGitDownload: false, allowWorkspaceCreate: false,
+    allowedAgentPresets: null, banned: false, sandboxMode: null, disabledSessions: [], allowedSessionIds: [],
+  });
+  const originalResourcesUnavailable = assignableResourcesUnavailable;
+  assignableResourcesUnavailable = true;
+  try {
+    // body 未带 allowedFolders（也未带 allowedSessionIds）：既有具体目录不应触发资源核验。
+    const response = await gatewayReq('POST', '/gateway/api/permissions', { 'content-type': 'application/json' }, JSON.stringify({
+      userId: subUser.id,
+      banned: true,
+      hourlyTokenLimit: 123,
+    }));
+    assert.equal(response.status, 200, response.body);
+    const perms = db.getPermissions(subUser.id);
+    assert.deepEqual(perms?.allowed_folders, ['/workspaces/visible'], '既有目录必须保留');
+    assert.equal(perms?.banned, true, '非目录字段必须生效');
+    assert.equal(perms?.hourly_token_limit, 123, '非目录字段必须生效');
+  } finally {
+    assignableResourcesUnavailable = originalResourcesUnavailable;
   }
 });
 
@@ -2282,7 +2394,7 @@ test('普通第三方 HTTP 路径对子用户直接放行（SSH 开关不参与�
   }
 });
 
-test('SSH HTTP 端点：子用户一律拒绝（历史 allow_ssh 也不例外），主用户仍可用', async () => {
+test('SSH HTTP 端点：子用户由 allow_ssh 开关控制（关闭 403、开启放行），主用户仍可用', async () => {
   const offUser = db.createUser('ssh-two-key-off', '$2a$10$dummyhashdummyhashdummyhashdu', 'user');
   const onUser = db.createUser('ssh-two-key-on', '$2a$10$dummyhashdummyhashdummyhashdu', 'user');
   db.setPermissions(offUser.id, {
@@ -2299,19 +2411,19 @@ test('SSH HTTP 端点：子用户一律拒绝（历史 allow_ssh 也不例外）
   const onCookie = `dsh_gateway_token=${jwt.sign({ sub: String(onUser.id), username: onUser.username, cv: 0 }, 'test-secret', { expiresIn: '12h' })}`;
   const originalCookie = cookie;
   try {
-    // 传统 SSH 登记已改为 owner-only 宿主能力：子用户无论历史 allow_ssh 如何都不可用。
+    // 未勾选 allow_ssh：登记 SSH 端点拒绝，不触上游。
     cookie = offCookie;
     const offUpstreamBefore = lastUpstreamUrl;
     const off = await gatewayReq('POST', '/api/ssh-http/inspect', { 'content-type': 'application/json' }, '{}');
     assert.equal(off.status, 403, off.body);
     assert.equal(lastUpstreamUrl, offUpstreamBefore, '未授权子用户不得到达上游');
 
-    // 历史 allow_ssh=true 也不再授予 SSH 端点能力。
+    // 勾选 allow_ssh：登记 SSH 端点放行并到达上游。
     cookie = onCookie;
     const onUpstreamBefore = lastUpstreamUrl;
     const on = await gatewayReq('POST', '/api/ssh-http/inspect', { 'content-type': 'application/json' }, '{}');
-    assert.equal(on.status, 403, `历史 allow_ssh=true 仍不可用: ${on.body}`);
-    assert.equal(lastUpstreamUrl, onUpstreamBefore, 'allow_ssh 不再放行 SSH 端点');
+    assert.equal(on.status, 200, `勾选 allow_ssh 后应放行: ${on.body}`);
+    assert.notEqual(lastUpstreamUrl, onUpstreamBefore, '授权子用户的 SSH 请求必须到达上游');
 
     // 主用户不受 SSH 边界限制（originalCookie 即管理员会话）
     cookie = originalCookie;
@@ -2322,7 +2434,7 @@ test('SSH HTTP 端点：子用户一律拒绝（历史 allow_ssh 也不例外）
   }
 });
 
-test('传输前缀：SSH 登记在两条通道对子用户一律拒绝（前缀不绕过 owner-only）', async () => {
+test('传输前缀：SSH 登记按 allow_ssh 放行对应通道，前缀不跨通道、不绕过 owner-only', async () => {
   const subUser = db.createUser('ssh-transport-user', '$2a$10$dummyhashdummyhashdummyhashdu', 'user');
   db.setPermissions(subUser.id, {
     allowedFolders: ['/workspaces/visible'], hourlyTokenLimit: null, dailyMinutesLimit: null,
@@ -2333,23 +2445,23 @@ test('传输前缀：SSH 登记在两条通道对子用户一律拒绝（前缀�
   const originalCookie = cookie;
   cookie = subCookie;
   try {
-    // SSH 已改为 owner-only：transport 前缀只用于登记表解析，不再向子用户放开任何通道。
+    // ws: 规则在 WebSocket 通道放行（已勾选 SSH）。
     const wsRuleOverWs = await websocketHandshake('/api/ssh-ws-only/terminal', {
       cookie: subCookie, origin: 'http://127.0.0.1', host: '127.0.0.1',
     });
-    assert.match(wsRuleOverWs.statusLine, /403/, 'ws: SSH 规则对子用户拒绝');
+    assert.match(wsRuleOverWs.statusLine, /101/, 'ws: SSH 规则对已授权子用户放行');
 
-    // ws: 规则不能通过 HTTP 绕过。
+    // ws: 规则不能通过 HTTP 绕过（前缀只放开对应通道）。
     const wsRuleOverHttp = await gatewayReq(
       'POST', '/api/ssh-ws-only/terminal', { 'content-type': 'application/json' }, '{}',
     );
     assert.equal(wsRuleOverHttp.status, 403, 'ws: SSH 规则不得在 HTTP 通道放行');
 
-    // http: 规则对 HTTP 通道同样拒绝。
+    // http: 规则对 HTTP 通道放行（已勾选 SSH）。
     const httpRuleOverHttp = await gatewayReq(
       'POST', '/api/ssh-http-only/inspect', { 'content-type': 'application/json' }, '{}',
     );
-    assert.equal(httpRuleOverHttp.status, 403, `http: SSH 规则对子用户拒绝: ${httpRuleOverHttp.body}`);
+    assert.equal(httpRuleOverHttp.status, 200, `http: SSH 规则对已授权子用户放行: ${httpRuleOverHttp.body}`);
 
     // http: 规则也不能通过 WebSocket 通道绕过（前缀不重开另一条 carrier）。
     const httpRuleOverWs = await websocketHandshake('/api/ssh-http-only/inspect', {
@@ -2403,31 +2515,54 @@ test('owner-only 表在两条通道都生效（WebSocket 侧不被 SSH 登记绕
   }
 });
 
-test('SSH HTTP 端点 SSRF：子用户不可达；主用户私网 host 被拦、公网放行且钉死 DNS', async () => {
-  const subUser = db.createUser('ssh-ssrf-user', '$2a$10$dummyhashdummyhashdummyhashdu', 'user');
-  db.setPermissions(subUser.id, {
+test('SSH HTTP 端点 SSRF：未授权子用户不可达；已授权子用户与主用户私网 host 被拦、公网放行且钉死 DNS', async () => {
+  const offUser = db.createUser('ssh-ssrf-off', '$2a$10$dummyhashdummyhashdummyhashdu', 'user');
+  const onUser = db.createUser('ssh-ssrf-on', '$2a$10$dummyhashdummyhashdummyhashdu', 'user');
+  db.setPermissions(offUser.id, {
+    allowedFolders: ['/workspaces/visible'], hourlyTokenLimit: null, dailyMinutesLimit: null,
+    allowUpload: true, allowGitDownload: true, allowWorkspaceCreate: false, allowSsh: false,
+    allowedAgentPresets: null, banned: false, sandboxMode: null, disabledSessions: [], allowedSessionIds: [],
+  });
+  db.setPermissions(onUser.id, {
     allowedFolders: ['/workspaces/visible'], hourlyTokenLimit: null, dailyMinutesLimit: null,
     allowUpload: true, allowGitDownload: true, allowWorkspaceCreate: false, allowSsh: true,
     allowedAgentPresets: null, banned: false, sandboxMode: null, disabledSessions: [], allowedSessionIds: [],
   });
-  const subCookie = `dsh_gateway_token=${jwt.sign({ sub: String(subUser.id), username: subUser.username, cv: 0 }, 'test-secret', { expiresIn: '12h' })}`;
+  const offCookie = `dsh_gateway_token=${jwt.sign({ sub: String(offUser.id), username: offUser.username, cv: 0 }, 'test-secret', { expiresIn: '12h' })}`;
+  const onCookie = `dsh_gateway_token=${jwt.sign({ sub: String(onUser.id), username: onUser.username, cv: 0 }, 'test-secret', { expiresIn: '12h' })}`;
   const originalCookie = cookie;
-  cookie = subCookie;
   try {
-    // 子用户对已登记 SSH 端点整体不可达：私网/公网 host 均在网关边界返回 403，
-    // 不依赖（也不可能触发）SSRF 检查。
-    const subUpstreamBefore = lastUpstreamUrl;
+    // 未勾选 allow_ssh 的子用户对已登记 SSH 端点整体不可达：私网/公网 host 均在网关边界
+    // 返回 403，不依赖（也不可能触发）SSRF 检查。
+    cookie = offCookie;
+    const offUpstreamBefore = lastUpstreamUrl;
     for (const host of ['127.0.0.1', '8.8.8.8']) {
       const denied = await gatewayReq(
         'POST', '/api/ssh-http/inspect', { 'content-type': 'application/json' },
         JSON.stringify({ host }),
       );
-      assert.equal(denied.status, 403, `${host} 子用户应被拒绝: ${denied.body}`);
+      assert.equal(denied.status, 403, `${host} 未授权子用户应被拒绝: ${denied.body}`);
     }
-    assert.equal(lastUpstreamUrl, subUpstreamBefore, '子用户 SSH 请求不得到达上游');
+    assert.equal(lastUpstreamUrl, offUpstreamBefore, '未授权子用户 SSH 请求不得到达上游');
 
-    // 主用户可以抵达已登记 SSH 端点，SSRF 纵深防御仍然生效（不因改为子用户边界
-    // 而丢掉宿主回环/元数据的保护）。
+    // 已勾选 allow_ssh 的子用户可抵达已登记 SSH 端点，但 SSRF 纵深防御仍生效：
+    // 回环/元数据被拦，公网放行。
+    cookie = onCookie;
+    for (const host of ['127.0.0.1', '0177.0.0.1', '169.254.169.254', '::ffff:127.0.0.1']) {
+      const blocked = await gatewayReq(
+        'POST', '/api/ssh-http/inspect', { 'content-type': 'application/json' },
+        JSON.stringify({ host }),
+      );
+      assert.equal(blocked.status, 403, `${host} 已授权子用户也应被 SSRF 拦截: ${blocked.body}`);
+    }
+    const subAllowed = await gatewayReq(
+      'POST', '/api/ssh-http/inspect', { 'content-type': 'application/json' },
+      JSON.stringify({ host: '8.8.8.8' }),
+    );
+    assert.equal(subAllowed.status, 200, subAllowed.body);
+
+    // 主用户可以抵达已登记 SSH 端点，SSRF 同样生效（不因开放子用户而丢掉
+    // 宿主回环/元数据的保护）。
     cookie = originalCookie;
     for (const host of ['127.0.0.1', '0177.0.0.1', '169.254.169.254', '::ffff:127.0.0.1']) {
       const blocked = await gatewayReq(
@@ -2468,7 +2603,7 @@ test('SSH 终端 WebSocket 升级对子用户拒绝', async () => {
   assert.match(handshake.statusLine, /403/);
 });
 
-test('SSH 终端 WebSocket：子用户即使 allow_ssh=true 也不能连接已登记端点，主用户仍可用', async () => {
+test('SSH 终端 WebSocket：子用户 allow_ssh=true 时放行已登记端点，主用户仍可用', async () => {
   const subUser = db.createUser('ssh-terminal-shared-user', '$2a$10$dummyhashdummyhashdummyhashdu', 'user');
   db.setPermissions(subUser.id, {
     allowedFolders: ['/workspaces/visible'], hourlyTokenLimit: null, dailyMinutesLimit: null,
@@ -2476,17 +2611,17 @@ test('SSH 终端 WebSocket：子用户即使 allow_ssh=true 也不能连接已�
     allowedAgentPresets: null, banned: false, sandboxMode: null, disabledSessions: [], allowedSessionIds: [],
   });
   const subToken = jwt.sign({ sub: String(subUser.id), username: subUser.username, cv: 0 }, 'test-secret', { expiresIn: '12h' });
-  const denied = await websocketHandshake('/api/dsh-ssh/terminal?alias=admin-host', {
+  const allowed = await websocketHandshake('/api/dsh-ssh/terminal?alias=admin-host', {
     cookie: `dsh_gateway_token=${subToken}`, origin: 'http://127.0.0.1', host: '127.0.0.1',
   });
-  assert.match(denied.statusLine, /403/, '历史 allow_ssh=true 不再授予已登记终端端点');
+  assert.match(allowed.statusLine, /101/, '勾选 allow_ssh 后授予已登记终端端点');
   const admin = await websocketHandshake('/api/dsh-ssh/terminal?alias=admin-host', {
     cookie, origin: 'http://127.0.0.1', host: '127.0.0.1',
   });
   assert.match(admin.statusLine, /101/, '主用户仍可连接已登记终端端点');
 });
 
-test('多 SSH WebSocket 端点：子用户一律拒绝，主用户可连接全部已登记端点', async () => {
+test('多 SSH WebSocket 端点：子用户按 allow_ssh 放行/拒绝，主用户可连接全部已登记端点', async () => {
   const deniedUser = db.createUser('ssh-second-denied', '$2a$10$dummyhashdummyhashdummyhashdu', 'user');
   db.setPermissions(deniedUser.id, {
     allowedFolders: ['/workspaces/visible'], hourlyTokenLimit: null, dailyMinutesLimit: null,
@@ -2508,10 +2643,10 @@ test('多 SSH WebSocket 端点：子用户一律拒绝，主用户可连接全�
     sandboxMode: null, disabledSessions: [], allowedSessionIds: [],
   });
   const allowedToken = jwt.sign({ sub: String(allowedUser.id), username: allowedUser.username, cv: 0 }, 'test-secret', { expiresIn: '12h' });
-  const stillDenied = await websocketHandshake('/plugins/ssh-b/terminal', {
+  const allowed = await websocketHandshake('/plugins/ssh-b/terminal', {
     cookie: `dsh_gateway_token=${allowedToken}`, origin: 'http://127.0.0.1', host: '127.0.0.1',
   });
-  assert.match(stillDenied.statusLine, /403/, '历史 allow_ssh=true 也不再放开已登记端点');
+  assert.match(allowed.statusLine, /101/, '勾选 allow_ssh 后放行已登记端点');
 
   const admin = await websocketHandshake('/plugins/ssh-b/terminal', {
     cookie, origin: 'http://127.0.0.1', host: '127.0.0.1',
@@ -2519,7 +2654,7 @@ test('多 SSH WebSocket 端点：子用户一律拒绝，主用户可连接全�
   assert.match(admin.statusLine, /101/, '主用户可连接已登记端点');
 });
 
-test('通配 SSH WebSocket 端点：子用户一律拒绝，主用户可连接', async () => {
+test('通配 SSH WebSocket 端点：子用户按 allow_ssh 放行/拒绝，主用户可连接', async () => {
   const sshUser = db.createUser('ssh-wildcard-allowed', '$2a$10$dummyhashdummyhashdummyhashdu', 'user');
   db.setPermissions(sshUser.id, {
     allowedFolders: ['/workspaces/visible'], hourlyTokenLimit: null, dailyMinutesLimit: null,
@@ -2530,7 +2665,7 @@ test('通配 SSH WebSocket 端点：子用户一律拒绝，主用户可连接',
   const sshHeaders = { cookie: `dsh_gateway_token=${sshToken}`, origin: 'http://127.0.0.1', host: '127.0.0.1' };
 
   const child = await websocketHandshake('/plugins/ssh-wild/terminal', sshHeaders);
-  assert.match(child.statusLine, /403/, '已登记通配端点的直接子路径对子用户拒绝');
+  assert.match(child.statusLine, /101/, '勾选 allow_ssh 后已登记通配端点的直接子路径放行');
   const base = await websocketHandshake('/plugins/ssh-wild', sshHeaders);
   assert.match(base.statusLine, /404/, '通配规则不放行基路径本身');
   const deeper = await websocketHandshake('/plugins/ssh-wild/a/b', sshHeaders);
@@ -2734,6 +2869,110 @@ test('Remote mux 浏览器腿发送 heartbeat ping，避免前置代理按空闲
     assert.ok(pings >= 1, `expected at least one browser-leg ping, got ${String(pings)}`);
   } finally {
     connection.client.close();
+  }
+});
+
+// Remote mux 心跳产品接线回归使用独立的短期限 fixture，不改变生产默认值。
+// 两条用例都覆盖真实 gateway -> ws server/client -> MuxHeartbeat 接线：
+// 静默客户端只持续读取、不回 Pong；合规客户端回显 nonce Pong。
+function waitForCondition(predicate: () => boolean, timeoutMs: number): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const startedAt = Date.now();
+    const tick = (): void => {
+      if (predicate()) { resolve(); return; }
+      if (Date.now() - startedAt >= timeoutMs) { reject(new Error('condition timeout')); return; }
+      setTimeout(tick, 50);
+    };
+    tick();
+  });
+}
+
+/** 从原始 socket 读取服务端→客户端帧，返回首个 Close(0x8) 帧（跳过期间的心跳 Ping）。 */
+function readServerCloseFrame(socket: net.Socket, timeoutMs: number): Promise<{ code: number; reason: string }> {
+  // 服务端→客户端帧不加掩码，按帧头切分即可，无需处理掩码位。
+  return new Promise((resolve, reject) => {
+    let buffer = Buffer.alloc(0);
+    const cleanup = (): void => {
+      clearTimeout(timer);
+      socket.off('data', onData);
+      socket.off('error', onError);
+      socket.off('close', onClose);
+    };
+    const timer = setTimeout(() => { cleanup(); reject(new Error('未在期限内收到服务端 Close 帧')); }, timeoutMs);
+    const onError = (error: Error): void => { cleanup(); reject(error); };
+    const onClose = (): void => { cleanup(); reject(new Error('连接在收到 Close 帧前断开')); };
+    const onData = (chunk: Buffer): void => {
+      buffer = Buffer.concat([buffer, chunk]);
+      for (;;) {
+        if (buffer.length < 2) return;
+        const opcode = buffer.readUInt8(0) & 0x0f;
+        let length = buffer.readUInt8(1) & 0x7f;
+        let offset = 2;
+        if (length === 126) {
+          if (buffer.length < 4) return;
+          length = buffer.readUInt16BE(2);
+          offset = 4;
+        } else if (length === 127) {
+          if (buffer.length < 10) return;
+          length = Number(buffer.readBigUInt64BE(2));
+          offset = 10;
+        }
+        if (buffer.length < offset + length) return;
+        const payload = buffer.subarray(offset, offset + length);
+        buffer = buffer.subarray(offset + length);
+        if (opcode === 0x8) {
+          const code = payload.length >= 2 ? payload.readUInt16BE(0) : 1005;
+          cleanup();
+          resolve({ code, reason: payload.subarray(2).toString('utf8') });
+          return;
+        }
+      }
+    };
+    socket.on('data', onData);
+    socket.on('error', onError);
+    socket.on('close', onClose);
+  });
+}
+
+test('Remote mux 心跳：持续读取但不回 Pong 的客户端按独立期限被 1011 关闭', async () => {
+  const heartbeatMux = { fragmentBytes: 131_072, pingIntervalMs: 250, pongTimeoutMs: 2_000, writeStallMs: 5_000 };
+  const heartbeatGateway = createGatewayServer({ ...gatewayConfig, gateway: { ...gatewayConfig.gateway, port: 0 }, mux: heartbeatMux }, auth, db);
+  await new Promise<void>((resolve) => heartbeatGateway.listen(0, '127.0.0.1', () => resolve()));
+  const heartbeatPort = (heartbeatGateway.address() as { port: number }).port;
+  const { socket, statusLine } = await rawUpgradeSocket('/api/remote.mux', {
+    cookie,
+    origin: 'http://127.0.0.1',
+    host: '127.0.0.1',
+  }, heartbeatPort);
+  assert.match(statusLine, /101/, `应完成 WebSocket 升级，实际：${statusLine}`);
+  try {
+    const close = await readServerCloseFrame(socket, 4_000);
+    assert.equal(close.code, 1011, `心跳超时应以 1011 关闭，实际：${JSON.stringify(close)}`);
+  } finally {
+    socket.destroy();
+    await new Promise<void>((resolve) => heartbeatGateway.close(() => resolve()));
+  }
+});
+
+test('Remote mux 心跳：合规客户端跨完整 Pong 期限持续存活', async () => {
+  const heartbeatMux = { fragmentBytes: 131_072, pingIntervalMs: 250, pongTimeoutMs: 2_000, writeStallMs: 5_000 };
+  const heartbeatGateway = createGatewayServer({ ...gatewayConfig, gateway: { ...gatewayConfig.gateway, port: 0 }, mux: heartbeatMux }, auth, db);
+  await new Promise<void>((resolve) => heartbeatGateway.listen(0, '127.0.0.1', () => resolve()));
+  const heartbeatPort = (heartbeatGateway.address() as { port: number }).port;
+  const connection = await openRemoteMux({ cookie, origin: 'http://127.0.0.1', host: '127.0.0.1' }, heartbeatPort);
+  let pings = 0;
+  let closed: { code: number; reason: string } | null = null;
+  connection.client.on('ping', () => { pings += 1; });
+  connection.client.on('close', (code: number, reason: Buffer) => { closed = { code, reason: reason.toString() }; });
+  try {
+    // 观察时间超过一个完整 Pong 期限，不能只等三个 Ping 周期就提前结束。
+    await new Promise((resolve) => setTimeout(resolve, heartbeatMux.pingIntervalMs + heartbeatMux.pongTimeoutMs + 500));
+    assert.equal(closed, null, `合规客户端不得被心跳误杀，实际关闭：${JSON.stringify(closed)}`);
+    assert.ok(pings >= 3, `expected at least 3 heartbeat pings, got ${String(pings)}`);
+    assert.equal(connection.client.readyState, NodeWebSocket.OPEN, '连接应保持打开');
+  } finally {
+    connection.client.close();
+    await new Promise<void>((resolve) => heartbeatGateway.close(() => resolve()));
   }
 });
 
@@ -3579,8 +3818,13 @@ test('权限：alpha.1 selectModel 仅允许已授权会话', async () => {
 
 test('权限：alpha.3 directoryPicker 创建目录受工作区创建开关和父目录白名单约束', async () => {
   const subUser = db.createUser('directory-picker-user', '$2a$10$dummyhashdummyhashdummyhashdu', 'user');
+  // 统一读/创建范围：用 platform-aware 真实临时根（Windows 非完全限定 / 不存在均不可作为落点）。
+  const allowedRoot = realpathSync(mkdtempSync(path.join(os.tmpdir(), 'dshpw-picker-allowed-')));
+  const outsideRoot = realpathSync(mkdtempSync(path.join(os.tmpdir(), 'dshpw-picker-outside-')));
+  const allowedPath = issue38Slash(allowedRoot);
+  const outsidePath = issue38Slash(outsideRoot);
   db.setPermissions(subUser.id, {
-    allowedFolders: ['/workspaces/visible'], hourlyTokenLimit: null, dailyMinutesLimit: null,
+    allowedFolders: [allowedPath], hourlyTokenLimit: null, dailyMinutesLimit: null,
     allowUpload: true, allowGitDownload: true, allowWorkspaceCreate: false,
     banned: false, sandboxMode: null, disabledSessions: [],
   });
@@ -3588,13 +3832,13 @@ test('权限：alpha.3 directoryPicker 创建目录受工作区创建开关和�
   cookie = `dsh_gateway_token=${jwt.sign({ sub: String(subUser.id), username: subUser.username, cv: 0 }, 'test-secret', { expiresIn: '12h' })}`;
   const body = JSON.stringify({
     type: 'client-request', rpcId: 'directory-create-1', method: 'directoryPicker/createDirectory',
-    payload: { args: { path: '/workspaces/visible', name: 'child' } },
+    payload: { args: { path: allowedPath, name: 'child' } },
   });
   try {
     const denied = await gatewayReq('POST', '/api/directoryPicker/createDirectory', { 'content-type': 'application/json' }, body);
     assert.equal(denied.status, 403, denied.body);
     db.setPermissions(subUser.id, {
-      allowedFolders: ['/workspaces/visible'], hourlyTokenLimit: null, dailyMinutesLimit: null,
+      allowedFolders: [allowedPath], hourlyTokenLimit: null, dailyMinutesLimit: null,
       allowUpload: true, allowGitDownload: true, allowWorkspaceCreate: true,
       banned: false, sandboxMode: null, disabledSessions: [],
     });
@@ -3602,11 +3846,13 @@ test('权限：alpha.3 directoryPicker 创建目录受工作区创建开关和�
     assert.equal(allowed.status, 200, allowed.body);
     const outside = await gatewayReq('POST', '/api/directoryPicker/createDirectory', { 'content-type': 'application/json' }, JSON.stringify({
       type: 'client-request', rpcId: 'directory-create-2', method: 'directoryPicker/createDirectory',
-      payload: { args: { path: '/workspaces/hidden', name: 'child' } },
+      payload: { args: { path: outsidePath, name: 'child' } },
     }));
     assert.equal(outside.status, 403, outside.body);
   } finally {
     cookie = originalCookie;
+    try { rmSync(allowedRoot, { recursive: true, force: true }); } catch { /* Windows 文件句柄尽力而为 */ }
+    try { rmSync(outsideRoot, { recursive: true, force: true }); } catch { /* 同上 */ }
   }
 });
 
@@ -4048,9 +4294,10 @@ test('跨源第三方 WebSocket 在升级前被拒绝', async () => {
 function rawUpgradeSocket(
   pathname: string,
   headers: Record<string, string>,
+  port = gatewayPort,
 ): Promise<{ socket: net.Socket; statusLine: string }> {
   return new Promise((resolve, reject) => {
-    const socket = net.connect({ host: '127.0.0.1', port: gatewayPort });
+    const socket = net.connect({ host: '127.0.0.1', port });
     const timer = setTimeout(() => {
       socket.destroy();
       reject(new Error('raw WebSocket upgrade timeout'));
@@ -4931,7 +5178,7 @@ test('Remote mux：子用户 terminal/follow 与 terminal/retain 只结束该逻
   }
 });
 
-test('Remote mux：子用户 terminal/follow 与 terminal/retain 即使 allow_ssh=true 也按逻辑流拒绝', async () => {
+test('Remote mux：子用户 allow_ssh=true 时 terminal/follow 与 terminal/retain 放行到上游', async () => {
   remoteMuxOpenEndpoints = [];
   remoteMuxOpenFrames = [];
   const subUser = db.createUser('remote-mux-terminal-allowed-user', '$2a$10$dummyhashdummyhashdummyhashdu', 'user');
@@ -4948,29 +5195,25 @@ test('Remote mux：子用户 terminal/follow 与 terminal/retain 即使 allow_ss
   });
   try {
     for (const [streamId, endpoint] of [
-      ['terminal-follow-denied', 'terminal/follow'],
-      ['terminal-retain-denied', 'terminal/retain'],
+      ['terminal-follow-allowed', 'terminal/follow'],
+      ['terminal-retain-allowed', 'terminal/retain'],
     ] as const) {
       connection.client.send(JSON.stringify({
         type: 'open', streamId, endpoint, payload: { args: {} },
       }));
-      const frame = await nextFrameOrFail(connection, `${endpoint} denial`);
-      assert.equal(frame.type, 'error', `${endpoint} 应只结束该逻辑流`);
+      const frame = await nextFrameOrFail(connection, `${endpoint} forward`);
       assert.equal(frame.streamId, streamId);
-      assert.equal((frame.error as Record<string, unknown>).code, 'terminal/unavailable');
+      assert.equal(frame.type, 'item', `${endpoint} 应转发上游输出帧`);
+      assert.equal((frame.value as { type?: string } | undefined)?.type, 'terminal/output', `${endpoint} 必须转发上游 terminal 输出`);
     }
-    assert.equal(connection.client.readyState, NodeWebSocket.OPEN, 'terminal 逻辑流拒绝不得关闭 carrier');
-    assert.equal(
-      remoteMuxOpenEndpoints.some((endpoint) => endpoint.startsWith('terminal/')),
-      false,
-      '上游不得收到任何 terminal 端点',
-    );
+    assert.equal(connection.client.readyState, NodeWebSocket.OPEN, 'terminal 逻辑流放行不得关闭 carrier');
+    assert.deepEqual(remoteMuxOpenEndpoints, ['terminal/follow', 'terminal/retain'], '上游必须收到两条官方 terminal 端点');
   } finally {
     connection.client.close();
   }
 });
 
-test('Remote mux：SSH 登记端点对子用户按逻辑流拒绝，allow_ssh 不授予 Remote 宿主能力', async () => {
+test('Remote mux：已登记第三方 SSH 端点对子用户仍按逻辑流拒绝（allow_ssh 只授予官方 terminal 流）', async () => {
   remoteMuxOpenEndpoints = [];
   remoteMuxOpenFrames = [];
   const subUser = db.createUser('remote-mux-ssh-rule-user', '$2a$10$dummyhashdummyhashdummyhashdu', 'user');
@@ -4986,8 +5229,8 @@ test('Remote mux：SSH 登记端点对子用户按逻辑流拒绝，allow_ssh �
     cookie: `dsh_gateway_token=${subToken}`, origin: 'http://127.0.0.1', host: '127.0.0.1',
   });
   try {
-    // Remote 端点名可映射到已登记的 SSH HTTP 路径（/api/<endpoint>），一律按
-    // owner-only 宿主能力拒绝；历史 allow_ssh 不再授予任何 Remote SSH 流。
+    // Remote 端点名可映射到已登记的 SSH HTTP 路径（/api/<endpoint>）。allow_ssh
+    // 只放行官方 terminal 流；已登记的第三方 SSH Remote 宿主能力仍按 owner-only 拒绝。
     for (const [streamId, endpoint] of [
       ['owner-only-inspect', 'ssh-http/inspect'],
       ['owner-only-terminal', 'dsh-ssh/terminal'],
@@ -5012,7 +5255,7 @@ test('Remote mux：SSH 登记端点对子用户按逻辑流拒绝，allow_ssh �
   } finally {
     connection.client.close();
   }
-  assert.equal(db.getPermissions(subUser.id)?.allow_ssh, true, '历史 allow_ssh 仍保留在权限行，但不再授予 SSH 能力');
+  assert.equal(db.getPermissions(subUser.id)?.allow_ssh, true, 'allow_ssh 仍保留在权限行，但不授予第三方 SSH Remote 宿主能力');
 });
 
 test('Remote mux：已登记的宿主敏感流也不能由子用户打开', async () => {
@@ -5092,6 +5335,48 @@ async function authorizedSubuserFixture(
   return { userId: subUser.id, cookie: subCookie, connection, baseline };
 }
 
+test('权限：userQuestions/answer HTTP 拒绝未授权会话，Remote attachWait 被官方命名空间拦截', async () => {
+  remoteMuxOpenEndpoints = [];
+  const fixture = await authorizedSubuserFixture('userquestions-test');
+  const envelope = (agentId: string): string => JSON.stringify({
+    type: 'client-request',
+    rpcId: 'uq-test',
+    method: 'userQuestions/answer',
+    payload: { args: { agentId, callId: 'c1', answer: { answers: [] } } },
+  });
+  try {
+    const forbidden = await gatewayReq(
+      'POST',
+      '/api/userQuestions/answer',
+      { 'content-type': 'application/json', cookie: fixture.cookie },
+      envelope('session-hidden'),
+    );
+    assert.equal(forbidden.status, 403);
+
+    const allowed = await gatewayReq(
+      'POST',
+      '/api/userQuestions/answer',
+      { 'content-type': 'application/json', cookie: fixture.cookie },
+      envelope('session-visible'),
+    );
+    assert.notEqual(allowed.status, 403);
+
+    remoteMuxOpenEndpoints = [];
+    fixture.connection.client.send(JSON.stringify({
+      type: 'open',
+      streamId: 'uq-attach',
+      endpoint: 'userQuestions/attachWait',
+      payload: { args: { agentId: 'session-visible', callId: 'c1' } },
+    }));
+    const error = await nextFrameOrFail(fixture.connection, 'userQuestions/attachWait error');
+    assert.equal(error.type, 'error');
+    assert.equal((error.error as { code?: string }).code, 'gateway/forbidden');
+    assert.equal(remoteMuxOpenEndpoints.includes('userQuestions/attachWait'), false);
+  } finally {
+    fixture.connection.client.close();
+  }
+});
+
 /** 0.1.7-alpha.1 workspaceFiles/readBytes 的 ClientConnection 信封。 */
 function readBytesEnvelope(scopeId: string, targetPath: string, options: unknown): string {
   return JSON.stringify({
@@ -5122,7 +5407,7 @@ async function remoteMuxCloseAfterRawSend(cookieValue: string, payload: string |
 test('Remote mux alpha.1 上行：仅透明放行的已开流转发 item/end，未知或过滤流只丢弃该帧', async () => {
   remoteMuxOpenEndpoints = [];
   remoteMuxUplinkFrames = [];
-  // SSH/terminal 流已改为 owner-only，改用普通扩展流验证上行透明转发语义。
+  // 官方 terminal 流由 allowSsh 控制，此处改用普通扩展流验证上行透明转发语义。
   const fixture = await authorizedSubuserFixture('mux-uplink-user');
   try {
     fixture.connection.client.send(JSON.stringify({
@@ -5563,6 +5848,66 @@ test('权限：子用户 workspaceFiles/changes 只允许授权会话工作区�
   }
 });
 
+test('权限：Remote workspaceFiles/changes 拒绝敏感路径（与 HTTP workspaceFiles 同口径）', async () => {
+  remoteMuxOpenEndpoints = [];
+  // 夹具部署根 tempDir 是敏感基（db 位于 <tempDir>/data）；把授权会话根放宽到
+  // os.tmpdir()（tempDir 的父级），就能构造「目标同时命中会话根/白名单/归属，但落在
+  // 敏感基内」的场景——这正是只有敏感基能挡住的情况。
+  const sensitiveTarget = path.join(tempDir, 'data', 'test.db');
+  const otherTmp = mkdtempSync(path.join(os.tmpdir(), 'dshpw-wf-other-'));
+  const allowedTarget = path.join(otherTmp, 'app.ts');
+  const subUser = db.createUser('workspace-files-sensitive-user', '$2a$10$dummyhashdummyhashdummyhashdu', 'user');
+  db.setPermissions(subUser.id, {
+    allowedFolders: [os.tmpdir()], hourlyTokenLimit: null, dailyMinutesLimit: null,
+    allowUpload: false, allowGitDownload: false, allowWorkspaceCreate: false,
+    allowedAgentPresets: null, banned: false, sandboxMode: null,
+    disabledSessions: [], allowedSessionIds: ['session-visible'],
+  });
+  db.markSessionGrantsSeeded(subUser.id);
+  const subCookie = `dsh_gateway_token=${jwt.sign(
+    { sub: String(subUser.id), username: subUser.username, cv: 0 },
+    'test-secret',
+    { expiresIn: '12h' },
+  )}`;
+  const previousVisiblePath = remoteMuxBaselineVisiblePath;
+  remoteMuxBaselineVisiblePath = os.tmpdir();
+  let connection: Awaited<ReturnType<typeof openRemoteMux>> | null = null;
+  try {
+    connection = await openRemoteMux({ cookie: subCookie, origin: 'http://127.0.0.1', host: '127.0.0.1' });
+    connection.client.send(JSON.stringify({
+      type: 'open', streamId: 'wf-sensitive-baseline', endpoint: 'workspace/follow', payload: { args: {} },
+    }));
+    await nextFrameOrFail(connection, 'sensitive wf baseline');
+
+    // 敏感路径：目标在部署根敏感基内 → 必须逐流拒绝，且不得到达上游
+    connection.client.send(JSON.stringify({
+      type: 'open',
+      streamId: 'wf-sensitive',
+      endpoint: 'workspaceFiles/changes',
+      payload: { args: { workspaceFileScopeId: 'session-visible', path: sensitiveTarget } },
+    }));
+    const denied = await nextFrameOrFail(connection, 'sensitive wf denied');
+    assert.equal(denied.type, 'error', JSON.stringify(denied));
+    assert.equal((denied.error as { code?: string } | undefined)?.code, 'gateway/forbidden');
+    assert.equal(remoteMuxOpenEndpoints.includes('workspaceFiles/changes'), false, '敏感路径的变更流不得到达上游');
+
+    // 对照：同在授权根内、但不命中敏感基的路径必须放行并到达上游
+    connection.client.send(JSON.stringify({
+      type: 'open',
+      streamId: 'wf-allowed',
+      endpoint: 'workspaceFiles/changes',
+      payload: { args: { workspaceFileScopeId: 'session-visible', path: allowedTarget } },
+    }));
+    const ready = await nextFrameOrFail(connection, 'allowed wf ready');
+    assert.deepEqual(ready.value, { kind: 'ready' }, '非敏感路径的变更流必须正常建立');
+    assert.equal(remoteMuxOpenEndpoints.includes('workspaceFiles/changes'), true, '非敏感路径的变更流必须到达上游');
+  } finally {
+    remoteMuxBaselineVisiblePath = previousVisiblePath;
+    connection?.client.close();
+    rmSync(otherTmp, { recursive: true, force: true });
+  }
+});
+
 test('权限：workspaceFiles 目标路径同时按词法与 canonical 口径判定（符号链接不可逃逸）', async (t) => {
   const tempRoot = mkdtempSync(path.join(os.tmpdir(), 'dshpw-wf-root-'));
   const outsideRoot = mkdtempSync(path.join(os.tmpdir(), 'dshpw-wf-outside-'));
@@ -5713,6 +6058,75 @@ test('revision：权限变更后旧基线立即失效，且在途 create 响应�
     cookie = originalCookie;
     fixture.connection.client.close();
   }
+});
+
+// ── R1：内存访问快照残留但权威 DB grant 已删除 ─────────────────────────────
+// 根因：沙盒收紧失败回收 grant 后，若内存快照未及时失效，HTTP 会话归属判定若只信
+// 快照就会继续放行已撤销会话。归属判定必须回查权威 DB grant（fail-closed），同时
+// 保留 workspaceOwnedByUser 自建工作区例外，且不改变管理员行为。
+test('R1：DB grant 已删除但内存快照残留时，HTTP session/prompt 归属判定 fail-closed', async () => {
+  const fixture = await authorizedSubuserFixture('r1-revoked-grant');
+  const headers = { 'content-type': 'application/json', cookie: fixture.cookie };
+  const prompt = (rpcId: string): string => clientRequestEnvelope(rpcId, 'session/prompt', {
+    request: { sessionId: 'session-visible', content: [{ type: 'text', text: 'hi' }] },
+  });
+  try {
+    // 前置：快照与 DB grant 一致时 prompt 放行并转发到上游。
+    promptUpstreamCount = 0;
+    const allowed = await gatewayReq('POST', '/api/session/prompt', headers, prompt('r1-allowed'));
+    assert.equal(allowed.status, 200, allowed.body);
+    assert.equal(promptUpstreamCount, 1, '授权一致时 prompt 必须转发一次');
+
+    // R1 场景：权威 grant 被删除（沙盒回收后快照尚未失效）——内存快照仍含该会话。
+    db.deleteUserSessionGrants(fixture.userId, ['session-visible']);
+    assert.equal(db.hasUserSessionGrant(fixture.userId, 'session-visible'), false, '权威 grant 必须已删除');
+
+    promptUpstreamCount = 0;
+    const denied = await gatewayReq('POST', '/api/session/prompt', headers, prompt('r1-revoked'));
+    assert.equal(denied.status, 403, denied.body);
+    assert.equal(promptUpstreamCount, 0, 'DB grant 删除后 prompt 不得继续用旧快照转发');
+  } finally {
+    fixture.connection.client.close();
+  }
+});
+
+test('R1：自建工作区例外保留——无显式 grant 时 prompt 仍按 workspaceOwnedByUser 放行', async () => {
+  const owner = db.createUser('r1-self-owned-workspace', '$2a$10$dummyhashdummyhashdummyhashdu', 'user');
+  db.setPermissions(owner.id, {
+    allowedFolders: ['/workspaces/visible'], hourlyTokenLimit: null, dailyMinutesLimit: null,
+    allowUpload: false, allowGitDownload: false, allowWorkspaceCreate: true,
+    allowedAgentPresets: null, banned: false, sandboxMode: null, disabledSessions: [], allowedSessionIds: [],
+  });
+  db.markSessionGrantsSeeded(owner.id);
+  db.addUserWorkspace(owner.id, '/workspaces/visible');
+  const ownerCookie = `dsh_gateway_token=${jwt.sign({ sub: String(owner.id), username: owner.username, cv: 0 }, 'test-secret', { expiresIn: '12h' })}`;
+  const connection = await openRemoteMux({ cookie: ownerCookie, origin: 'http://127.0.0.1', host: '127.0.0.1' });
+  const prompt = clientRequestEnvelope('r1-self-owned', 'session/prompt', {
+    request: { sessionId: 'session-visible', content: [{ type: 'text', text: 'hi' }] },
+  });
+  try {
+    connection.client.send(JSON.stringify({ type: 'open', streamId: 'r1-self-owned-baseline', endpoint: 'workspace/follow', payload: { args: {} } }));
+    assert.equal((await nextFrameOrFail(connection, 'r1 self-owned baseline')).type, 'item');
+    assert.equal(db.hasUserSessionGrant(owner.id, 'session-visible'), false, '自建工作区会话不写显式 grant');
+
+    promptUpstreamCount = 0;
+    const allowed = await gatewayReq('POST', '/api/session/prompt', { 'content-type': 'application/json', cookie: ownerCookie }, prompt);
+    assert.equal(allowed.status, 200, allowed.body);
+    assert.equal(promptUpstreamCount, 1, '自建工作区会话必须按归属放行，不依赖显式 grant');
+  } finally {
+    connection.client.close();
+    db.removeUserWorkspace(owner.id, '/workspaces/visible');
+  }
+});
+
+test('R1：管理员 session/prompt 不受会话授权回查影响（无 perms 时照常透传）', async () => {
+  const prompt = clientRequestEnvelope('r1-admin', 'session/prompt', {
+    request: { sessionId: 'session-any', content: [{ type: 'text', text: 'hi' }] },
+  });
+  promptUpstreamCount = 0;
+  const response = await gatewayReq('POST', '/api/session/prompt', { 'content-type': 'application/json' }, prompt);
+  assert.equal(response.status, 200, response.body);
+  assert.equal(promptUpstreamCount, 1, '管理员 prompt 必须照常透传');
 });
 
 test('Remote mux：baseline 未建立且 grant 尚未 seed 时等待后拒绝未授权 session/follow', async () => {
@@ -5883,14 +6297,17 @@ test('上游响应头超时：已收到响应头的慢响应（SSE/长响应）�
 // ── 子用户工作区/会话 403、503 回归（__deny__+create picker、分配工作区、
 //    按 workspaceId 建会话、基线缺失、既有会话可见性） ─────────────────────
 
-test('D1 工作流：__deny__ + allow_workspace_create 的刚创建目录可列出（不再 403）', async () => {
+test('D1 工作流：授权根内刚创建目录可列出；pending 不扩大浏览范围', async () => {
+  const visibleRoot = realpathSync(mkdtempSync(path.join(os.tmpdir(), 'dshpw-d1-deny-list-')));
+  const rootPath = issue38Slash(visibleRoot);
   const home = os.homedir().replace(/\\/g, '/').replace(/\/+$/, '');
   const subUser = db.createUser('d1-deny-list-user', '$2a$10$dummyhashdummyhashdummyhashdu', 'user');
   db.setPermissions(subUser.id, {
-    allowedFolders: ['__deny__'], hourlyTokenLimit: null, dailyMinutesLimit: null,
+    allowedFolders: [rootPath], hourlyTokenLimit: null, dailyMinutesLimit: null,
     allowUpload: false, allowGitDownload: false, allowWorkspaceCreate: true,
     allowedAgentPresets: null, banned: false, sandboxMode: null, disabledSessions: [],
   });
+  db.markSessionGrantsSeeded(subUser.id);
   const originalCookie = cookie;
   cookie = `dsh_gateway_token=${jwt.sign({ sub: String(subUser.id), username: subUser.username, cv: 0 }, 'test-secret', { expiresIn: '12h' })}`;
   const json = { 'content-type': 'application/json' };
@@ -5902,66 +6319,80 @@ test('D1 工作流：__deny__ + allow_workspace_create 的刚创建目录可列�
     const value = (JSON.parse(body) as { result?: { value?: { entries?: Array<{ path?: unknown }> } } }).result?.value;
     return (value?.entries ?? []).map((entry) => String(entry.path));
   };
-  const newDir = `${home}/d1-deny-list-dir`;
+  const newDir = issue38Slash(path.join(visibleRoot, 'd1-deny-list-dir'));
+  const elsewhere = issue38Slash(realpathSync(mkdtempSync(path.join(os.tmpdir(), 'dshpw-d1dl-elsewhere-'))));
   try {
-    // 1) picker 从主目录创建新文件夹 → 记账 pending（__deny__ 不再阻止记账）。
+    // 1) 授权根内创建新文件夹 → 记账 pending。
     const mkdir = await gatewayReq('POST', '/api/directoryPicker/createDirectory', json, JSON.stringify({
       type: 'client-request', rpcId: 'd1dl-mkdir', method: 'directoryPicker/createDirectory',
-      payload: { args: { path: home, name: 'd1-deny-list-dir' } },
+      payload: { args: { path: rootPath, name: 'd1-deny-list-dir' } },
     }));
     assert.equal(mkdir.status, 200, mkdir.body);
 
-    // 2) 主目录（新建落点）可完整列出。
+    // 2) 主目录未授权：不回放 home 既有目录。
     const listHome = await gatewayReq('POST', '/api/directoryPicker/list', json, listBody(home, 'd1dl-home'));
     assert.equal(listHome.status, 200, listHome.body);
+    assert.equal(entryPaths(listHome.body).some((entry) => entry.includes('/aaa-dir') || entry.includes('/bbb-dir')), false,
+      '未授权 home 落点不得回放 home 子目录');
 
     // 3) 刚创建的目录可列出并进入（选择新文件夹必需）。
     const listNew = await gatewayReq('POST', '/api/directoryPicker/list', json, listBody(newDir, 'd1dl-new'));
     assert.equal(listNew.status, 200, listNew.body);
 
-    // 4) 与授权根/pending 无关的目录不再 403：上游内容全部过滤，只回放可进入的
-    //    pending 目录入口（fail-closed，不泄露宿主目录名）。
-    const listElsewhere = await gatewayReq('POST', '/api/directoryPicker/list', json, listBody('/etc', 'd1dl-elsewhere'));
+    // 4) 与授权根无关的目录：上游内容全部过滤，只回放授权的可读根入口（pending 不扩大浏览）。
+    directoryListEntriesOverride = [
+      { path: `${elsewhere}/unrelated-dir` },
+    ];
+    const listElsewhere = await gatewayReq('POST', '/api/directoryPicker/list', json, listBody(elsewhere, 'd1dl-elsewhere'));
     assert.equal(listElsewhere.status, 200, listElsewhere.body);
-    assert.equal(entryPaths(listElsewhere.body).includes('/root/33'), false, '不得回放上游目录内容');
-    assert.equal(entryPaths(listElsewhere.body).includes('/workspaces/other'), false, '不得回放上游目录内容');
+    assert.equal(entryPaths(listElsewhere.body).some((entry) => entry.includes('unrelated-dir')), false, '不得回放无关目录内容');
+    assert.deepEqual(entryPaths(listElsewhere.body).map(issue38Norm), [issue38Norm(rootPath)], '只回放授权根入口，pending 不扩大浏览范围');
   } finally {
+    directoryListEntriesOverride = null;
     cookie = originalCookie;
+    try { rmSync(visibleRoot, { recursive: true, force: true }); } catch { /* Windows 句柄未释放：交给系统回收 */ }
+    try { rmSync(elsewhere, { recursive: true, force: true }); } catch { /* Windows 句柄未释放：交给系统回收 */ }
   }
 });
 
 test('D1 工作流：上游回包的新目录逃逸出请求父目录时不记账、不可登记', async () => {
-  const home = os.homedir().replace(/\\/g, '/').replace(/\/+$/, '');
-  const escaped = '/escaped-outside-dir';
+  const visibleRoot = realpathSync(mkdtempSync(path.join(os.tmpdir(), 'dshpw-d1-escape-')));
+  const rootPath = issue38Slash(visibleRoot);
+  const parentPath = issue38Slash(path.join(visibleRoot, 'sub-parent'));
+  const escaped = issue38Slash(path.join(visibleRoot, 'escaped-sibling'));
   const subUser = db.createUser('d1-escape-record', '$2a$10$dummyhashdummyhashdummyhashdu', 'user');
   db.setPermissions(subUser.id, {
-    allowedFolders: ['__deny__'], hourlyTokenLimit: null, dailyMinutesLimit: null,
+    allowedFolders: [rootPath], hourlyTokenLimit: null, dailyMinutesLimit: null,
     allowUpload: false, allowGitDownload: false, allowWorkspaceCreate: true,
     allowedAgentPresets: null, banned: false, sandboxMode: null, disabledSessions: [],
   });
+  db.markSessionGrantsSeeded(subUser.id);
   const originalCookie = cookie;
   cookie = `dsh_gateway_token=${jwt.sign({ sub: String(subUser.id), username: subUser.username, cv: 0 }, 'test-secret', { expiresIn: '12h' })}`;
   const json = { 'content-type': 'application/json' };
   directoryCreateEscapePath = escaped;
   try {
-    // 上游被替换/回归时回了一个父目录之外的路径（DSH 自身会拒绝 . / .. / 含分隔符的 name）。
+    // 上游被替换/回归时回了一个请求父目录之外的路径（词法上仍在授权根内）。
     const mkdir = await gatewayReq('POST', '/api/directoryPicker/createDirectory', json, JSON.stringify({
       type: 'client-request', rpcId: 'd1-escape-mkdir', method: 'directoryPicker/createDirectory',
-      payload: { args: { path: home, name: 'escape-dir' } },
+      payload: { args: { path: parentPath, name: 'escape-dir' } },
     }));
     assert.equal(mkdir.status, 200, mkdir.body);
 
-    // 逃逸目录不得进 pending：登记通道仍 fail-closed，且不得写入任何归属/白名单。
+    // 逃逸目录不得进 pending：登记通道仍 fail-closed（即便它是授权根内的可读路径），不写归属/白名单。
+    workspaceCreateMakesNewWorkspace = true;
     const register = await gatewayReq('POST', '/api/workspace/create', json, JSON.stringify({
       type: 'client-request', rpcId: 'd1-escape-register', method: 'workspace/create',
       payload: { args: { request: { path: escaped } } },
     }));
     assert.equal(register.status, 403, register.body);
     assert.deepEqual(db.listUserWorkspacePaths(subUser.id), [], '不得把父目录之外的目录归为私有工作区');
-    assert.deepEqual(db.getPermissions(subUser.id)?.allowed_folders, ['__deny__'], '不得扩宽工作区白名单');
+    assert.deepEqual(db.getPermissions(subUser.id)?.allowed_folders, [rootPath], '不得扩宽工作区白名单');
   } finally {
     directoryCreateEscapePath = null;
+    workspaceCreateMakesNewWorkspace = false;
     cookie = originalCookie;
+    try { rmSync(visibleRoot, { recursive: true, force: true }); } catch { /* Windows 句柄未释放：交给系统回收 */ }
   }
 });
 
@@ -6213,10 +6644,10 @@ async function syncDynamicManifest(
   }, body);
 }
 
-test('官方 terminal HTTP：子用户始终只能拿到无能力桩或拒绝，主用户原样透传', async () => {
+test('官方 terminal HTTP：子用户 allow_ssh=true 时已知 RPC 原样透传，主用户原样透传', async () => {
   const subUser = db.createUser('official-terminal-user', '$2a$10$dummyhashdummyhashdummyhashdu', 'user');
   db.setPermissions(subUser.id, {
-    // 即使历史 allow_ssh=true 也不改变官方 terminal 对子用户的边界。
+    // allow_ssh=true：官方已知 terminal HTTP unary RPC 对子用户透传。
     allowedFolders: ['/workspaces/visible'], hourlyTokenLimit: null, dailyMinutesLimit: null,
     allowUpload: true, allowGitDownload: true, allowWorkspaceCreate: false, allowSsh: true,
     allowedAgentPresets: null, banned: false, sandboxMode: null, disabledSessions: [], allowedSessionIds: [],
@@ -6225,45 +6656,16 @@ test('官方 terminal HTTP：子用户始终只能拿到无能力桩或拒绝，
   const originalCookie = cookie;
   cookie = subCookie;
   try {
-    const upstreamBefore = lastUpstreamUrl;
-    // 四个无能力 UX 桩：本地固定响应，绝不触上游。
-    const list = await gatewayReq('POST', '/api/terminal/list', { 'content-type': 'application/json' },
-      clientRequestEnvelope('official-terminal-list', 'terminal/list', { sessionId: 'session-x' }));
-    assert.equal(list.status, 200, list.body);
-    const listBody = JSON.parse(list.body) as { type: string; rpcId: string; result: { ok: boolean; value: unknown[] } };
-    assert.equal(listBody.type, 'server-response');
-    assert.equal(listBody.rpcId, 'official-terminal-list', 'rpcId 必须原样回显');
-    assert.equal(listBody.result.ok, true);
-    assert.deepEqual(listBody.result.value, [], 'list 桩必须是裸空数组');
-
-    for (const [url, method] of [
-      ['/api/terminal/environment', 'terminal/environment'],
-      ['/api/terminal/shells', 'terminal/shells'],
-    ] as const) {
-      const res = await gatewayReq('POST', url, { 'content-type': 'application/json' },
-        clientRequestEnvelope(`official-${method}`, method, {}));
-      assert.equal(res.status, 200, res.body);
-      const body = JSON.parse(res.body) as { result: { ok: boolean; error?: { code?: string } } };
-      assert.equal(body.result.ok, false, `${method} 必须回无能力`);
-      assert.equal(body.result.error?.code, 'terminal/unavailable');
-    }
-
-    const close = await gatewayReq('POST', '/api/terminal/close', { 'content-type': 'application/json' },
-      clientRequestEnvelope('official-terminal-close', 'terminal/close', {}));
-    assert.equal(close.status, 200, close.body);
-    const closeBody = JSON.parse(close.body) as { result: { ok: boolean; value?: unknown } };
-    assert.equal(closeBody.result.ok, true);
-    assert.equal(closeBody.result.value, undefined, 'close 桩不得带回任何 value');
-
-    // 真实宿主方法一律 403（terminal 命名空间硬边界）。
-    for (const method of ['create', 'write', 'resize', 'rename'] as const) {
+    // 官方已知 terminal HTTP unary RPC：全部原样透传（不再回无能力桩）。
+    for (const method of ['list', 'environment', 'shells', 'close', 'create', 'write', 'resize', 'rename'] as const) {
+      const before = lastUpstreamUrl;
       const res = await gatewayReq('POST', `/api/terminal/${method}`, { 'content-type': 'application/json' },
         clientRequestEnvelope(`official-${method}`, `terminal/${method}`, {}));
-      assert.equal(res.status, 403, `${method} 必须被拒绝: ${res.body}`);
+      assert.equal(res.status, 200, `${method} 必须透传: ${res.body}`);
+      assert.notEqual(lastUpstreamUrl, before, `terminal/${method} 必须到达上游`);
     }
-    // GET 即使命中桩方法名也不是合法 RPC，回 403 而不是执行桩。
+    // GET 即使命中方法名也不是合法 RPC，回 403 而不是执行上游。
     assert.equal((await gatewayReq('GET', '/api/terminal/list')).status, 403);
-    assert.equal(lastUpstreamUrl, upstreamBefore, '子用户 terminal 桩/拒绝都不得触上游');
 
     // 主用户不受 terminal 边界限制，真实方法原样透传。
     cookie = originalCookie;
@@ -6495,7 +6897,7 @@ test('H1：请求体上限按角色与 allow_upload 分档（64 MiB ↔ 300 MiB�
   assert.equal(requestBodyLimitFor('admin', true), ADMIN_REQUEST_BODY_BYTES);
 });
 
-test('H1：allow_upload=false 时子用户官方上传拒绝且请求体维持 64 MiB；普通插件不受影响', async () => {
+test('H1：allow_upload=false 时子用户官方小文件上传仍放行且请求体维持 64 MiB；普通插件不受影响', async () => {
   const subUser = db.createUser('h1-no-upload-user', '$2a$10$dummyhashdummyhashdummyhashdu', 'user');
   db.setPermissions(subUser.id, {
     allowedFolders: ['/workspaces/visible'], hourlyTokenLimit: null, dailyMinutesLimit: null,
@@ -6508,15 +6910,24 @@ test('H1：allow_upload=false 时子用户官方上传拒绝且请求体维持 6
   const subCookie = `dsh_gateway_token=${jwt.sign({ sub: String(subUser.id), username: subUser.username, cv: 0 }, 'test-secret', { expiresIn: '12h' })}`;
   cookie = subCookie;
   try {
-    // 官方二进制上传：即使带已授权 sessionId 也必须在到达上游前 403。
-    const beforeBinary = lastUpstreamUrl;
+    const connection = await openRemoteMux({ cookie: subCookie, origin: 'http://127.0.0.1', host: '127.0.0.1' });
+    try {
+      connection.client.send(JSON.stringify({
+        type: 'open', streamId: 'h1-no-upload-baseline', endpoint: 'workspace/follow', payload: { args: {} },
+      }));
+      assert.equal((await nextFrameOrFail(connection, 'h1 no-upload baseline')).streamId, 'h1-no-upload-baseline');
+    } finally {
+      connection.client.close();
+    }
+
+    // allow_upload=false 只保留 64 MiB 档位；合法会话的小文件上传仍应到达上游。
     const uploadBinary = await gatewayReq('POST', '/api/session/uploadFileBinary?sessionId=session-visible', {
       'content-type': 'application/octet-stream',
     }, 'bytes');
-    assert.equal(uploadBinary.status, 403, uploadBinary.body);
-    assert.equal(lastUpstreamUrl, beforeBinary, '官方上传在开关关闭时不得到达上游');
+    assert.equal(uploadBinary.status, 200, uploadBinary.body);
+    assert.deepEqual(lastRawUploadBody, Buffer.from('bytes'));
 
-    // 官方 fileUploads 上传同样拒绝。
+    // fileUploads 仍受独立的会话归属校验保护：无身份的 body 必须拒绝。
     const fileUpload = await gatewayReq('POST', '/api/fileUploads/upload', { 'content-type': 'application/json' }, '{}');
     assert.equal(fileUpload.status, 403, fileUpload.body);
 
@@ -6718,5 +7129,835 @@ test('Remote mux：子用户打开宿主写/出站探测流被逐流拒绝且不
     assert.equal(remoteMuxOpenEndpoints.includes('llm/discoverModels'), true, '主用户端点应透明转发到 DSH');
   } finally {
     ownerConnection.client.close();
+  }
+});
+
+// ── Issue #38：workspaceCreationRoots 已退役；allowed_folders 是唯一创建范围 ─────
+// 契约（行为口径，不做源码断言）：
+//   · 权限 API 拒绝任何 workspaceCreationRoots 提交（400），省略该字段的部分保存不受影响；
+//   · 目录创建（directoryPicker/createDirectory）与工作区登记（workspace/create）都只认
+//     当前 live 权限行的 allowed_folders：父目录与新目标须同时通过词法 + canonical 白名单，
+//     并拒绝文件系统根、敏感基与他人工作区子树；
+//   · allowWorkspaceCreate 仍是前置开关（关闭时即使父目录在授权根内也拒绝）；
+//   · workspace/create 仍只认 assigned exact / owned / pending 三种凭据。
+
+/** 与网关 normalizePath 同口径的路径比较形态（分隔符与尾斜杠）。 */
+function issue38Slash(candidate: string): string {
+  return candidate.replace(/\\/g, '/').replace(/\/+$/, '');
+}
+
+/** normalizePath 口径：反斜杠归一 + 盘符小写（网关落库/回显同一形态）。 */
+function issue38Norm(candidate: string): string {
+  return issue38Slash(candidate).replace(/^([A-Za-z]):/, (match) => match.toLowerCase());
+}
+
+/** 子会话 cookie：与既有用例同一签名口径。 */
+function issue38Cookie(user: { id: number; username: string }): string {
+  return `dsh_gateway_token=${jwt.sign(
+    { sub: String(user.id), username: user.username, cv: 0 },
+    'test-secret',
+    { expiresIn: '12h' },
+  )}`;
+}
+
+/** 目录授权用户的公共权限底座（调用方补齐 allowedFolders / allowWorkspaceCreate）。 */
+const ISSUE38_PERM_BASE = {
+  hourlyTokenLimit: null,
+  dailyMinutesLimit: null,
+  allowUpload: false,
+  allowGitDownload: false,
+  allowedAgentPresets: null,
+  banned: false,
+  sandboxMode: null,
+  disabledSessions: [] as string[],
+};
+
+test('Issue #38：workspaceCreationRoots 已退役，任何提交一律 400，省略字段保存不受影响', async () => {
+  const subUser = db.createUser('issue38-roots-api-user', '$2a$10$dummyhashdummyhashdummyhashdu', 'user');
+  db.setPermissions(subUser.id, {
+    ...ISSUE38_PERM_BASE,
+    allowedFolders: [],
+    allowWorkspaceCreate: true,
+  });
+  const json = { 'content-type': 'application/json' };
+  const save = (body: Record<string, unknown>) => {
+    const payload = JSON.stringify(body);
+    return gatewayReq('POST', '/gateway/api/permissions', {
+      ...json,
+      'content-length': String(Buffer.byteLength(payload)),
+    }, payload);
+  };
+
+  // 任何形式的 workspaceCreationRoots（合法数组 / null / [] / 非法形状 / 内部哨兵）都必须 400。
+  const rejected: unknown[] = [
+    ['/srv/a'],
+    [],
+    null,
+    'not-an-array',
+    42,
+    [''],
+    ['relative/path'],
+    ['__deny__'],
+  ];
+  for (const roots of rejected) {
+    const denied = await save({ userId: subUser.id, workspaceCreationRoots: roots });
+    assert.equal(denied.status, 400, `${JSON.stringify(roots)} 必须 400：${denied.body}`);
+  }
+  assert.deepEqual(db.getPermissions(subUser.id)?.allowed_folders, [], '被拒请求不得改写白名单');
+
+  // 省略 workspaceCreationRoots 的部分保存（只改别的开关）必须 200，不得 500。
+  const partial = await save({ userId: subUser.id, allowGitDownload: true });
+  assert.equal(partial.status, 200, partial.body);
+  assert.equal(db.getPermissions(subUser.id)?.allow_git_download, true, '其余权限应正常生效');
+});
+
+test('Issue #38：user_permissions 无 workspace_creation_roots 列，显式提交仍 400', async () => {
+  const subUser = db.createUser('issue38-corrupt-roots-user', '$2a$10$dummyhashdummyhashdummyhashdu', 'user');
+  db.setPermissions(subUser.id, {
+    ...ISSUE38_PERM_BASE,
+    allowedFolders: [],
+    allowWorkspaceCreate: true,
+  });
+  const raw = (db as unknown as { db: import('node:sqlite').DatabaseSync }).db;
+  const json = { 'content-type': 'application/json' };
+  const post = (body: Record<string, unknown>) => {
+    const payload = JSON.stringify(body);
+    return gatewayReq('POST', '/gateway/api/permissions', {
+      ...json,
+      'content-length': String(Buffer.byteLength(payload)),
+    }, payload);
+  };
+  try {
+    // 退役列不得存在：旧库里的损坏创建根数据不可能再影响权限读侧。
+    const columns = raw.prepare('PRAGMA table_info(user_permissions)').all() as Array<{ name: string }>;
+    assert.equal(
+      columns.some((column) => column.name === 'workspace_creation_roots'),
+      false,
+      '退役列不得存在',
+    );
+
+    // 省略字段的其它权限保存：必须 200，不得 500。
+    const partial = await post({ userId: subUser.id, allowGitDownload: true });
+    assert.equal(partial.status, 200, partial.body);
+
+    // 显式提交 workspaceCreationRoots（含内部哨兵）一律 400。
+    const explicit = await post({ userId: subUser.id, workspaceCreationRoots: ['__deny__'] });
+    assert.equal(explicit.status, 400, `显式提交必须被拒绝：${explicit.body}`);
+  } finally {
+    raw.prepare('DELETE FROM user_permissions WHERE user_id = ?').run(subUser.id);
+    raw.prepare('DELETE FROM user_session_grants WHERE user_id = ?').run(subUser.id);
+    raw.prepare('DELETE FROM user_workspaces WHERE user_id = ?').run(subUser.id);
+    raw.prepare('DELETE FROM users WHERE id = ?').run(subUser.id);
+  }
+});
+
+test('Issue #38：目录分配 registry 命中放行，未登记的本地真实目录回退放行，未知 400，非主用户 403', async () => {
+  const originalResources = assignableResources;
+  const originalCookie = cookie;
+  const subUser = db.createUser('issue38-dir-assign-user', '$2a$10$dummyhashdummyhashdummyhashdu', 'user');
+  db.setPermissions(subUser.id, {
+    ...ISSUE38_PERM_BASE,
+    allowedFolders: ['__deny__'],
+    allowWorkspaceCreate: true,
+  });
+  const realDir = realpathSync(mkdtempSync(path.join(os.tmpdir(), 'dshpw-dir-assign-')));
+  const missingDir = path.join(os.tmpdir(), `dshpw-dir-assign-missing-${Date.now()}`);
+  const json = { 'content-type': 'application/json' };
+  const post = (folders: string[]) =>
+    gatewayReq('POST', '/gateway/api/permissions', json, JSON.stringify({ userId: subUser.id, allowedFolders: folders }));
+  try {
+    assignableResources = { folders: ['/workspaces/visible'], sessions: [], retainedSessions: [] };
+    cookie = originalCookie;
+
+    // 1) registry 命中（假测试路径）仍放行（权威来源）。
+    const registered = await post(['/workspaces/visible']);
+    assert.equal(registered.status, 200, registered.body);
+    assert.deepEqual(db.getPermissions(subUser.id)?.allowed_folders, ['/workspaces/visible']);
+
+    // 2) 未登记但真实存在且非敏感：回退放行，且不得自动 grant 会话。
+    const fallback = await post([issue38Slash(realDir)]);
+    assert.equal(fallback.status, 200, fallback.body);
+    assert.deepEqual(db.getPermissions(subUser.id)?.allowed_folders, [issue38Slash(realDir)]);
+    assert.deepEqual(db.listUserSessionGrants(subUser.id), [], '分配目录不得自动 grant 会话');
+
+    // 3) 未登记且不存在：400（不用任意目录绕过授权）。
+    const unknown = await post([issue38Slash(missingDir)]);
+    assert.equal(unknown.status, 400, unknown.body);
+
+    // 4) 非主用户不得调用分配接口。
+    cookie = issue38Cookie(subUser);
+    const denied = await post(['/workspaces/visible']);
+    assert.equal(denied.status, 403, denied.body);
+  } finally {
+    assignableResources = originalResources;
+    cookie = originalCookie;
+    try { rmSync(realDir, { recursive: true, force: true }); } catch { /* Windows 文件句柄尽力而为 */ }
+  }
+});
+
+test('Issue #38：授权根内可建目录并登记；根外与主目录拒绝且不触上游；开关关闭拒绝', async () => {
+  const rootPath = issue38Slash(realpathSync(mkdtempSync(path.join(os.tmpdir(), 'dshpw-issue38-root-'))));
+  const outside = issue38Slash(realpathSync(mkdtempSync(path.join(os.tmpdir(), 'dshpw-issue38-outside-'))));
+  const home = os.homedir();
+  const originalCookie = cookie;
+  const json = { 'content-type': 'application/json' };
+  const mkdir = (parent: string, name: string, rpcId: string) => gatewayReq('POST', '/api/directoryPicker/createDirectory', json, JSON.stringify({
+    type: 'client-request', rpcId, method: 'directoryPicker/createDirectory',
+    payload: { args: { path: issue38Slash(parent), name } },
+  }));
+  const register = (target: string, rpcId: string) => gatewayReq('POST', '/api/workspace/create', json, JSON.stringify({
+    type: 'client-request', rpcId, method: 'workspace/create',
+    payload: { args: { request: { path: issue38Slash(target) } } },
+  }));
+  try {
+    const subUser = db.createUser('issue38-mkdir-user', '$2a$10$dummyhashdummyhashdummyhashdu', 'user');
+    db.setPermissions(subUser.id, {
+      ...ISSUE38_PERM_BASE,
+      allowedFolders: [rootPath],
+      allowWorkspaceCreate: true,
+    });
+    db.markSessionGrantsSeeded(subUser.id);
+    cookie = issue38Cookie(subUser);
+
+    // 1) 授权根内创建目录。
+    const created = await mkdir(rootPath, 'fresh', 'issue38-mkdir-1');
+    assert.equal(created.status, 200, created.body);
+    const newDir = issue38Slash(path.join(rootPath, 'fresh'));
+
+    // 2) 刚创建的目录可列出（选择新文件夹必需的 picker 进入）。
+    const listNew = await gatewayReq('POST', '/api/directoryPicker/list', json, JSON.stringify({
+      type: 'client-request', rpcId: 'issue38-list-new', method: 'directoryPicker/list',
+      payload: { args: { path: newDir } },
+    }));
+    assert.equal(listNew.status, 200, listNew.body);
+
+    // 3) 登记为工作区：pending 通道生效，原子写入归属与白名单。
+    workspaceCreateMakesNewWorkspace = true;
+    const registered = await register(newDir, 'issue38-register-1');
+    assert.equal(registered.status, 200, registered.body);
+    assert.equal(
+      db.listUserWorkspacePaths(subUser.id).some((entry) => issue38Norm(entry) === issue38Norm(newDir)),
+      true,
+      '刚创建的目录必须登记为该子用户的私有工作区',
+    );
+    assert.equal(
+      (db.getPermissions(subUser.id)?.allowed_folders ?? []).some((entry) => issue38Norm(entry) === issue38Norm(newDir)),
+      true,
+      '登记必须把新目录并入白名单',
+    );
+    assert.deepEqual(db.listUserWorkspacePaths(subUser.id), [issue38Norm(newDir)], '归属行必须是归一化后的单一条目');
+    assert.deepEqual(
+      db.getPermissions(subUser.id)?.allowed_folders ?? [],
+      [rootPath, issue38Norm(newDir)],
+      '白名单应保留授权根并并入新目录',
+    );
+
+    // 4) 授权根之外的父目录：拒绝，且不得到达上游。
+    const beforeOutside = lastUpstreamUrl;
+    const outsideMkdir = await mkdir(outside, 'nope', 'issue38-mkdir-outside');
+    assert.equal(outsideMkdir.status, 403, outsideMkdir.body);
+    assert.equal(lastUpstreamUrl, beforeOutside, '授权根外的目录创建不得触达上游');
+
+    // 5) 主目录不再是可创建父目录。
+    const beforeHome = lastUpstreamUrl;
+    const homeMkdir = await mkdir(home, 'nope', 'issue38-mkdir-home');
+    assert.equal(homeMkdir.status, 403, homeMkdir.body);
+    assert.equal(lastUpstreamUrl, beforeHome, '主目录越界创建不得触达上游');
+
+    // 6) 存在但未分配的目录仍不可登记：授权根只授予创建权，不授予既有目录登记权。
+    const preexisting = issue38Slash(path.join(rootPath, 'pre-existing'));
+    const preexistingRegister = await register(preexisting, 'issue38-register-preexisting');
+    assert.equal(preexistingRegister.status, 403, preexistingRegister.body);
+    assert.equal(
+      db.listUserWorkspacePaths(subUser.id).some((entry) => issue38Slash(entry) === preexisting),
+      false,
+      '未分配目录不得因位于授权根内而被登记',
+    );
+
+    // 7) allowWorkspaceCreate 是前置开关：关闭时即使父目录在授权根内也拒绝。
+    const offUser = db.createUser('issue38-mkdir-off-user', '$2a$10$dummyhashdummyhashdummyhashdu', 'user');
+    db.setPermissions(offUser.id, {
+      ...ISSUE38_PERM_BASE,
+      allowedFolders: [rootPath],
+      allowWorkspaceCreate: false,
+    });
+    cookie = issue38Cookie(offUser);
+    const offMkdir = await mkdir(rootPath, 'off', 'issue38-mkdir-off');
+    assert.equal(offMkdir.status, 403, offMkdir.body);
+  } finally {
+    workspaceCreateMakesNewWorkspace = false;
+    cookie = originalCookie;
+    try { rmSync(rootPath, { recursive: true, force: true }); } catch { /* Windows 句柄未释放：交给系统回收 */ }
+    try { rmSync(outside, { recursive: true, force: true }); } catch { /* 同上 */ }
+  }
+});
+
+test('Issue #38：授权根作为 picker 导航入口，不放行既有目录与工作区', async () => {
+  const rootPath = issue38Slash(realpathSync(mkdtempSync(path.join(os.tmpdir(), 'dshpw-issue38-nav-'))));
+  const originalCookie = cookie;
+  const json = { 'content-type': 'application/json' };
+  let elsewhere = '';
+  try {
+    const subUser = db.createUser('issue38-nav-user', '$2a$10$dummyhashdummyhashdummyhashdu', 'user');
+    db.setPermissions(subUser.id, {
+      ...ISSUE38_PERM_BASE,
+      allowedFolders: [rootPath],
+      allowWorkspaceCreate: true,
+    });
+    db.markSessionGrantsSeeded(subUser.id);
+    cookie = issue38Cookie(subUser);
+
+    // 1) 无关目录的浏览：上游目录名全部被过滤，只回放授权根作为可进入入口。
+    elsewhere = issue38Slash(realpathSync(mkdtempSync(path.join(os.tmpdir(), 'dshpw-issue38-nav-elsewhere-'))));
+    directoryListEntriesOverride = [
+      { path: `${elsewhere}/should-hide` },
+      { path: rootPath },
+    ];
+    const list = await gatewayReq('POST', '/api/directoryPicker/list', json, JSON.stringify({
+      type: 'client-request', rpcId: 'issue38-nav-list', method: 'directoryPicker/list',
+      payload: { args: { path: elsewhere } },
+    }));
+    assert.equal(list.status, 200, list.body);
+    const entries = ((JSON.parse(list.body) as { result?: { value?: { entries?: Array<{ path?: unknown }> } } })
+      .result?.value?.entries ?? []).map((entry) => issue38Norm(String(entry.path)));
+    assert.deepEqual(entries, [issue38Norm(rootPath)], '只回放授权根入口');
+    assert.equal(entries.some((entry) => entry.includes('should-hide')), false, '不得回放上游无关目录名');
+
+    // 2) 工作区可见性与授权根无关：根配置不提供任何既有工作区可见性。
+    const workspaceList = await gatewayReq('POST', '/api/workspace.list', {
+      ...json,
+      'x-test-mode': 'assigned-visible',
+    }, '{}');
+    assert.equal(workspaceList.status, 200, workspaceList.body);
+    const items = (JSON.parse(workspaceList.body) as { result?: { value?: { items?: Array<{ path?: unknown }> } } })
+      .result?.value?.items ?? [];
+    assert.deepEqual(items, [], '授权根配置不得让既有工作区变为可见');
+  } finally {
+    directoryListEntriesOverride = null;
+    cookie = originalCookie;
+    if (elsewhere !== '') { try { rmSync(elsewhere, { recursive: true, force: true }); } catch { /* Windows 句柄未释放：交给系统回收 */ } }
+    try { rmSync(rootPath, { recursive: true, force: true }); } catch { /* Windows 句柄未释放：交给系统回收 */ }
+  }
+});
+
+test('Issue #38：授权目录内符号链接越界拒绝；根内有效链接仍放行', async (t) => {
+  // 授权白名单只含根：根内链接指向根外目录时 canonical 腿必须拒绝；指向根内目录时两腿命中。
+  const realRoot = issue38Slash(realpathSync(mkdtempSync(path.join(os.tmpdir(), 'dshpw-issue38-link-root-'))));
+  const outside = issue38Slash(realpathSync(mkdtempSync(path.join(os.tmpdir(), 'dshpw-issue38-link-outside-'))));
+  const escape = path.join(realRoot, 'escape');
+  const insideLink = path.join(realRoot, 'inside-link');
+  const insideReal = path.join(realRoot, 'inside-real');
+  const originalCookie = cookie;
+  const json = { 'content-type': 'application/json' };
+  const mkdir = (parent: string, name: string, rpcId: string) => gatewayReq('POST', '/api/directoryPicker/createDirectory', json, JSON.stringify({
+    type: 'client-request', rpcId, method: 'directoryPicker/createDirectory',
+    payload: { args: { path: issue38Slash(parent), name } },
+  }));
+  try {
+    const subUser = db.createUser('issue38-link-user', '$2a$10$dummyhashdummyhashdummyhashdu', 'user');
+    db.setPermissions(subUser.id, {
+      ...ISSUE38_PERM_BASE,
+      allowedFolders: [realRoot],
+      allowWorkspaceCreate: true,
+    });
+    cookie = issue38Cookie(subUser);
+    assert.equal((await mkdir(realRoot, 'inside-real', 'issue38-link-mkdir-real')).status, 200);
+
+    // 根内 → 根外 的目录链接（Windows junction / POSIX symlink）：canonical 腿必须拒绝。
+    let linkedEscape = false;
+    for (const type of ['junction', 'dir'] as const) {
+      try { symlinkSync(outside, escape, type); linkedEscape = true; break; } catch { /* 下一个形态 */ }
+    }
+    if (!linkedEscape) {
+      t.skip('当前平台无法创建目录符号链接/junction，跳过 canonical 逃逸回归');
+      return;
+    }
+    const beforeEscape = lastUpstreamUrl;
+    const escaped = await mkdir(escape, 'escaped', 'issue38-link-escape');
+    assert.equal(escaped.status, 403, escaped.body);
+    assert.equal(lastUpstreamUrl, beforeEscape, '经符号链接逃逸出授权目录的创建不得触达上游');
+
+    // 根内 → 根内 的链接仍然有效：词法与 canonical 都命中同一授权根。
+    let linkedInside = false;
+    for (const type of ['junction', 'dir'] as const) {
+      try { symlinkSync(insideReal, insideLink, type); linkedInside = true; break; } catch { /* 下一个形态 */ }
+    }
+    if (linkedInside) {
+      const viaInsideLink = await mkdir(insideLink, 'via-link', 'issue38-link-inside');
+      assert.equal(viaInsideLink.status, 200, viaInsideLink.body);
+    }
+  } finally {
+    cookie = originalCookie;
+    try { rmSync(escape, { recursive: true, force: true }); } catch { /* 链接随真实根一并清理 */ }
+    try { rmSync(insideLink, { recursive: true, force: true }); } catch { /* 同上 */ }
+    try { rmSync(realRoot, { recursive: true, force: true }); } catch { /* Windows 句柄未释放：交给系统回收 */ }
+    try { rmSync(outside, { recursive: true, force: true }); } catch { /* 同上 */ }
+  }
+});
+
+test('Issue #38：同一授权根下不跨子用户登记或建目录', async () => {
+  const root = issue38Slash(realpathSync(mkdtempSync(path.join(os.tmpdir(), 'dshpw-issue38-shared-'))));
+  const originalCookie = cookie;
+  const json = { 'content-type': 'application/json' };
+  const mkdir = (parent: string, name: string, rpcId: string) => gatewayReq('POST', '/api/directoryPicker/createDirectory', json, JSON.stringify({
+    type: 'client-request', rpcId, method: 'directoryPicker/createDirectory',
+    payload: { args: { path: issue38Slash(parent), name } },
+  }));
+  try {
+    const owner = db.createUser('issue38-shared-owner', '$2a$10$dummyhashdummyhashdummyhashdu', 'user');
+    const peer = db.createUser('issue38-shared-peer', '$2a$10$dummyhashdummyhashdummyhashdu', 'user');
+    // owner 通过常规目录白名单获得创建能力，并把子目录直接记为自建工作区：
+    // 本用例只验证「同一授权根下不跨子用户登记或建目录」。
+    db.setPermissions(owner.id, {
+      ...ISSUE38_PERM_BASE,
+      allowedFolders: [root],
+      allowWorkspaceCreate: true,
+    });
+    // peer 被分配了同一授权根：parentAllowed 会命中，因此唯一能拦住它的是
+    // 「不得伸进另一子用户的工作区子树」。
+    db.setPermissions(peer.id, {
+      ...ISSUE38_PERM_BASE,
+      allowedFolders: [root],
+      allowWorkspaceCreate: true,
+    });
+    const ownerDir = issue38Slash(path.join(root, 'a-owned'));
+    db.addUserWorkspace(owner.id, ownerDir);
+
+    // owner 在共享授权根下建目录（含自己工作区子树内）不受归属边界影响。
+    cookie = issue38Cookie(owner);
+    assert.equal((await mkdir(root, 'a-fresh', 'issue38-shared-owner-mkdir')).status, 200);
+    assert.equal((await mkdir(ownerDir, 'own-nested', 'issue38-shared-owner-nested')).status, 200, '不得拦截在自己工作区子树内建目录');
+
+    // peer 即使被分配了同一授权根，也不得登记 owner 的工作区，也不得伸进其子树。
+    cookie = issue38Cookie(peer);
+    const peerRegister = await gatewayReq('POST', '/api/workspace/create', json, JSON.stringify({
+      type: 'client-request', rpcId: 'issue38-shared-peer-register', method: 'workspace/create',
+      payload: { args: { request: { path: ownerDir } } },
+    }));
+    assert.equal(peerRegister.status, 403, '另一子用户的工作区不可被他人登记');
+    assert.equal(
+      db.listUserWorkspacePaths(peer.id).some((entry) => issue38Slash(entry) === ownerDir),
+      false,
+    );
+    // 共享授权根本身仍可作父目录建兄弟目录，但伸进 owner 子树被拒。
+    assert.equal((await mkdir(root, 'b-fresh', 'issue38-shared-peer-sibling')).status, 200);
+    const peerMkdirInside = await mkdir(ownerDir, 'nested', 'issue38-shared-peer-mkdir');
+    assert.equal(peerMkdirInside.status, 403, '不得在另一子用户的工作区子树内建目录');
+  } finally {
+    cookie = originalCookie;
+    try { rmSync(root, { recursive: true, force: true }); } catch { /* Windows 句柄未释放：交给系统回收 */ }
+  }
+});
+
+test('Issue #38：上游回包词法在授权根内、canonical 出根（根内链接）不得记账或登记', async (t) => {
+  // 真实 createDirectory 返回 join(resolve(path), name)（词法直接子路径）；本用例模拟上游被替换/回归：
+  // 回一个「词法在请求父目录内、但经根内目录链接 canonical 出根」的路径。
+  const rootPath = issue38Slash(realpathSync(mkdtempSync(path.join(os.tmpdir(), 'dshpw-issue38-acct-root-'))));
+  const outside = issue38Slash(realpathSync(mkdtempSync(path.join(os.tmpdir(), 'dshpw-issue38-acct-outside-'))));
+  const link = path.join(rootPath, 'link');
+  const leaked = path.join(outside, 'leak');
+  const originalCookie = cookie;
+  const json = { 'content-type': 'application/json' };
+  const mkdir = (parent: string, name: string, rpcId: string) => gatewayReq('POST', '/api/directoryPicker/createDirectory', json, JSON.stringify({
+    type: 'client-request', rpcId, method: 'directoryPicker/createDirectory',
+    payload: { args: { path: issue38Slash(parent), name } },
+  }));
+  const register = (target: string, rpcId: string) => gatewayReq('POST', '/api/workspace/create', json, JSON.stringify({
+    type: 'client-request', rpcId, method: 'workspace/create',
+    payload: { args: { request: { path: issue38Slash(target) } } },
+  }));
+  try {
+    let linked = false;
+    for (const type of ['junction', 'dir'] as const) {
+      try { symlinkSync(outside, link, type); linked = true; break; } catch { /* 下一个形态 */ }
+    }
+    if (!linked) {
+      t.skip('当前平台无法创建目录链接/junction，跳过记账 canonical 逃逸回归');
+      return;
+    }
+    // 使 realpath(root/link/leak) 能解析到 outside/leak。
+    mkdirSync(leaked, { recursive: true });
+
+    const subUser = db.createUser('issue38-acct-user', '$2a$10$dummyhashdummyhashdummyhashdu', 'user');
+    db.setPermissions(subUser.id, {
+      ...ISSUE38_PERM_BASE,
+      allowedFolders: [rootPath],
+      allowWorkspaceCreate: true,
+    });
+    db.markSessionGrantsSeeded(subUser.id);
+    cookie = issue38Cookie(subUser);
+
+    // 请求父目录是授权根本身（合法）：accounting 需在此拒绝 canonical 出根的回包路径。
+    directoryCreateEscapePath = issue38Slash(path.join(rootPath, 'link', 'leak'));
+    const created = await mkdir(rootPath, 'okname', 'issue38-acct-mkdir');
+    assert.equal(created.status, 200, created.body);
+
+    // 该 canonical 出根路径不得进入 pending 信任窗口：登记必须 403，不写归属/白名单。
+    workspaceCreateMakesNewWorkspace = true;
+    const registered = await register(leaked, 'issue38-acct-register');
+    assert.equal(registered.status, 403, 'canonical 出根的路径不得被登记');
+    assert.deepEqual(db.listUserWorkspacePaths(subUser.id), [], '不得把根外目录归为私有工作区');
+    assert.deepEqual(db.getPermissions(subUser.id)?.allowed_folders, [rootPath], '不得扩宽工作区白名单');
+  } finally {
+    directoryCreateEscapePath = null;
+    workspaceCreateMakesNewWorkspace = false;
+    cookie = originalCookie;
+    try { rmSync(link, { recursive: true, force: true }); } catch { /* junction 删除 */ }
+    try { rmSync(rootPath, { recursive: true, force: true }); } catch { /* Windows 句柄未释放：交给系统回收 */ }
+    try { rmSync(outside, { recursive: true, force: true }); } catch { /* 同上 */ }
+  }
+});
+
+test('Issue #38：home 落点无授权时一律不回放既有目录', async () => {
+  const home = os.homedir();
+  const json = { 'content-type': 'application/json' };
+  const originalCookie = cookie;
+  const listHome = (rpcId: string) => gatewayReq('POST', '/api/directoryPicker/list', json, JSON.stringify({
+    type: 'client-request', rpcId, method: 'directoryPicker/list',
+    payload: { args: { path: home } },
+  }));
+  const entryPaths = (body: string): string[] =>
+    ((JSON.parse(body) as { result?: { value?: { entries?: Array<{ path?: unknown }> } } })
+      .result?.value?.entries ?? []).map((entry) => String(entry.path));
+  try {
+    // 上游忠实地回了 home 的全部（含一个已存在子目录）；home 未授权就不得回放这些目录名。
+    directoryListEntriesOverride = [{ path: `${issue38Slash(home)}/home-existing-dir` }];
+
+    // 授权根在别处：home 落点不得回放既有目录，只回放授权根入口。
+    const rootPath = issue38Slash(realpathSync(mkdtempSync(path.join(os.tmpdir(), 'dshpw-issue38-home-nav-'))));
+    const configured = db.createUser('issue38-home-roots-user', '$2a$10$dummyhashdummyhashdummyhashdu', 'user');
+    db.setPermissions(configured.id, {
+      ...ISSUE38_PERM_BASE,
+      allowedFolders: [rootPath],
+      allowWorkspaceCreate: true,
+    });
+    cookie = issue38Cookie(configured);
+    const filtered = await listHome('issue38-home-roots');
+    assert.equal(filtered.status, 200, filtered.body);
+    const filteredEntries = entryPaths(filtered.body);
+    assert.equal(filteredEntries.some((entry) => entry.includes('home-existing-dir')), false, '未授权 home 不得回放既有目录');
+    assert.deepEqual(filteredEntries, [], 'home 落点只保留通往授权根的导航，上游无关目录被过滤');
+
+    // __deny__（无可读根）：条目为空，既不回放上游内容也不返回 403。
+    const legacy = db.createUser('issue38-home-legacy-user', '$2a$10$dummyhashdummyhashdummyhashdu', 'user');
+    db.setPermissions(legacy.id, {
+      ...ISSUE38_PERM_BASE,
+      allowedFolders: ['__deny__'],
+      allowWorkspaceCreate: true,
+    });
+    cookie = issue38Cookie(legacy);
+    const unfiltered = await listHome('issue38-home-legacy');
+    assert.equal(unfiltered.status, 200, unfiltered.body);
+    assert.deepEqual(entryPaths(unfiltered.body), [], '无可读根时 home 落点不得回放既有目录');
+    try { rmSync(rootPath, { recursive: true, force: true }); } catch { /* Windows 句柄未释放：交给系统回收 */ }
+  } finally {
+    directoryListEntriesOverride = null;
+    cookie = originalCookie;
+  }
+});
+
+test('Issue #38：授权根本身是符号链接时可在真实/词法视角建目录并归一为 canonical 登记', async (t) => {
+  // 授权根**本身就是符号链接**：创建父路径门禁的 dual 两腿（词法=链接路径，canonical=真实目标）
+  // 必须命中同一授权范围，且记账 dual 不阻碍合法创建。
+  const realTarget = issue38Slash(realpathSync(mkdtempSync(path.join(os.tmpdir(), 'dshpw-issue38-linkroot-real-'))));
+  const linkParent = issue38Slash(realpathSync(mkdtempSync(path.join(os.tmpdir(), 'dshpw-issue38-linkroot-p-'))));
+  const linkRoot = path.join(linkParent, 'root-link');
+  const name = 'fresh';
+  const realDir = issue38Slash(path.join(realTarget, name));
+  const lexicalDir = issue38Slash(path.join(linkRoot, name));
+  const originalCookie = cookie;
+  const json = { 'content-type': 'application/json' };
+  const mkdir = (parent: string, dirName: string, rpcId: string) => gatewayReq('POST', '/api/directoryPicker/createDirectory', json, JSON.stringify({
+    type: 'client-request', rpcId, method: 'directoryPicker/createDirectory',
+    payload: { args: { path: issue38Slash(parent), name: dirName } },
+  }));
+  const register = (target: string, rpcId: string) => gatewayReq('POST', '/api/workspace/create', json, JSON.stringify({
+    type: 'client-request', rpcId, method: 'workspace/create',
+    payload: { args: { request: { path: issue38Slash(target) } } },
+  }));
+  try {
+    let linked = false;
+    for (const type of ['junction', 'dir'] as const) {
+      try { symlinkSync(realTarget, linkRoot, type); linked = true; break; } catch { /* 下一个形态 */ }
+    }
+    if (!linked) {
+      t.skip('当前平台无法创建目录链接/junction，跳过链接授权根回归');
+      return;
+    }
+    // 真实 DSH 的 createDirectory 会 mkdir 出目录、workspace/create 以 fs.realpath 归一回包；
+    // 这里预建物理目录，模拟 mkdir 之后、登记之前的文件系统状态（mock 不落盘）。
+    mkdirSync(path.join(realTarget, name), { recursive: true });
+
+    const subUser = db.createUser('issue38-linkroot-user', '$2a$10$dummyhashdummyhashdummyhashdu', 'user');
+    db.setPermissions(subUser.id, {
+      ...ISSUE38_PERM_BASE,
+      // 链接路径与其真实目标都必须在白名单内：创建 dual 两腿才都能命中。
+      allowedFolders: [issue38Slash(linkRoot), realTarget],
+      allowWorkspaceCreate: true,
+    });
+    db.markSessionGrantsSeeded(subUser.id);
+    cookie = issue38Cookie(subUser);
+
+    // 1) 经合法链接根建目录：父路径门禁 dual 命中同一授权范围 → 200。
+    const created = await mkdir(issue38Slash(linkRoot), name, 'issue38-linkroot-mkdir');
+    assert.equal(created.status, 200, created.body);
+
+    // 2) 词法视角登记（客户经链接导航到根并新建后拿到的就是链接路径）：
+    //    登记必须落库为 canonical 归属（真实 DSH 回包即 realpath）。
+    workspaceCreateMakesNewWorkspace = true;
+    const lexicalRegister = await register(lexicalDir, 'issue38-linkroot-register-lexical');
+    assert.equal(lexicalRegister.status, 200, lexicalRegister.body);
+    assert.deepEqual(db.listUserWorkspacePaths(subUser.id), [issue38Norm(realDir)], '词法视角登记必须归一为 canonical 归属');
+    assert.equal(
+      (db.getPermissions(subUser.id)?.allowed_folders ?? []).some((entry) => issue38Norm(entry) === issue38Norm(realDir)),
+      true,
+      '词法视角登记必须并入 canonical 白名单',
+    );
+
+    // 3) 真实路径视角登记：同一 canonical 归属，不因链接形态差异产生第二条记录。
+    const realRegister = await register(realDir, 'issue38-linkroot-register-real');
+    assert.equal(realRegister.status, 200, realRegister.body);
+    assert.deepEqual(db.listUserWorkspacePaths(subUser.id), [issue38Norm(realDir)], '真实视角登记不得产生重复归属');
+  } finally {
+    workspaceCreateMakesNewWorkspace = false;
+    cookie = originalCookie;
+    try { rmSync(linkRoot, { recursive: true, force: true }); } catch { /* junction 删除 */ }
+    try { rmSync(linkParent, { recursive: true, force: true }); } catch { /* Windows 句柄未释放：交给系统回收 */ }
+    try { rmSync(realTarget, { recursive: true, force: true }); } catch { /* 同上 */ }
+  }
+});
+
+test('Remote workspace/follow 的 archived 增量立即更新会话归档投影', async () => {
+  const subUser = db.createUser('remote-archived-inc-user', '$2a$10$dummyhashdummyhashdummyhashdu', 'user');
+  db.setPermissions(subUser.id, {
+    allowedFolders: ['/workspaces/visible'], hourlyTokenLimit: null, dailyMinutesLimit: null,
+    allowUpload: false, allowGitDownload: false, allowWorkspaceCreate: false,
+    allowedAgentPresets: null, banned: false, sandboxMode: null, disabledSessions: [],
+    allowedSessionIds: ['session-visible'],
+  });
+  db.markSessionGrantsSeeded(subUser.id);
+  const subCookie = `dsh_gateway_token=${jwt.sign({ sub: String(subUser.id), username: subUser.username, cv: 0 }, 'test-secret', { expiresIn: '12h' })}`;
+  const originalCookie = cookie;
+  cookie = subCookie;
+  remoteMuxBaselineVisibleSessionIds = ['session-visible'];
+  remoteMuxArchivedIncrement = ['session-visible', 'session-unauthorized'];
+  const connection = await openRemoteMux({ cookie: subCookie, origin: 'http://127.0.0.1', host: '127.0.0.1' });
+  try {
+    connection.client.send(JSON.stringify({ type: 'open', streamId: 'archived-inc', endpoint: 'workspace/follow', payload: { args: {} } }));
+    const baseline = await nextFrameOrFail(connection, 'archived baseline');
+    assert.equal((baseline.value as { type?: string }).type, 'baseline');
+
+    const increment = await nextFrameOrFail(connection, 'archived increment');
+    assert.deepEqual(
+      increment.value,
+      { type: 'archived', archivedSessionIds: ['session-visible'] },
+      '未授权会话 ID 不得进入归档增量投影',
+    );
+
+    const list = await gatewayReq('POST', '/api/session.list', { 'content-type': 'application/json' }, '{}');
+    assert.equal(list.status, 200, list.body);
+    assert.deepEqual(
+      (JSON.parse(list.body) as { result: { value: { items: Array<{ sessionId: string }> } } }).result.value.items.map((item) => item.sessionId),
+      [],
+      'archived 增量必须立即把会话从 session.list 中隐藏',
+    );
+  } finally {
+    remoteMuxArchivedIncrement = null;
+    remoteMuxBaselineVisibleSessionIds = ['session-visible'];
+    cookie = originalCookie;
+    connection.client.close();
+  }
+});
+
+// ── Issue #38：目录选择器加固（完全限定路径 / 敏感与他人子树 / 畸形响应） ───
+
+test('Issue #38：子用户目录浏览拒绝非完全限定路径（无相对、Windows 盘符不摇晃）', async () => {
+  const wsRoot = realpathSync(mkdtempSync(path.join(os.tmpdir(), 'dshpw-qual-root-')));
+  const originalCookie = cookie;
+  const json = { 'content-type': 'application/json' };
+  const list = (requestPath: string, rpcId: string) => gatewayReq('POST', '/api/directoryPicker/list', json, JSON.stringify({
+    type: 'client-request', rpcId, method: 'directoryPicker/list',
+    payload: { args: { path: requestPath } },
+  }));
+  try {
+    const subUser = db.createUser('issue38-qualified-user', '$2a$10$dummyhashdummyhashdummyhashdu', 'user');
+    db.setPermissions(subUser.id, {
+      ...ISSUE38_PERM_BASE,
+      allowedFolders: [issue38Slash(wsRoot)],
+      allowWorkspaceCreate: false,
+    });
+    cookie = issue38Cookie(subUser);
+
+    // 相对路径一律拒绝（子用户根导航不做相对解析）。
+    assert.equal((await list('relative/dir', 'qual-rel')).status, 403, '相对路径必须 403');
+    assert.equal((await list('./sibling', 'qual-dot')).status, 403, '相对路径必须 403');
+    if (process.platform === 'win32') {
+      // Windows 上 '/etc' 会落到进程当前盘符，属于含糊输入：拒绝（/foo 不再是默认 drive）。
+      assert.equal((await list('/etc', 'qual-ambiguous')).status, 403, 'Windows 盘符含糊路径必须 403');
+    }
+    // 完全限定路径仍正常放行。
+    assert.equal((await list(issue38Slash(wsRoot), 'qual-ok')).status, 200);
+  } finally {
+    cookie = originalCookie;
+    try { rmSync(wsRoot, { recursive: true, force: true }); } catch { /* Windows 句柄未释放：交给系统回收 */ }
+  }
+});
+
+test('Issue #38：授权目录内敏感子目录（含链接 canonical 腿）逐条隐藏', async (t) => {
+  const wsRoot = realpathSync(mkdtempSync(path.join(os.tmpdir(), 'dshpw-sens-root-')));
+  const secretLink = path.join(wsRoot, 'secret-link');
+  const originalCookie = cookie;
+  const json = { 'content-type': 'application/json' };
+  const list = (requestPath: string, rpcId: string) => gatewayReq('POST', '/api/directoryPicker/list', json, JSON.stringify({
+    type: 'client-request', rpcId, method: 'directoryPicker/list',
+    payload: { args: { path: requestPath } },
+  }));
+  const entryPaths = (body: string): string[] =>
+    ((JSON.parse(body) as { result?: { value?: { entries?: Array<{ path?: unknown }> } } }).result?.value?.entries ?? [])
+      .map((entry) => issue38Norm(String(entry.path)));
+  try {
+    // 授权目录内的链接指向部署根（敏感基）→ canonical 腿必须拦住。
+    let linked = false;
+    for (const type of ['junction', 'dir'] as const) {
+      try { symlinkSync(tempDir, secretLink, type); linked = true; break; } catch { /* 下一个形态 */ }
+    }
+    const subUser = db.createUser('issue38-sensitive-user', '$2a$10$dummyhashdummyhashdummyhashdu', 'user');
+    db.setPermissions(subUser.id, {
+      ...ISSUE38_PERM_BASE,
+      allowedFolders: [issue38Slash(wsRoot)],
+      allowWorkspaceCreate: false,
+    });
+    cookie = issue38Cookie(subUser);
+
+    const okDir = `${issue38Slash(wsRoot)}/ok-dir`;
+    const directSecret = issue38Slash(path.join(tempDir, 'deployment-secret'));
+    directoryListEntriesOverride = [
+      { path: okDir },
+      { path: directSecret },
+      ...(linked ? [{ path: issue38Slash(secretLink) }] : []),
+    ];
+    const res = await list(issue38Slash(wsRoot), 'sens-list');
+    assert.equal(res.status, 200, res.body);
+    const entries = entryPaths(res.body);
+    assert.deepEqual(entries, [issue38Norm(okDir)], '只保留非敏感子目录');
+    assert.equal(entries.some((entry) => entry.includes('deployment-secret') || entry.includes('secret-link')), false, '敏感子目录必须隐藏');
+    if (!linked) t.diagnostic('当前平台无法创建目录链接，secret-link 的 canonical 腿未覆盖');
+  } finally {
+    directoryListEntriesOverride = null;
+    cookie = originalCookie;
+    try { rmSync(secretLink, { recursive: true, force: true }); } catch { /* junction 删除 */ }
+    try { rmSync(wsRoot, { recursive: true, force: true }); } catch { /* Windows 句柄未释放：交给系统回收 */ }
+  }
+});
+
+test('Issue #38：授权目录内他人工作区子树（含链接 canonical 腿）逐条隐藏', async (t) => {
+  const wsRoot = realpathSync(mkdtempSync(path.join(os.tmpdir(), 'dshpw-peer-root-')));
+  const owned = realpathSync(mkdtempSync(path.join(os.tmpdir(), 'dshpw-peer-owned-')));
+  const peerLink = path.join(wsRoot, 'peer-link');
+  const originalCookie = cookie;
+  const json = { 'content-type': 'application/json' };
+  const list = (requestPath: string, rpcId: string) => gatewayReq('POST', '/api/directoryPicker/list', json, JSON.stringify({
+    type: 'client-request', rpcId, method: 'directoryPicker/list',
+    payload: { args: { path: requestPath } },
+  }));
+  const entryPaths = (body: string): string[] =>
+    ((JSON.parse(body) as { result?: { value?: { entries?: Array<{ path?: unknown }> } } }).result?.value?.entries ?? [])
+      .map((entry) => issue38Norm(String(entry.path)));
+  try {
+    const owner = db.createUser('issue38-peer-owner', '$2a$10$dummyhashdummyhashdummyhashdu', 'user');
+    db.addUserWorkspace(owner.id, issue38Slash(owned));
+    let linked = false;
+    for (const type of ['junction', 'dir'] as const) {
+      try { symlinkSync(owned, peerLink, type); linked = true; break; } catch { /* 下一个形态 */ }
+    }
+    const viewer = db.createUser('issue38-peer-viewer', '$2a$10$dummyhashdummyhashdummyhashdu', 'user');
+    db.setPermissions(viewer.id, {
+      ...ISSUE38_PERM_BASE,
+      allowedFolders: [issue38Slash(wsRoot)],
+      allowWorkspaceCreate: false,
+    });
+    cookie = issue38Cookie(viewer);
+
+    const okDir = `${issue38Slash(wsRoot)}/ok-dir`;
+    directoryListEntriesOverride = [
+      { path: okDir },
+      { path: issue38Slash(owned) },
+      ...(linked ? [{ path: issue38Slash(peerLink) }] : []),
+    ];
+    const res = await list(issue38Slash(wsRoot), 'peer-list');
+    assert.equal(res.status, 200, res.body);
+    const entries = entryPaths(res.body);
+    assert.deepEqual(entries, [issue38Norm(okDir)], '只保留非他人工作区子目录');
+    if (!linked) t.diagnostic('当前平台无法创建目录链接，peer-link 的 canonical 腿未覆盖');
+  } finally {
+    directoryListEntriesOverride = null;
+    cookie = originalCookie;
+    try { rmSync(peerLink, { recursive: true, force: true }); } catch { /* junction 删除 */ }
+    try { rmSync(wsRoot, { recursive: true, force: true }); } catch { /* Windows 句柄未释放：交给系统回收 */ }
+    try { rmSync(owned, { recursive: true, force: true }); } catch { /* 同上 */ }
+  }
+});
+
+test('Issue #38：文件系统根浏览不枚举全局目录，只保留通往授权根的导航', async () => {
+  const wsRoot = realpathSync(mkdtempSync(path.join(os.tmpdir(), 'dshpw-fsroot-root-')));
+  const fsRoot = path.parse(wsRoot).root.replace(/\\/g, '/');
+  const originalCookie = cookie;
+  const json = { 'content-type': 'application/json' };
+  const list = (requestPath: string, rpcId: string) => gatewayReq('POST', '/api/directoryPicker/list', json, JSON.stringify({
+    type: 'client-request', rpcId, method: 'directoryPicker/list',
+    payload: { args: { path: requestPath } },
+  }));
+  const entryPaths = (body: string): string[] =>
+    ((JSON.parse(body) as { result?: { value?: { entries?: Array<{ path?: unknown }> } } }).result?.value?.entries ?? [])
+      .map((entry) => issue38Norm(String(entry.path)));
+  try {
+    const subUser = db.createUser('issue38-fsroot-user', '$2a$10$dummyhashdummyhashdummyhashdu', 'user');
+    db.setPermissions(subUser.id, {
+      ...ISSUE38_PERM_BASE,
+      allowedFolders: [issue38Slash(wsRoot)],
+      allowWorkspaceCreate: false,
+    });
+    cookie = issue38Cookie(subUser);
+
+    // 上游在根下回一堆全局目录：全部不得回放（根是授权根的祖先，仅导航）。
+    directoryListEntriesOverride = [
+      { path: `${fsRoot}global-top-secret` },
+      { path: issue38Norm(`${fsRoot}another-global`) },
+    ];
+    const res = await list(fsRoot, 'fsroot-list');
+    assert.equal(res.status, 200, res.body);
+    const entries = entryPaths(res.body);
+    // 根是授权根的祖先：上游全局目录全部不回放，只留可进入的授权根入口。
+    assert.deepEqual(entries, [issue38Norm(wsRoot)], '文件系统根只回放授权根入口');
+    assert.equal(entries.some((entry) => entry.includes('global-top-secret') || entry.includes('another-global')), false, '文件系统根不得枚举全局目录');
+  } finally {
+    directoryListEntriesOverride = null;
+    cookie = originalCookie;
+    try { rmSync(wsRoot, { recursive: true, force: true }); } catch { /* Windows 句柄未释放：交给系统回收 */ }
+  }
+});
+
+test('Issue #38：目录列表响应结构畸形（缺 entries/crumbs）502 fail-closed', async () => {
+  const wsRoot = realpathSync(mkdtempSync(path.join(os.tmpdir(), 'dshpw-malformed-root-')));
+  const originalCookie = cookie;
+  const json = { 'content-type': 'application/json' };
+  try {
+    const subUser = db.createUser('issue38-malformed-user', '$2a$10$dummyhashdummyhashdummyhashdu', 'user');
+    db.setPermissions(subUser.id, {
+      ...ISSUE38_PERM_BASE,
+      allowedFolders: [issue38Slash(wsRoot)],
+      allowWorkspaceCreate: false,
+    });
+    cookie = issue38Cookie(subUser);
+    directoryListMalformed = true;
+    const res = await gatewayReq('POST', '/api/directoryPicker/list', json, JSON.stringify({
+      type: 'client-request', rpcId: 'malformed-list', method: 'directoryPicker/list',
+      payload: { args: { path: issue38Slash(wsRoot) } },
+    }));
+    assert.equal(res.status, 502, `结构畸形必须 502：${res.body}`);
+  } finally {
+    directoryListMalformed = false;
+    cookie = originalCookie;
+    try { rmSync(wsRoot, { recursive: true, force: true }); } catch { /* Windows 句柄未释放：交给系统回收 */ }
   }
 });

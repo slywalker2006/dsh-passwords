@@ -30,6 +30,8 @@ let showLegacyWorkspace = false;
 /** DSH 0.2.1-alpha.1+ 已退役点号 /api/workspace.list：模拟上游对该 RPC 返回不可解析的 404。 */
 let legacyWorkspaceRpcAbsent = false;
 let workspaceResponsePlan: Array<{ archived: string[]; delayMs: number; gate?: Promise<void> }> = [];
+/** workspace.archiveSession/unarchiveSession 成功响应回带的权威归档集合（'malformed' = 形状非法）。 */
+let archiveActionResponse: string[] | 'malformed' | null = null;
 
 const sessionListBody = () => {
   const value = [
@@ -96,6 +98,20 @@ function tokenFor(user: { id: number; username: string }, secret: string): strin
   return `dsh_gateway_token=${jwt.sign({ sub: String(user.id), username: user.username, cv: 0 }, secret, { expiresIn: '12h' })}`;
 }
 
+function listSessionIds(response: { json: unknown }): string[] {
+  return (response.json as { result: { value: Array<{ sessionId: string }> } }).result.value.map((item) => item.sessionId);
+}
+
+/** 前面的 Issue #39 用例把 s-active 置为 disabled；归档传输用例需要干净的活跃授权。 */
+function resetArchiveUser(): void {
+  db.setPermissions(userId, {
+    allowedFolders: [workspaceDir, otherWorkspaceDir], hourlyTokenLimit: null, dailyMinutesLimit: null,
+    allowUpload: true, allowGitDownload: true, allowWorkspaceCreate: false,
+    banned: false, sandboxMode: null, disabledSessions: [],
+    allowedSessionIds: ['s-active', 's-archived'],
+  });
+}
+
 before(async () => {
   tempDir = mkdtempSync(path.join(os.tmpdir(), 'dshpw-archive-proxy-'));
   workspaceDir = mkdtempSync(path.join(os.tmpdir(), 'dshpw-archive-workspace-'));
@@ -141,9 +157,23 @@ before(async () => {
       res.end(JSON.stringify({
         ok: true,
         folders: [workspaceDir, otherWorkspaceDir],
-        sessions: ['s-active', 's-archived', 's-other'],
+        sessions: ['s-active', 's-other'],
+        assignableSessions: ['s-active', 's-other'],
+        retainedSessions: ['s-archived'],
       }));
       return;
+    }
+    if (req.url?.startsWith('/api/workspace.archiveSession') || req.url?.startsWith('/api/workspace.unarchiveSession')) {
+      if (archiveActionResponse !== null) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+          result: {
+            ok: true,
+            value: { archivedSessionIds: archiveActionResponse === 'malformed' ? 'not-an-array' : archiveActionResponse },
+          },
+        }));
+        return;
+      }
     }
     if (req.url?.startsWith('/api/workspace.list')) {
       const plan = workspaceResponsePlan.shift();
@@ -420,6 +450,27 @@ test('Issue #16: workspace.archiveSession uses session ownership checks', async 
   assert.equal(other.status, 403, '其他用户工作区中的会话不得归档');
 });
 
+test('Issue #39: archived grants are retained but new archived grants are rejected', async () => {
+  archiveIds = ['s-archived'];
+  const retained = await request('POST', '/gateway/api/permissions', adminCookie, JSON.stringify({
+    userId,
+    allowedFolders: [workspaceDir],
+    allowedSessionIds: ['s-active', 's-archived'],
+    disabledSessions: ['s-active'],
+  }));
+  assert.equal(retained.status, 200, retained.text);
+  assert.deepEqual(db.listUserSessionGrants(userId), ['s-active', 's-archived']);
+
+  const rejected = await request('POST', '/gateway/api/permissions', adminCookie, JSON.stringify({
+    userId,
+    allowedFolders: [workspaceDir],
+    allowedSessionIds: ['s-active', 's-archived', 's-new-archived'],
+    disabledSessions: ['s-active'],
+  }));
+  assert.equal(rejected.status, 400, rejected.text);
+  assert.equal((rejected.json as { code?: string }).code, 'SESSION_NOT_ASSIGNABLE');
+});
+
 test('Issue #16: admin retains raw workspace and session archive views', async () => {
   archiveIds = ['s-archived'];
   const workspace = await request('POST', '/api/workspace.list', adminCookie);
@@ -432,4 +483,85 @@ test('Issue #16: admin retains raw workspace and session archive views', async (
   assert.equal(sessions.status, 200);
   const sessionItems = (sessions.json as { result: { value: Array<{ sessionId: string }> } }).result.value;
   assert.deepEqual(sessionItems.map((item) => item.sessionId), ['s-active', 's-archived', 's-other']);
+});
+
+test('Issue #16: 归档/解档成功后 session.list 立即反映新归档集合（无需重建 baseline）', async () => {
+  // 建立 baseline：s-archived 已归档，s-active 活动。
+  resetArchiveUser();
+  archiveIds = ['s-archived'];
+  assert.equal((await request('POST', '/api/workspace.list', userCookie)).status, 200);
+  assert.deepEqual(listSessionIds(await request('POST', '/api/session.list', userCookie)), ['s-active']);
+
+  try {
+    // 归档 s-active：上游回带完整归档集合，并混入越权 ID（s-other 属于其他用户）。
+    archiveActionResponse = ['s-active', 's-archived', 's-other'];
+    const archived = await request('POST', '/api/workspace.archiveSession', userCookie, JSON.stringify({ sessionId: 's-active' }));
+    assert.equal(archived.status, 200, archived.text);
+    assert.deepEqual(
+      (archived.json as { result: { value: { archivedSessionIds: string[] } } }).result.value.archivedSessionIds,
+      ['s-active', 's-archived'],
+      '响应体的归档集合只保留已授权会话',
+    );
+    // 未重建 baseline：session.list 必须立即隐藏两条已归档会话。
+    assert.deepEqual(listSessionIds(await request('POST', '/api/session.list', userCookie)), []);
+
+    // 解档 s-active：立即恢复可见。
+    archiveActionResponse = ['s-archived'];
+    const unarchived = await request('POST', '/api/workspace.unarchiveSession', userCookie, JSON.stringify({ sessionId: 's-active' }));
+    assert.equal(unarchived.status, 200, unarchived.text);
+    assert.deepEqual(listSessionIds(await request('POST', '/api/session.list', userCookie)), ['s-active']);
+  } finally {
+    archiveActionResponse = null;
+    archiveIds = [];
+  }
+});
+
+test('Issue #16: 归档动作畸形/业务失败不得清空既有归档状态', async () => {
+  resetArchiveUser();
+  archiveIds = ['s-archived'];
+  assert.equal((await request('POST', '/api/workspace.list', userCookie)).status, 200);
+  assert.deepEqual(listSessionIds(await request('POST', '/api/session.list', userCookie)), ['s-active']);
+
+  try {
+    archiveActionResponse = 'malformed';
+    const malformed = await request('POST', '/api/workspace.archiveSession', userCookie, JSON.stringify({ sessionId: 's-active' }));
+    assert.equal(malformed.status, 502, malformed.text);
+    // 旧归档集合未被清空：s-archived 仍隐藏、s-active 仍可见。
+    assert.deepEqual(listSessionIds(await request('POST', '/api/session.list', userCookie)), ['s-active']);
+  } finally {
+    archiveActionResponse = null;
+    archiveIds = [];
+  }
+});
+
+test('Issue #16: 较早的在途 workspace.list 响应不得回滚新的归档动作', async () => {
+  resetArchiveUser();
+  archiveIds = ['s-archived'];
+  assert.equal((await request('POST', '/api/workspace.list', userCookie)).status, 200);
+  assert.deepEqual(listSessionIds(await request('POST', '/api/session.list', userCookie)), ['s-active']);
+
+  // 在途旧响应：携带「s-archived 已归档」的旧权限视图；用 gate 精确控制它在归档动作之后才返回。
+  let releaseStale = (): void => {};
+  const staleGate = new Promise<void>((resolve) => { releaseStale = resolve; });
+  workspaceResponsePlan = [{ archived: ['s-archived'], delayMs: 0, gate: staleGate }];
+  const stale = request('POST', '/api/workspace.list', userCookie);
+  for (let i = 0; i < 200 && workspaceResponsePlan.length > 0; i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assert.equal(workspaceResponsePlan.length, 0, '在途请求必须已抵达上游并占用延迟计划');
+
+  try {
+    archiveActionResponse = ['s-active', 's-archived'];
+    assert.equal((await request('POST', '/api/workspace.archiveSession', userCookie, JSON.stringify({ sessionId: 's-active' }))).status, 200);
+    assert.deepEqual(listSessionIds(await request('POST', '/api/session.list', userCookie)), [], '归档动作后立即隐藏');
+
+    // 放行在途旧响应：它必须被顺序水位拒绝，不能把 s-active 从归档集合里移除。
+    releaseStale();
+    assert.equal((await stale).status, 200);
+    assert.deepEqual(listSessionIds(await request('POST', '/api/session.list', userCookie)), [], '旧响应不得复活已归档会话');
+  } finally {
+    archiveActionResponse = null;
+    workspaceResponsePlan = [];
+    archiveIds = [];
+  }
 });

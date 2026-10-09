@@ -440,6 +440,15 @@ export function registerMediaRoutes(app: Express, deps: MediaRoutesDeps): MediaR
       rejectUpload(req, res, mediaId, null, 415, 'INVALID_MIME', '该类型不允许此 MIME');
       return;
     }
+    // 并发准入：与 init 共用同一计数，但必须在这里再判一次。init 只能拦住
+    // 「有 PUT 正在进行」时的新签发；客户端仍可先签发足量 pending 资产，再同时
+    // 打开全部 PUT，绕过「同一用户同时打开的 PUT 上传数」这一不变式。超限时
+    // 不标记资产失败（传 mediaId=null）：这是可重试的背压，客户端应在其它上传
+    // 结束后重发同一 uploadId，而不是被迫重新 init。
+    if ((mediaActiveUploads.get(me.userId) ?? 0) >= MEDIA_MAX_CONCURRENT_UPLOADS) {
+      rejectUpload(req, res, null, null, 429, 'MEDIA_BUSY', '并发上传过多，请稍后再试');
+      return;
+    }
     const tempKey = newMediaKey('u_');
     let tempPath: string;
     try {
@@ -649,7 +658,10 @@ export function registerMediaRoutes(app: Express, deps: MediaRoutesDeps): MediaR
     res.setHeader('Content-Type', internal.mime_type);
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('Cache-Control', 'private, no-store');
-    res.setHeader('Accept-Ranges', 'bytes');
+    // 只有视频实现了 Range（见下方分支）；图片/表情包带 Range 头也只会得到 200 全量。
+    // 对不实现 Range 的类型声明 Accept-Ranges: bytes 会让下载器/代理误以为支持
+    // 断点续传（RFC 9110 §14.5.1），因此仅对视频声明。
+    if (kind === 'video') res.setHeader('Accept-Ranges', 'bytes');
     // inline：媒体要在消息气泡里直接渲染；文件名不参与（不输出原始名）
     res.setHeader('Content-Disposition', 'inline');
     const rangeHeader = typeof req.headers.range === 'string' ? req.headers.range : '';

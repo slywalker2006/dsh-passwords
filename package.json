@@ -1,6 +1,6 @@
 {
   "name": "dsh-passwords",
-  "version": "2.7.7",
+  "version": "2.7.8",
   "description": "dsh-passwords: a server-grade gateway that turns DeepSeek Harness into a multi-tenant platform — remote access + automatic HTTPS, per-subuser permissions & quotas, sandbox enforcement, first-run setup, SQLite auth with at-rest encryption, rate-limit and audit log (bilingual zh/en UI)",
   "type": "module",
   "main": "dist/index.js",
@@ -44,13 +44,13 @@
     "scripts/",
     "npm-shrinkwrap.json",
     "docker/",
-    "src/",
-    "tsconfig.json",
     "install.sh",
     "install.bat",
     "cordis.yml",
     "README.md",
     "README_en.md",
+    "CONTRIBUTING.md",
+    "docs/",
     "LICENSE",
     "CHANGELOG.md",
     ".env.example"
@@ -66,8 +66,6 @@
   "scripts": {
     "build": "tsc -p tsconfig.json && node scripts/build-client.mjs",
     "build:client": "node scripts/build-client.mjs",
-    "pretest": "npm run build",
-    "test": "node --import tsx --test \"test/**/*.test.ts\"",
     "prepack": "node scripts/clean-dist.mjs && npm run build",
     "start": "node dist/cli.js serve-gateway",
     "start:gateway": "node dist/cli.js serve-gateway"

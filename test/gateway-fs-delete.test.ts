@@ -150,6 +150,57 @@ function post(url: string, body: unknown, cookie: string, port = gatewayPort): P
 
 const del = (target: string, cookie = adminCookie) => post('/gateway/api/fs/delete-directory', { path: target }, cookie);
 
+/** 删除响应 workspaces 字段的条目契约（与 src/admin.ts 的响应组装一致）。 */
+type WorkspaceSyncTarget = { workspaceId: string; path: string };
+type WorkspaceSyncFailure = WorkspaceSyncTarget & { error: string };
+type WorkspaceSyncReport = {
+  deleted: string[];
+  failed: WorkspaceSyncFailure[];
+  unverified: WorkspaceSyncTarget[];
+};
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isWorkspaceSyncTarget(value: unknown): value is WorkspaceSyncTarget {
+  return isRecord(value) && typeof value.workspaceId === 'string' && typeof value.path === 'string';
+}
+
+function isWorkspaceSyncFailure(value: unknown): value is WorkspaceSyncFailure {
+  if (!isRecord(value)) return false;
+  return typeof value.workspaceId === 'string' && typeof value.path === 'string' && typeof value.error === 'string';
+}
+
+function readWorkspaceArray<T>(
+  value: unknown,
+  guard: (item: unknown) => item is T,
+  field: string,
+  json: Record<string, unknown>,
+): T[] {
+  if (!Array.isArray(value)) throw new Error(`响应 workspaces.${field} 不是数组：${JSON.stringify(json)}`);
+  const result: T[] = [];
+  for (const item of value) {
+    if (!guard(item)) throw new Error(`响应 workspaces.${field} 条目契约不符：${JSON.stringify(json)}`);
+    result.push(item);
+  }
+  return result;
+}
+
+/**
+ * 收窄删除响应中的 workspaces。网络响应是真实信任边界，形状不符即失败，
+ * 而不是用断言把契约漂移掩盖成测试通过。
+ */
+function workspaceSyncReport(json: Record<string, unknown>): WorkspaceSyncReport {
+  const report = json.workspaces;
+  if (!isRecord(report)) throw new Error(`响应缺少 workspaces 字段：${JSON.stringify(json)}`);
+  return {
+    deleted: readWorkspaceArray(report.deleted, (item): item is string => typeof item === 'string', 'deleted', json),
+    failed: readWorkspaceArray(report.failed, isWorkspaceSyncFailure, 'failed', json),
+    unverified: readWorkspaceArray(report.unverified, isWorkspaceSyncTarget, 'unverified', json),
+  };
+}
+
 /**
  * 以子用户身份打开网关 Remote mux 的 workspace/follow 并等待 baseline。
  * 网关的过滤基线是本进程内 workspaceId→path 缓存（暖缓存）的唯一来源；
@@ -271,15 +322,18 @@ before(async () => {
     });
   });
   upstream.on('request', (req, res) => {
-    // 子用户 directoryPicker/createDirectory 记账测试：回显请求路径，网关据此登记 pending。
+    // 子用户 directoryPicker/createDirectory 记账测试：按真实 DSH 契约（path=父目录 + name=单段）
+    // 回 join(path, name) 作为新建目录，网关据此登记 pending。
     if (req.method === 'POST' && req.url === '/api/directoryPicker/createDirectory') {
       void (async () => {
         const body = await readJsonBody(req);
         const payload = body.payload as Record<string, unknown> | undefined;
         const args = payload?.args as Record<string, unknown> | undefined;
-        const requested = typeof args?.path === 'string' ? args.path : '';
+        const parent = typeof args?.path === 'string' ? args.path : '';
+        const name = typeof args?.name === 'string' ? args.name : '';
+        const created = parent === '' || name === '' ? parent : path.join(parent, name);
         res.writeHead(200, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ type: 'server-response', rpcId: body.rpcId, result: { ok: true, value: requested } }));
+        res.end(JSON.stringify({ type: 'server-response', rpcId: body.rpcId, result: { ok: true, value: created } }));
       })();
       return;
     }
@@ -657,7 +711,7 @@ test('缓存命中 + 上游快照失败：零上游删除、本地缓存仅报�
   // 暖缓存绝不能驱动删除：一次 workspace/delete 都不允许发出
   assert.deepEqual(deleteCalls, []);
   assert.deepEqual(upstreamWorkspaces.map((workspace) => workspace.workspaceId), ['ws-cached']);
-  const unverified = res.json.workspaces.unverified as Array<{ workspaceId: string; path: string }>;
+  const unverified = workspaceSyncReport(res.json).unverified;
   assert.deepEqual(unverified.map((entry) => entry.workspaceId), ['ws-cached']);
   assert.ok((res.json.warnings as string[]).some((warning) => warning.includes('ws-cached')));
 
@@ -786,7 +840,7 @@ test('删除父目录时按树内命中清理 DB 归属与白名单（树外保�
 
   const res = await del(parent);
   assert.equal(res.status, 200, JSON.stringify(res.json));
-  assert.deepEqual(res.json.workspaces.deleted, ['ws-dbchild']);
+  assert.deepEqual(workspaceSyncReport(res.json).deleted, ['ws-dbchild']);
   assert.equal(existsSync(parent), false);
   assert.equal(db.listUserWorkspacePaths(syncUser.id).includes(normalizePath(parent)), false);
   assert.deepEqual(db.getPermissions(syncUser.id)!.allowed_folders, [keep.replace(/\\/g, '/')]);
@@ -981,7 +1035,7 @@ test('别名：注册路径是指向被删目录的符号链接也命中（尽�
 
   const res = await del(realTarget, adminCCookie);
   assert.equal(res.status, 200, JSON.stringify(res.json));
-  assert.deepEqual(res.json.workspaces.deleted, ['ws-alias']);
+  assert.deepEqual(workspaceSyncReport(res.json).deleted, ['ws-alias']);
   assert.equal(existsSync(realTarget), false);
 });
 
@@ -1107,12 +1161,12 @@ test('删除树内 pending 目录：所有 owner 的临时授权被清理并失�
   const mux = await followWorkspaceBaseline(subuserCookie);
   const closedCode = new Promise<number>((resolve) => mux.on('close', (code: number) => resolve(code)));
 
-  // 官方目录创建 RPC：假上游回显路径 → 网关记账 pending。
+  // 官方目录创建 RPC：按真实契约 path=父目录 + name=单段；假上游回 join(path, name) → 网关记账 pending。
   const created = await post('/api/directoryPicker/createDirectory', {
     type: 'client-request',
     rpcId: 'rpc-mkdir-pending',
     method: 'directoryPicker/createDirectory',
-    payload: { args: { path: pendingDir } },
+    payload: { args: { path: target, name: 'made' } },
   }, subuserCookie);
   assert.equal(created.status, 200, JSON.stringify(created.json));
 

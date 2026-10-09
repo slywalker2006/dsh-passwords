@@ -11,6 +11,7 @@ import { randomBytes } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { hasPrebuiltRuntime } from './prebuilt-check.mjs';
+import { firstInstallNeedsRoot, firstInstallEnvContent } from './install-root-gate.mjs';
 
 const isWin = process.platform === 'win32';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -111,7 +112,7 @@ if (!existsSync(pkgPath)) {
   process.exit(1);
 }
 
-// ── 1. Node.js（本包 engines ^22.19.0 || >=24.0.0；DSH 0.2.1-alpha.1 依赖树中的
+// ── 1. Node.js（本包 engines ^22.19.0 || >=24.0.0；DSH 0.2.1-alpha.2 依赖树中的
 //    @deepseek-ai/libreoffice-kit 声明 node >=22.19.0；DSH CLI 包自身未声明 engines） ──
 const [nodeMajor, nodeMinor] = process.versions.node.split('.').map(Number);
 if ((nodeMajor === 22 && nodeMinor < 19) || nodeMajor < 22 || nodeMajor === 23) {
@@ -123,7 +124,7 @@ say(`Node.js v${process.versions.node} ✓`);
 
 // ── 2. dsh（DeepSeek Harness）版本窗口校验 ──
 // 支持的补丁线：>=0.2.1-alpha.1 <0.2.2-0（与 src/cli.ts 的运行时门禁同一身份边界）。
-// 0.2.1 的后续预发布（alpha.2/beta/rc）与稳定版共享同一 bundle/wire 契约，仍在窗口内；
+// 0.2.1 的后续预发布（alpha.3/beta/rc）与稳定版共享同一 bundle/wire 契约，仍在窗口内；
 // 0.1.x、0.2.0、0.2.1-alpha.0 以及 0.2.2+ 都不允许打补丁或公开监听，安装器必须同样失败。
 const DSH_SUPPORTED_RANGE = '>=0.2.1-alpha.1 <0.2.2-0';
 const DSH_SUPPORTED_CORE = '0.2.1';
@@ -171,7 +172,7 @@ function isSupportedDshVersion(version) {
 function assertSupportedDshVersion(version) {
   if (isSupportedDshVersion(version)) return;
   err(`不支持的 dsh 版本（当前 ${version}），本安装器仅支持 ${DSH_SUPPORTED_RANGE}。`);
-  err('  请安装受支持版本后重试：npm install -g @deepseek-ai/dsh@0.2.1-alpha.1');
+  err('  请安装受支持版本后重试：npm install -g @deepseek-ai/dsh@0.2.1-alpha.2');
   err('  源码部署请将 MCP_DSH_ROOT 指向该版本所在的 dsh 目录。');
   process.exit(1);
 }
@@ -202,7 +203,7 @@ if (explicitDshRoot) {
     : versionOutput.match(/\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?/);
   if (versionMatch === null) {
     err('未找到 dsh（DeepSeek Harness）。请先安装：');
-    err('  npm install -g @deepseek-ai/dsh@0.2.1-alpha.1');
+    err('  npm install -g @deepseek-ai/dsh@0.2.1-alpha.2');
     err('  然后确认 dsh --version 可读，或设置 MCP_DSH_ROOT 指向 dsh 安装目录后重试。');
     process.exit(1);
   }
@@ -219,8 +220,6 @@ const envPath = explicitEnvFile ? path.resolve(explicitEnvFile) : path.join(root
 const keyFile = explicitEnvFile
   ? path.join(path.dirname(envPath), 'setup-key.txt')
   : path.join(root, 'setup-key.txt');
-// 显式部署目录可能尚未创建；写入前补齐，避免安装器在半途 ENOENT。
-if (explicitEnvFile) mkdirSync(path.dirname(envPath), { recursive: true });
 const isFirstInstall = !existsSync(envPath);
 if (isFirstInstall && existsSync(keyFile)) {
   // .env 已丢失但旧引导文件还在：其 key 与即将生成的新 key 不可信地不一致。
@@ -228,12 +227,16 @@ if (isFirstInstall && existsSync(keyFile)) {
   err(`检测到 ${keyFile}，但 ${envPath} 不存在。请先确认是否需要恢复旧配置；否则删除/备份该残留文件后重试。`);
   process.exit(1);
 }
-if (isFirstInstall && !isWin && typeof process.getuid === 'function' && process.getuid() !== 0) {
+const uid = typeof process.getuid === 'function' ? process.getuid() : null;
+if (isFirstInstall && firstInstallNeedsRoot({ isWin, uid, env: process.env })) {
   err('自动 HTTPS 需要监听 80 和 443；Unix/macOS 上请使用 sudo 运行安装器。');
-  err('如必须非特权账号部署，请先阅读 README 的反向代理或明文 HTTP 模式说明，再自行配置 .env。');
+  err('如必须非特权账号部署，请显式关闭自动 HTTPS（MCP_GATEWAY_AUTO_TLS=0/false/no）');
+  err('或配置 MCP_GATEWAY_TLS_CERT/KEY 后重试，并按 README 设置高位端口与监听地址。');
   process.exit(1);
 }
-if (isFirstInstall && !isWin && typeof process.getuid === 'function' && process.getuid() === 0) {
+// 只有通过首次安装门禁后才创建显式部署目录；拒绝路径不得产生任何部署副作用。
+if (isFirstInstall && explicitEnvFile) mkdirSync(path.dirname(envPath), { recursive: true });
+if (isFirstInstall && !isWin && uid === 0) {
   // root 安装后，dsh 的 web profile（~/.dsh/profiles/web）将由 root 拥有；
   // 之后用普通用户跑 dsh 会因目录归属/权限读不到插件（M-2）。
   say('⚠ 检测到以 root 安装：dsh 的 web profile（~/.dsh）将由 root 拥有。');
@@ -255,30 +258,24 @@ say('pnpm ✓');
 // 不能只看 node_modules 目录：中断安装会留下半残目录，之后直到首次运行才暴露 MODULE_NOT_FOUND。
 // 运行时依赖用 Node 模块解析检测（兼容 npm --prefix 安装时依赖被提升到上层
 // node_modules 的情况）；dist/cli.js 与 dist/client.js 均存在才视为已构建。
+const hasSource = existsSync(path.join(root, 'tsconfig.json')) && existsSync(path.join(root, 'src'));
 const prebuilt = hasPrebuiltRuntime(root, RUNTIME_DEPS);
-if (prebuilt) {
-  say('检测到已构建产物，跳过依赖安装与编译');
-} else {
-  say('安装依赖…');
-  // npm-shrinkwrap.json 是源码、Docker 与 npm 发布包共享的确定性依赖契约。
-  // 旧发布包可能不带它，退回 npm install 仍可完成自修复安装。
+if (prebuilt && !hasSource) {
+  say('检测到 npm 预构建包，跳过依赖安装与编译');
+} else if (hasSource) {
+  say('安装源码依赖…');
+  // 源码构建不执行依赖包脚本：本项目运行时不依赖 postinstall，DSH 的原生脚本
+  // 由外部安装器单独按 allowlist 处理。这样 npm 11 的用户级 allow-scripts
+  // 不会改变本项目 npm ci 的结果，也不会执行未审查的第三方脚本。
   const installArgs = existsSync(path.join(root, 'npm-shrinkwrap.json'))
-    ? ['ci', '--include=optional', '--include=dev', '--no-audit', '--no-fund']
-    : ['install', '--no-audit', '--no-fund'];
+    ? ['ci', '--include=optional', '--include=dev', '--ignore-scripts', '--no-audit', '--no-fund']
+    : ['install', '--ignore-scripts', '--no-audit', '--no-fund'];
   mustRun('npm', installArgs, '依赖安装失败，请修复 npm 输出后重试');
-  // 源码 clone 与 npm 发布包都带 tsconfig.json/src（package.json files 白名单），
-  // 有 tsconfig.json 就执行编译；只有不含它的旧发布物才要求预构建产物必须完整。
-  if (existsSync(path.join(root, 'tsconfig.json'))) {
-    say('编译…');
-    mustRun('npm', ['run', 'build'], '编译失败，请修复错误后重试');
-  } else {
-    // registry 安装：依赖刚装完，再校验一次预构建产物完整性，避免带病继续
-    if (!hasPrebuiltRuntime(root, RUNTIME_DEPS)) {
-      err('预构建产物不完整，请重新安装 dsh-passwords');
-      process.exit(1);
-    }
-    say('检测到 registry 安装（无源码），跳过编译');
-  }
+  say('编译…');
+  mustRun('npm', ['run', 'build'], '编译失败，请修复错误后重试');
+} else {
+  err('npm 包缺少完整的预构建产物，请重新安装 dsh-passwords');
+  process.exit(1);
 }
 
 // ── 5. 生成/修复 .env（重跑不覆盖既有配置） ──
@@ -309,7 +306,7 @@ if (!isFirstInstall && existsSync(envPath)) {
   const dbEncKey = randomBytes(32).toString('hex');
   writeFileSync(
     envPath,
-    `SETUP_KEY=${setupKey}\nMCP_DB_ENC_KEY=${dbEncKey}\nMCP_GATEWAY_PORT=443\nMCP_GATEWAY_REDIRECT_PORT=80\n`,
+    firstInstallEnvContent(setupKey, dbEncKey, process.env),
     { encoding: 'utf8', mode: 0o600 },
   );
   if (!isWin) chmodSync(envPath, 0o600);
@@ -375,19 +372,33 @@ const PATCH_EXIT_REASONS = {
   36: '补丁写入或校验失败（DSH 文件可能被其他工具改动）',
   37: `dsh 版本不受支持（仅支持 ${DSH_SUPPORTED_RANGE}）`,
 };
+// 永久失败退出码（与 src/plugin.ts 的 PERMANENT_GATEWAY_EXIT_CODES 中补丁相关子集一致）：
+// 密码门在这些码上拒绝启动且不会自动重试，安装器必须同样终止，不得打印“安装完成”。
+const PATCH_PERMANENT_EXIT_CODES = new Set([1, 34, 35, 36, 37]);
+let patchPermanentFailure = false;
 if (patchResult.error !== undefined) {
   say(`补丁暂时无法应用（执行失败：${patchResult.error.message}），密码门启动时会自动重试`);
 } else if (patchResult.status === 0) {
   say('补丁已应用');
-} else if (patchResult.status === 37) {
-  say(`补丁未应用：${PATCH_EXIT_REASONS[37]}；密码门将拒绝启动，请改用受支持的 dsh 版本`);
 } else {
-  const reason = PATCH_EXIT_REASONS[patchResult.status]
-    ?? `未知原因（退出码 ${patchResult.status ?? 'signal'}）`;
-  say(`补丁暂时无法应用（${reason}），密码门启动时会自动重试`);
+  const code = patchResult.status;
+  const reason = PATCH_EXIT_REASONS[code]
+    ?? `未知原因（退出码 ${code ?? 'signal'}）`;
+  if (PATCH_PERMANENT_EXIT_CODES.has(code)) {
+    patchPermanentFailure = true;
+    err(`补丁未应用（永久失败）：${reason}；密码门将拒绝启动，不会自动重试`);
+  } else {
+    say(`补丁暂时无法应用（${reason}），密码门启动时会自动重试。若问题持续，请手动修复后重新运行安装器`);
+  }
 }
 
 // ── 9. 完成 ──
+// 永久补丁失败时密码门不会启动，安装并未完成：不得打印“安装完成”，并以非零码退出，
+// 让 install.sh / install.bat 的退出码透传反映真实结果。
+if (patchPermanentFailure) {
+  err('安装未完成：远程设置补丁未应用，密码门将拒绝启动。请修复上述原因后重新运行安装器。');
+  process.exit(1);
+}
 say('');
 say('★ 安装完成！');
 say('');

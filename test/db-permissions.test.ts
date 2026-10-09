@@ -231,6 +231,8 @@ test('旧 user_permissions 表会迁移缺失列，并保留现有权限', () =>
   }
 });
 
+
+
 test('删除用户级联清理工作区所有权；启动迁移清除孤儿所有权行', () => {
   const tempDir = mkdtempSync(path.join(os.tmpdir(), 'dshpw-orphan-ownership-'));
   const dbPath = path.join(tempDir, 'orphan.db');
@@ -942,6 +944,88 @@ test('removeUserOwnedWorkspace：自建后管理员重分配同路径仍 fail-cl
     );
   } finally {
     try { db.close(); } catch { /* 已关闭 */ }
+    rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+// ── Issue #38：workspaceCreationRoots 已退役：allowed_folders 是唯一创建范围 ─────
+//
+// 统一目录授权后 DB 不再保留 workspace_creation_roots 列：旧列既不参与判定，也不再
+// 暴露给读写模型。创建范围（含可创建位置）完全由 allowed_folders 表达，
+// allow_workspace_create 仅作为前置开关。
+
+test('Issue #38：user_permissions 不再含 workspace_creation_roots 列，读模型也不暴露该字段', () => {
+  const tempDir = mkdtempSync(path.join(os.tmpdir(), 'dshpw-issue38-retired-'));
+  const db = new Database(path.join(tempDir, 'perms.db'), createFieldCrypto('test-key', 'test-key'));
+  try {
+    db.init();
+    const columns = (db as unknown as { db: DatabaseSync }).db
+      .prepare('PRAGMA table_info(user_permissions)').all() as Array<{ name: string }>;
+    assert.equal(
+      columns.some((column) => column.name === 'workspace_creation_roots'),
+      false,
+      '退役列不得再出现在权限表中',
+    );
+
+    const user = db.createUser('issue38-retired', '$2a$10$dummyhashdummyhashdummyhashdu');
+    db.setPermissions(user.id, {
+      allowedFolders: ['/srv/project'],
+      hourlyTokenLimit: null,
+      dailyMinutesLimit: null,
+      allowUpload: false,
+      allowGitDownload: false,
+      allowWorkspaceCreate: true,
+      banned: false,
+      sandboxMode: null,
+      disabledSessions: [],
+    });
+    const perms = db.getPermissions(user.id);
+    assert.ok(perms);
+    assert.deepEqual(perms.allowed_folders, ['/srv/project'], '创建范围只由 allowed_folders 表达');
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(perms, 'workspace_creation_roots'),
+      false,
+      '读模型不得再暴露退役字段',
+    );
+  } finally {
+    try { db.close(); } catch { /* 已关闭 */ }
+    rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('Issue #38：旧表迁移不新增 workspace_creation_roots 列', () => {
+  const tempDir = mkdtempSync(path.join(os.tmpdir(), 'dshpw-issue38-legacy-'));
+  const dbPath = path.join(tempDir, 'legacy.db');
+  const raw = new DatabaseSync(dbPath);
+  raw.exec(`
+    CREATE TABLE user_permissions (
+      user_id INTEGER PRIMARY KEY,
+      allowed_folders TEXT,
+      hourly_token_limit INTEGER,
+      daily_minutes_limit INTEGER,
+      allow_workspace_create INTEGER NOT NULL DEFAULT 1,
+      banned INTEGER NOT NULL DEFAULT 0,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    INSERT INTO user_permissions (user_id, allowed_folders, allow_workspace_create) VALUES (7, '["/srv/project"]', 1);
+  `);
+  raw.close();
+
+  const db = new Database(dbPath, createFieldCrypto('test-key', 'test-key'));
+  try {
+    db.init();
+    const columns = (db as unknown as { db: DatabaseSync }).db
+      .prepare('PRAGMA table_info(user_permissions)').all() as Array<{ name: string }>;
+    assert.equal(
+      columns.some((column) => column.name === 'workspace_creation_roots'),
+      false,
+      '迁移不得重建退役列',
+    );
+    const migrated = db.getPermissions(7);
+    assert.equal(migrated?.allow_workspace_create, true, '迁移不得改动既有创建权限');
+    assert.deepEqual(migrated?.allowed_folders, ['/srv/project']);
+  } finally {
+    db.close();
     rmSync(tempDir, { recursive: true, force: true });
   }
 });

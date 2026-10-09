@@ -8,7 +8,7 @@
 // 语言：卡片词典注册在 locale 命名空间 'dshpw'（见 locales.ts），文字跟随
 // dsh 设置里的语言（Settings → General → Language）。t seat 由注册时的
 // `locale: 'dshpw'` 声明注入。
-import { createElement as h, useEffect, useRef, useState } from 'react';
+import { createElement as h, useEffect, useRef, useState, type ReactNode } from 'react';
 import type { PropsLocale } from '@deepseek-ai/dsh-client-ui-slots';
 import { publishChatEntryChanged } from './events';
 import { api } from './api';
@@ -137,6 +137,7 @@ interface PermDraft {
   upload: boolean;
   git: boolean;
   workspaceCreate: boolean;
+  ssh: boolean;
   banned: boolean;
   sandbox: string;
   disabledSessions: string[];
@@ -168,6 +169,38 @@ interface WorkspaceInfo {
   sessions: Array<{ id: string; title: string }>;
 }
 
+/** 目录浏览器的一个直接子目录项（服务端已过滤文件与敏感路径）。 */
+export interface DirectoryPickerEntry {
+  name: string;
+  path: string;
+  /** 服务端判定该项是否可作为落点（文件系统根/盘符根为 false，只能进入）。 */
+  selectable: boolean;
+}
+
+/** GET /gateway/api/directory-picker/list 的统一响应。 */
+export interface DirectoryPickerListing {
+  ok: true;
+  /** 当前目录绝对路径；null = 盘符列表等无当前目录的起点。 */
+  currentPath: string | null;
+  /** 父目录；null = 已在根/起点。 */
+  parentPath: string | null;
+  /** 当前目录本身是否可作为落点；currentPath 为 null 时恒 false。 */
+  selectable: boolean;
+  entries: DirectoryPickerEntry[];
+  /** 子目录过多被有界截断；仅作提示，不影响可选性。 */
+  truncated: boolean;
+}
+
+/** 面板阶段：有辨识 union，避免 status/error 等可相互矛盾的松散字段。 */
+type PickerListing =
+  | { kind: 'loading' }
+  | { kind: 'error'; message: string }
+  | { kind: 'ready'; data: DirectoryPickerListing };
+
+interface PickerState {
+  listing: PickerListing;
+}
+
 /** 展平后的模型目录项：`id` 为提交给网关的稳定 ID（provider/model） */
 export interface ModelCatalogEntry {
   id: string;
@@ -183,6 +216,27 @@ const MODEL_ID_RE = /^[^/\s]{1,100}\/[^\s]{1,200}$/;
 
 /** 模型目录可用状态：unavailable = 服务端未返回目录（不能据此清空 allowlist） */
 export type ModelCatalogStatus = 'ready' | 'unavailable';
+
+/**
+ * 可选数据请求（工作区、Agent 预设）的句柄：独立中止控制器 + 有限超时。
+ * 它不参与主刷新守卫的完成条件，所以挂起的上游不会冻结整个刷新流程。
+ */
+type OptionalRequest = {
+  controller: AbortController;
+  timedOut: boolean;
+  timeout: ReturnType<typeof setTimeout>;
+};
+
+type RequiredRefreshRequest = OptionalRequest;
+
+/** 可选数据请求的有限超时（毫秒）：超时后主动中止并转入错误态，而非无限等待。 */
+const OPTIONAL_REQUEST_TIMEOUT_MS = 5000;
+/** 目录浏览可能访问网络盘或大型目录，单独给出有界但足够的预算。 */
+const DIRECTORY_PICKER_REQUEST_TIMEOUT_MS = 30_000;
+/** 工作区展示会触发冷枚举，允许覆盖观测到的 40-90 秒冷路径。 */
+const WORKSPACE_REQUEST_TIMEOUT_MS = 120_000;
+/** 状态与权限快照是刷新主链；墙钟到期后必须释放刷新守卫。 */
+const REQUIRED_REFRESH_TIMEOUT_MS = 10000;
 
 /**
  * 展平 overview 里的模型目录为可勾选列表。
@@ -265,11 +319,11 @@ function fmtTime(iso: string): string {
 
 type StatusTone = 'neutral' | 'success' | 'warning' | 'danger';
 
-function StatusPill(props: { tone?: StatusTone; children?: React.ReactNode }) {
+function StatusPill(props: { tone?: StatusTone; children?: ReactNode }) {
   return h('span', { className: `dshpw-status dshpw-status-${props.tone ?? 'neutral'}` }, props.children);
 }
 
-function SectionHeader(props: { label: React.ReactNode; status?: React.ReactNode; tone?: StatusTone }) {
+function SectionHeader(props: { label: ReactNode; status?: ReactNode; tone?: StatusTone }) {
   return h(
     'div',
     { className: 'dshpw-section-head' },
@@ -292,6 +346,79 @@ function stringArray(value: unknown): string[] | null {
   return Array.isArray(value) && value.every((entry) => typeof entry === 'string') ? value : null;
 }
 
+/**
+ * 严格解析目录浏览响应（服务端已过滤文件/敏感路径）：任何必需字段缺失或类型
+ * 不符都视为契约违规 → 返回 null（调用方转错误态），绝不猜测兼容字段。
+ */
+function parseDirectoryListing(value: unknown): DirectoryPickerListing | null {
+  if (typeof value !== 'object' || value === null) return null;
+  const row = value as Record<string, unknown>;
+  if (row.ok !== true) return null;
+  const currentPath = row.currentPath === null || typeof row.currentPath === 'string' ? row.currentPath : undefined;
+  const parentPath = row.parentPath === null || typeof row.parentPath === 'string' ? row.parentPath : undefined;
+  if (currentPath === undefined || parentPath === undefined) return null;
+  if (typeof row.selectable !== 'boolean' || typeof row.truncated !== 'boolean') return null;
+  if (!Array.isArray(row.entries)) return null;
+  const entries: DirectoryPickerEntry[] = [];
+  for (const raw of row.entries) {
+    if (typeof raw !== 'object' || raw === null) return null;
+    const entry = raw as Record<string, unknown>;
+    if (typeof entry.name !== 'string' || typeof entry.path !== 'string' || typeof entry.selectable !== 'boolean') return null;
+    entries.push({ name: entry.name, path: entry.path, selectable: entry.selectable });
+  }
+  return { ok: true, currentPath, parentPath, selectable: row.selectable, entries, truncated: row.truncated };
+}
+
+/** 面板状态键：每个子用户一个目录浏览器。 */
+function pickerKey(userId: number): string {
+  return `${userId}`;
+}
+
+/** 面板 DOM id：与触发按钮的 aria-controls 对应。 */
+function pickerPanelId(userId: number): string {
+  return `dshpw-dir-picker-${userId}`;
+}
+
+/** 绝对路径 → 面包屑（根 → 当前）。只接受服务端返回的规范化绝对路径（POSIX 或盘符）。 */
+function pathCrumbs(path: string | null): Array<{ label: string; path: string }> {
+  if (path === null || path === '') return [];
+  const crumbs: Array<{ label: string; path: string }> = [];
+  if (/^[A-Za-z]:[\\/]/.test(path)) {
+    const drive = path.slice(0, 2);
+    let base = `${drive}\\`;
+    crumbs.push({ label: drive, path: base });
+    for (const part of path.slice(2).split(/[\\/]+/).filter((segment) => segment !== '')) {
+      base = base.endsWith('\\') ? `${base}${part}` : `${base}\\${part}`;
+      crumbs.push({ label: part, path: base });
+    }
+    return crumbs;
+  }
+  if (path.startsWith('/')) {
+    let base = '/';
+    crumbs.push({ label: '/', path: '/' });
+    for (const part of path.split('/').filter((segment) => segment !== '')) {
+      base = base === '/' ? `/${part}` : `${base}/${part}`;
+      crumbs.push({ label: part, path: base });
+    }
+    return crumbs;
+  }
+  // 服务端只返回绝对路径；异常输入退化为单段当前路径，不构造祖先。
+  return [{ label: path, path }];
+}
+
+// 依赖内联 SVG 图标（仓库无 lucide 依赖、无共享 React icon helper 时的最小实现）。
+const ICON_CHEVRON_UP = 'M4 9.5 8 5.5l4 4';
+const ICON_CHEVRON_RIGHT = 'M6 4l4 4-4 4';
+const ICON_X = 'M4.5 4.5l7 7M11.5 4.5l-7 7';
+
+function dirIcon(d: string) {
+  return h(
+    'svg',
+    { className: 'dshpw-dir-icon', viewBox: '0 0 16 16', fill: 'none', 'aria-hidden': 'true', focusable: 'false' },
+    h('path', { d, stroke: 'currentColor', 'stroke-width': '1.4', 'stroke-linecap': 'round', 'stroke-linejoin': 'round' }),
+  );
+}
+
 function errText(error: unknown, tr: (key: string, params?: Record<string, string | number>) => string): string {
   if (error instanceof Error) {
     const code = (error as Error & { code?: string }).code;
@@ -303,6 +430,38 @@ function errText(error: unknown, tr: (key: string, params?: Record<string, strin
     return error.message;
   }
   return tr('opFailed');
+}
+
+/**
+ * 目录浏览器面板：可聚焦（tabIndex=-1）并在挂载后把焦点移入面板，
+ * 使键盘用户能用 Escape 关闭，也避免打开面板时把焦点丢到 body。
+ * react-test-renderer 无真实宿主实例（ref 恒为 null），此处静默跳过。
+ */
+function DirectoryPanel(props: {
+  id: string;
+  label: string;
+  onEscape: () => void;
+  children: ReactNode;
+}) {
+  const panelRef = useRef<{ focus?: () => void } | null>(null);
+  useEffect(() => {
+    panelRef.current?.focus?.();
+  }, []);
+  return h(
+    'div',
+    {
+      id: props.id,
+      className: 'dshpw-dir-picker',
+      role: 'group',
+      'aria-label': props.label,
+      tabIndex: -1,
+      ref: panelRef,
+      onKeyDown: (event: { key?: string }) => {
+        if (event.key === 'Escape') props.onEscape();
+      },
+    },
+    props.children,
+  );
 }
 
 export function DshPasswordsCard(props: DshpwCardProps) {
@@ -351,54 +510,188 @@ export function DshPasswordsCard(props: DshpwCardProps) {
   const [modelCatalogStatus, setModelCatalogStatus] = useState<ModelCatalogStatus>('unavailable');
 
   const [workspaces, setWorkspaces] = useState<WorkspaceInfo[]>([]);
+  const [workspaceStatus, setWorkspaceStatus] = useState<'loading' | 'ready' | 'error'>('loading');
+  const [workspaceError, setWorkspaceError] = useState('');
+  // 目录浏览器面板状态与在飞请求（按子用户键）。
+  // 每次导航取消上一轮请求，旧响应到达时 signal 已中止 → 丢弃，不覆盖新路径。
+  const [dirPickers, setDirPickers] = useState<Record<string, PickerState>>({});
+  const pickerRequestsRef = useRef<Map<string, OptionalRequest>>(new Map());
   // 正在编辑中的子用户草稿：dirty 时 30s 自动刷新不覆盖本地未保存的修改
   const dirtyUsersRef = useRef<Set<number>>(new Set());
   // 刷新 in-flight 守卫：慢网络下 30s 定时 + 操作后手动 refresh 不重叠。
   // 若刷新期间又有请求，排队在当前响应结束后补跑，避免旧快照覆盖乐观分配结果。
   const refreshingRef = useRef(false);
   const refreshQueuedRef = useRef(false);
+  // 工作区 / Agent 预设是可选数据：各自持有独立的 in-flight 句柄，
+  // 新一轮请求会取消上一轮，避免慢上游的旧响应覆盖新数据。
+  const workspaceRequestRef = useRef<OptionalRequest | null>(null);
+  const presetRequestRef = useRef<OptionalRequest | null>(null);
+  // 模型目录 RPC 是 overview 里的可选上游：同样需要可被新一轮刷新 / 卸载取消。
+  const catalogRequestRef = useRef<OptionalRequest | null>(null);
+  const requiredRefreshRef = useRef<RequiredRefreshRequest | null>(null);
+  // patch/status 与 update/status 是轻量独立请求：各自持有可取消句柄 + 有限超时，
+  // 新一轮刷新会取消上一轮，慢上游的旧响应不会覆盖新状态，卸载时统一清理。
+  const patchStatusRequestRef = useRef<OptionalRequest | null>(null);
+  const updateStatusRequestRef = useRef<OptionalRequest | null>(null);
+  const disposedRef = useRef(false);
+
+  /** 取消并清空一个在飞的可选请求句柄（被新一轮刷新取代 / 卸载 / 走到 ready 分支）。 */
+  const cancelOptional = (ref: { current: OptionalRequest | null }) => {
+    const request = ref.current;
+    if (!request) return;
+    ref.current = null;
+    request.controller.abort();
+    clearTimeout(request.timeout);
+  };
+
+  /**
+   * 加载可选数据：独立 AbortController + 有限超时。
+   * - 被新一轮刷新取代（abort 但未超时）：丢弃结果，不触碰状态。
+   * - 超时中止：转交 onError(error, true)，由调用方转入错误态。
+   * 该 Promise 不进入 refresh 的主链，pending 它不会阻塞整体刷新。
+   */
+  const loadOptional = <T,>(
+    ref: { current: OptionalRequest | null },
+    path: string,
+    body: unknown,
+    onResult: (result: T) => void,
+    onError: (error: unknown, timedOut: boolean) => void,
+    timeoutMs = OPTIONAL_REQUEST_TIMEOUT_MS,
+    replaceInFlight = true,
+  ) => {
+    if (replaceInFlight) cancelOptional(ref);
+    const request: OptionalRequest = {
+      controller: new AbortController(),
+      timedOut: false,
+      timeout: setTimeout(() => {
+        request.timedOut = true;
+        request.controller.abort();
+      }, timeoutMs),
+    };
+    ref.current = request;
+    api<T>(path, body, request.controller.signal)
+      .then((result) => {
+        if (request.controller.signal.aborted && !request.timedOut) return;
+        onResult(result);
+      })
+      .catch((error: unknown) => {
+        if (request.controller.signal.aborted && !request.timedOut) return;
+        onError(error, request.timedOut);
+      })
+      .finally(() => {
+        clearTimeout(request.timeout);
+        if (ref.current === request) ref.current = null;
+      });
+  };
+
+  const loadRequired = <T,>(path: string, request: RequiredRefreshRequest): Promise<T> =>
+    api<T>(path, undefined, request.controller.signal).catch((error: unknown) => {
+      if (request.timedOut) throw new Error(t('permsRefreshTimeout'));
+      throw error;
+    });
+
+  const loadWorkspaces = () => {
+    // 冷枚举请求在飞时复用它；否则 30s 轮询会叠加昂贵枚举，并丢失旧句柄导致
+    // 卸载时无法清理其 AbortController 和超时计时器。
+    if (workspaceRequestRef.current) return;
+    setWorkspaceStatus((status) => (status === 'ready' ? status : 'loading'));
+    setWorkspaceError('');
+    loadOptional<{ workspaces: WorkspaceInfo[] }>(
+      workspaceRequestRef,
+      '/api/dsh-passwords/workspaces',
+      undefined,
+      (result) => {
+        setWorkspaces(result.workspaces ?? []);
+        setWorkspaceStatus('ready');
+      },
+      (error, timedOut) => {
+        const message = timedOut ? t('permsWorkspacesTimeout') : errText(error, trErr);
+        setWorkspaceError(message);
+        setWorkspaceStatus('error');
+      },
+      WORKSPACE_REQUEST_TIMEOUT_MS,
+    );
+  };
+
+  const loadAgentPresets = () => {
+    loadOptional<{ presets: AgentPresetInfo[] }>(
+      presetRequestRef,
+      '/api/dsh-passwords/agent-presets',
+      undefined,
+      (result) => {
+        setAgentPresets(result.presets ?? []);
+        setAgentPresetStatus('ready');
+      },
+      () => setAgentPresetStatus('unavailable'),
+    );
+  };
 
   const refresh = () => {
+    if (disposedRef.current) return;
     if (refreshingRef.current) {
       refreshQueuedRef.current = true;
       return;
     }
     refreshingRef.current = true;
-    // in-flight 守卫覆盖整个 state→overview→workspaces 链（而非只覆盖 patch/status）：
-    // 否则慢网络下 overview 未返回时守卫已被 patch/status 提前释放，30s 定时又会叠一轮。
-    api<StateData>('/api/dsh-passwords/state')
+    const previous = requiredRefreshRef.current;
+    if (previous) {
+      previous.controller.abort();
+      clearTimeout(previous.timeout);
+    }
+    const request: RequiredRefreshRequest = {
+      controller: new AbortController(),
+      timedOut: false,
+      timeout: setTimeout(() => {
+        request.timedOut = true;
+        request.controller.abort();
+      }, REQUIRED_REFRESH_TIMEOUT_MS),
+    };
+    requiredRefreshRef.current = request;
+    const active = (): boolean => !disposedRef.current && !request.controller.signal.aborted;
+    // state 与 overview 是必需链：无论上游如何挂住，墙钟到期都必须释放守卫。
+    loadRequired<StateData>('/api/dsh-passwords/state', request)
       .then((d) => {
+        if (!active()) return undefined;
         setData(d);
         setError('');
         if (d.me?.role !== 'admin') return undefined;
-        return api<PermOverview>('/gateway/api/overview')
+        return loadRequired<PermOverview>('/gateway/api/overview', request)
           .then((o) => {
+            if (!active()) return undefined;
             // overview 是权限快照；modelCatalog 只有在网关此前观察到官方 RPC 时才会
             // 内嵌。首次进入设置页主动调用无参数的官方 RPC，避免依赖主界面先打开模型选择器。
             const overviewCatalog = readModelCatalog(o);
             // Render the permission snapshot independently of the optional model catalog.
             // A stalled upstream catalog request must not make the whole settings card disappear.
             setOverview(o);
-            const catalogPromise = overviewCatalog.status === 'ready'
-              ? Promise.resolve(overviewCatalog)
-              : (() => {
-                  const controller = new AbortController();
-                  const timeout = setTimeout(() => controller.abort(), 5000);
-                  return api<unknown>('/api/session/modelCatalog', {
-                    type: 'client-request',
-                    rpcId: `dshpw-model-catalog-${Date.now()}`,
-                    method: 'session/modelCatalog',
-                    payload: { args: {} },
-                  }, controller.signal)
-                    .then(readModelCatalogResponse)
-                    .catch(() => overviewCatalog)
-                    .finally(() => clearTimeout(timeout));
-                })();
-            // 模型目录是可选的上游数据；它不能阻塞权限草稿、工作区和预设的渲染。
-            void catalogPromise.then((catalog) => {
-              setModelCatalog(catalog.entries);
-              setModelCatalogStatus(catalog.status);
-            });
+            if (overviewCatalog.status === 'ready') {
+              // overview 已内嵌目录：无需再发 RPC，并取消上一轮仍在飞的目录请求。
+              cancelOptional(catalogRequestRef);
+              setModelCatalog(overviewCatalog.entries);
+              setModelCatalogStatus(overviewCatalog.status);
+            } else {
+              // 官方 RPC 也是可选上游：独立句柄 + 有限超时。新一轮刷新 / 卸载会
+              // 取消它；失败只回落到 overview 的空目录，不阻塞主链。
+              loadOptional<unknown>(
+                catalogRequestRef,
+                '/api/session/modelCatalog',
+                {
+                  type: 'client-request',
+                  rpcId: `dshpw-model-catalog-${Date.now()}`,
+                  method: 'session/modelCatalog',
+                  payload: { args: {} },
+                },
+                (raw) => {
+                  const catalog = readModelCatalogResponse(raw);
+                  setModelCatalog(catalog.entries);
+                  setModelCatalogStatus(catalog.status);
+                },
+                () => {
+                  setModelCatalog(overviewCatalog.entries);
+                  setModelCatalogStatus(overviewCatalog.status);
+                },
+              );
+            }
 
             // 草稿同步：新用户初始化；未在编辑（dirty）中的草稿用服务端最新值覆盖
             // （注释承诺的“主用户在别处修改后页面自动同步最新状态”真正生效）；
@@ -416,6 +709,7 @@ export function DshPasswordsCard(props: DshpwCardProps) {
                   upload: u.permissions.allowUpload,
                   git: u.permissions.allowGitDownload,
                   workspaceCreate: u.permissions.allowWorkspaceCreate,
+                  ssh: u.permissions.allowSsh === true,
                   banned: u.permissions.banned,
                   agentPresets: u.permissions.allowedAgentPresets === null ? null : [...u.permissions.allowedAgentPresets],
                   models: u.permissions.allowedModels === null || u.permissions.allowedModels === undefined
@@ -438,66 +732,85 @@ export function DshPasswordsCard(props: DshpwCardProps) {
               }
               return drafts;
             });
-            return Promise.allSettled([
-              api<{ workspaces: WorkspaceInfo[] }>('/api/dsh-passwords/workspaces'),
-              api<{ presets: AgentPresetInfo[] }>('/api/dsh-passwords/agent-presets'),
-            ])
-              .then(([workspaceResult, presetResult]) => {
-                if (refreshQueuedRef.current) return;
-
-                if (workspaceResult.status === 'fulfilled') {
-                  setWorkspaces(workspaceResult.value.workspaces ?? []);
-                }
-
-                if (presetResult.status === 'fulfilled') {
-                  setAgentPresets(presetResult.value.presets ?? []);
-                  setAgentPresetStatus('ready');
-                } else {
-                  setAgentPresets([]);
-                  setAgentPresetStatus('unavailable');
-                }
-              })
-              .then(() => undefined)
-              .catch((e) => {
-                // 工作区清单是权限编辑的可信状态；请求失败不能用空数组覆盖，
-                // 否则页面会把所有工作区误显示为关闭并在下一次保存时丢权限。
-                if (!refreshQueuedRef.current) {
-                  setError(errText(e, trErr));
-                }
-              });
+            // 工作区与 Agent 预设是可选数据：独立加载，不进入主刷新守卫的完成
+            // 条件。它们各自带中止控制器 + 有限超时，慢或挂起的上游既能被新一轮
+            // 刷新取消，也不会把 refreshingRef 永久锁住而冻结整体刷新。
+            loadWorkspaces();
+            loadAgentPresets();
           })
-          .catch(() => {
+          .catch((error: unknown) => {
+            if (request.timedOut || request.controller.signal.aborted) throw error;
             setOverview(null);
             // 目录随 overview 失败：不能沿用上一次快照把已下架的模型当成仍可勾选
             setModelCatalog([]);
             setModelCatalogStatus('unavailable');
+            // overview 非超时失败（5xx / 业务错误）必须可见，不能静默停在旧快照。
+            setError(errText(error, trErr));
           });
       })
-      .catch((e) => setError(errText(e, trErr)))
+      .catch((e) => {
+        if (disposedRef.current || (request.controller.signal.aborted && !request.timedOut)) return;
+        setError(errText(e, trErr));
+      })
       .finally(() => {
+        clearTimeout(request.timeout);
+        if (requiredRefreshRef.current === request) requiredRefreshRef.current = null;
         refreshingRef.current = false;
-        if (refreshQueuedRef.current) {
+        if (refreshQueuedRef.current && !disposedRef.current) {
           refreshQueuedRef.current = false;
           refresh();
         }
       });
-    // patch 状态独立于主链（轻量 + 失败只影响状态展示）
-    api<unknown>('/api/dsh-passwords/patch/status')
-      .then((r) => setPatchState(readPatchState(r)))
-      .catch(() => setPatchState(null));
-    // 更新状态独立拉取（失败只降级为状态未知，不阻塞主链）
-    api<{ ok?: boolean; status?: UpdateInfo }>('/api/dsh-passwords/update/status')
-      .then((r) => setUpdateInfo(r.status ?? null))
-      .catch(() => setUpdateInfo(null));
+    // patch 状态独立于主链（轻量 + 失败只影响状态展示）：独立 AbortController +
+    // 有限超时 + 新一轮刷新取消上一轮，旧响应不会覆盖新状态。
+    loadOptional<unknown>(
+      patchStatusRequestRef,
+      '/api/dsh-passwords/patch/status',
+      undefined,
+      (r) => setPatchState(readPatchState(r)),
+      () => setPatchState(null),
+    );
+    // 更新状态独立拉取（失败只降级为状态未知，不阻塞主链），同样有界可取消。
+    loadOptional<{ ok?: boolean; status?: UpdateInfo }>(
+      updateStatusRequestRef,
+      '/api/dsh-passwords/update/status',
+      undefined,
+      (r) => setUpdateInfo(r.status ?? null),
+      () => setUpdateInfo(null),
+    );
   };
 
   // 密码门已是独立设置分区页（settings.section），无需折叠：
   // 进入分区即渲染全部内容，并每 30 秒自动刷新（主用户在别处修改子用户
   // 权限/工作区后，页面自动同步最新状态）
   useEffect(() => {
+    // effect 重跑（StrictMode 双调用 / 依赖变化）时复位：否则上一次卸载标记会
+    // 让本实例的 refresh 永久短路，整张卡片停止更新。
+    disposedRef.current = false;
     refresh();
     const timer = window.setInterval(refresh, 30_000);
-    return () => window.clearInterval(timer);
+    return () => {
+      disposedRef.current = true;
+      window.clearInterval(timer);
+      // 卸载时取消所有仍未完成的请求（含 overview 完成后才创建的可选请求），
+      // 避免卸载后迟到响应写入状态。
+      cancelOptional(workspaceRequestRef);
+      cancelOptional(presetRequestRef);
+      cancelOptional(catalogRequestRef);
+      cancelOptional(patchStatusRequestRef);
+      cancelOptional(updateStatusRequestRef);
+      for (const request of pickerRequestsRef.current.values()) {
+        request.controller.abort();
+        clearTimeout(request.timeout);
+      }
+      pickerRequestsRef.current.clear();
+      const required = requiredRefreshRef.current;
+      if (required) {
+        requiredRefreshRef.current = null;
+        required.controller.abort();
+        clearTimeout(required.timeout);
+      }
+    };
   }, []);
 
   // 后台自动下载不经过“立即检查/立即安装”按钮，下载进度也必须在设置页
@@ -509,16 +822,29 @@ export function DshPasswordsCard(props: DshpwCardProps) {
     const phase = updateInfo?.phase;
     const active = updateInfo?.checking || phase === 'downloading' || phase === 'installing' || phase === 'restarting';
     if (!active) return undefined;
+    // 单飞轮询：上一轮未返回时跳过本次 tick，避免慢响应堆积后旧响应覆盖新状态。
+    // 独立 AbortController + cancelled 守卫：effect 重跑 / 卸载后迟到响应不再写状态。
+    const controller = new AbortController();
+    let cancelled = false;
+    let inFlight = false;
     const poll = () => {
-      api<{ ok?: boolean; status?: UpdateInfo }>('/api/dsh-passwords/update/status')
+      if (cancelled || inFlight) return;
+      inFlight = true;
+      api<{ ok?: boolean; status?: UpdateInfo }>('/api/dsh-passwords/update/status', undefined, controller.signal)
         .then((r) => {
+          if (cancelled || controller.signal.aborted) return;
           if (r.status) setUpdateInfo(r.status);
         })
-        .catch(() => undefined);
+        .catch(() => undefined)
+        .finally(() => { inFlight = false; });
     };
     poll();
     const timer = window.setInterval(poll, 700);
-    return () => window.clearInterval(timer);
+    return () => {
+      cancelled = true;
+      controller.abort();
+      window.clearInterval(timer);
+    };
   }, [updateInfo?.checking, updateInfo?.phase]);
 
   const isAdmin = data?.me?.role === 'admin';
@@ -873,6 +1199,113 @@ export function DshPasswordsCard(props: DshpwCardProps) {
     setDraft(userId, { models: [...current] });
   };
 
+  // ── 可读取目录：目录浏览器（不可自由编辑）──
+  // 已选目录以只读 chips 展示；只能通过 /gateway/api/directory-picker/list 逐级
+  // 浏览并选择。不存在手打自由路径的入口。
+  const setPicker = (key: string, state: PickerState | null) => {
+    setDirPickers((prev) => {
+      if (state === null) {
+        if (!(key in prev)) return prev;
+        const next = { ...prev };
+        delete next[key];
+        return next;
+      }
+      return { ...prev, [key]: state };
+    });
+  };
+
+  const cancelPickerRequest = (key: string) => {
+    const request = pickerRequestsRef.current.get(key);
+    if (!request) return;
+    pickerRequestsRef.current.delete(key);
+    request.controller.abort();
+    clearTimeout(request.timeout);
+  };
+
+  /**
+   * 加载某目录的直接子目录。每次导航取消同一键上一轮在飞请求并挂新的
+   * AbortController + 有限超时；被取代中止的旧响应直接丢弃，不覆盖新路径。
+   * path === null 时请求默认起点（不带 query）。
+   */
+  const loadDirectory = (key: string, path: string | null) => {
+    cancelPickerRequest(key);
+    const timedOutState: PickerState = { listing: { kind: 'error', message: t('permsDirTimeout') } };
+    const request: OptionalRequest = {
+      controller: new AbortController(),
+      timedOut: false,
+      timeout: setTimeout(() => {
+        request.timedOut = true;
+        request.controller.abort();
+        // 超时立即转错误态，不依赖底层 fetch 是否响应 abort（保持与其它可选请求一致）。
+        // 若已被新一轮导航取代，cancelPickerRequest 已清除本计时器，不会走到这里。
+        setPicker(key, timedOutState);
+      }, DIRECTORY_PICKER_REQUEST_TIMEOUT_MS),
+    };
+    pickerRequestsRef.current.set(key, request);
+    const { controller } = request;
+    setPicker(key, { listing: { kind: 'loading' } });
+    const query = path === null ? '' : `?path=${encodeURIComponent(path)}`;
+    api<unknown>(`/gateway/api/directory-picker/list${query}`, undefined, controller.signal)
+      .then((raw) => {
+        // 身份守卫：同一键已挂新一轮请求（或被关闭）→ 旧响应直接丢弃，不覆盖新路径。
+        if (pickerRequestsRef.current.get(key) !== request) return;
+        if (request.timedOut) {
+          setPicker(key, timedOutState);
+          return;
+        }
+        const data = parseDirectoryListing(raw);
+        setPicker(key, data === null
+          ? { listing: { kind: 'error', message: t('permsDirInvalid') } }
+          : { listing: { kind: 'ready', data } });
+      })
+      .catch((loadError: unknown) => {
+        if (pickerRequestsRef.current.get(key) !== request) return;
+        setPicker(key, request.timedOut
+          ? timedOutState
+          : { listing: { kind: 'error', message: errText(loadError, trErr) } });
+      })
+      .finally(() => {
+        clearTimeout(request.timeout);
+        if (pickerRequestsRef.current.get(key) === request) pickerRequestsRef.current.delete(key);
+      });
+  };
+
+  const openPicker = (userId: number) => {
+    loadDirectory(pickerKey(userId), null);
+  };
+
+  const closePicker = (userId: number) => {
+    const key = pickerKey(userId);
+    cancelPickerRequest(key);
+    setPicker(key, null);
+  };
+
+  /** 可读取目录：从当前有效集合出发加入。`__deny__` ⇒ 空集，`[]` ⇒ 全部工作区
+   * （与工作区开关一致）；加入后即从“所有目录/已禁止”切到具体 array（该次编辑为
+   * 显式变更，会标记 folders touched）。*/
+  const addReadFolder = (userId: number, path: string) => {
+    if (path === '') return;
+    const draft = permDrafts[userId];
+    if (!draft) return;
+    const current = enabledFolderSet(draft);
+    if (current.has(path)) return;
+    current.add(path);
+    setDraft(userId, { folders: [...current] });
+  };
+
+  /** 移除一个可读目录；移除最后一个提交 ['__deny__']（= 无读取权限，fail-closed）。 */
+  const removeReadFolder = (userId: number, path: string) => {
+    const draft = permDrafts[userId];
+    if (!draft) return;
+    const remaining = draft.folders.filter((folder) => folder !== path && folder !== '__deny__');
+    setDraft(userId, { folders: remaining.length > 0 ? remaining : ['__deny__'] });
+  };
+
+  const selectDirectory = (userId: number, path: string) => {
+    if (path === '') return;
+    addReadFolder(userId, path);
+  };
+
   const savePermissions = (userId: number) => {
     const d = permDrafts[userId];
     if (!d) return;
@@ -903,11 +1336,13 @@ export function DshPasswordsCard(props: DshpwCardProps) {
         }>('/gateway/api/permissions', {
           userId,
           ...(d.touched.has('folders') ? { allowedFolders: d.folders } : {}),
+
           ...(d.touched.has('token') ? { hourlyTokenLimit: tokenNum } : {}),
           ...(d.touched.has('minutes') ? { dailyMinutesLimit: minutesNum } : {}),
           ...(d.touched.has('upload') ? { allowUpload: d.upload } : {}),
           ...(d.touched.has('git') ? { allowGitDownload: d.git } : {}),
           ...(d.touched.has('workspaceCreate') ? { allowWorkspaceCreate: d.workspaceCreate } : {}),
+          ...(d.touched.has('ssh') ? { allowSsh: d.ssh } : {}),
           ...(d.touched.has('agentPresets') ? { allowedAgentPresets: d.agentPresets } : {}),
           // NULL = 不限；[] = 禁用全部；非空 = allowlist。保持三态语义原样提交。
           ...(d.touched.has('models') ? { allowedModels: d.models } : {}),
@@ -965,6 +1400,8 @@ export function DshPasswordsCard(props: DshpwCardProps) {
           const workspaceResult = await api<{ workspaces: WorkspaceInfo[] }>('/api/dsh-passwords/workspaces');
           setOverview(latest);
           setWorkspaces(workspaceResult.workspaces ?? []);
+          setWorkspaceStatus('ready');
+          setWorkspaceError('');
           setPermDrafts((prev) => {
             const current = prev[userId];
             if (!current) return prev;
@@ -1014,6 +1451,171 @@ export function DshPasswordsCard(props: DshpwCardProps) {
           ),
         )
       : null;
+
+  // 已选可读取目录 chips。
+  const renderChip = (userId: number, path: string) => {
+    const removeLabel = t('permsReadRemove', { path });
+    return h(
+      'span',
+      { key: path, className: 'dshpw-chip dshpw-read-chip' },
+      h('span', { className: 'dshpw-chip-path dshpw-read-path', title: path }, path),
+      h('button', {
+        type: 'button',
+        className: 'dshpw-chip-remove dshpw-read-remove',
+        disabled: busy,
+        'aria-label': removeLabel,
+        title: removeLabel,
+        onClick: () => removeReadFolder(userId, path),
+      }, dirIcon(ICON_X)),
+    );
+  };
+
+  // 目录浏览器：面包屑 + 上一级 + 关闭 + 仅直接子目录。
+  // 加载/错误态下所有选择入口禁用；行内“选择”只看服务端 selectable。
+  const renderDirectoryBrowser = (userId: number) => {
+    const key = pickerKey(userId);
+    const state = dirPickers[key];
+    if (state === undefined) return null;
+    const listing = state.listing;
+    const data = listing.kind === 'ready' ? listing.data : null;
+    const navigating = listing.kind === 'loading';
+    const separator = data !== null && data.currentPath !== null && data.currentPath.includes('\\') ? '\\' : '/';
+    const crumbs = pathCrumbs(data === null ? null : data.currentPath);
+    return h(
+      DirectoryPanel,
+      {
+        id: pickerPanelId(userId),
+        label: t('permsDirBrowser'),
+        onEscape: () => closePicker(userId),
+        children: [
+          h(
+            'div',
+            { className: 'dshpw-dir-picker-head' },
+            h(
+              'nav',
+              { className: 'dshpw-dir-picker-crumbs', 'aria-label': t('permsDirPath') },
+              crumbs.length === 0
+                ? h('span', { className: 'dshpw-dir-picker-current' }, t('permsDirPath'))
+                : crumbs.map((crumb, index) =>
+                    h(
+                      'span',
+                      { key: crumb.path, className: 'dshpw-dir-picker-seg' },
+                      index > 0 ? h('span', { className: 'dshpw-dir-picker-sep' }, separator) : null,
+                      index === crumbs.length - 1
+                        ? h('span', { className: 'dshpw-dir-picker-current' }, crumb.label)
+                        : h('button', {
+                            type: 'button',
+                            className: 'dshpw-dir-picker-crumb',
+                            disabled: busy || navigating,
+                            onClick: () => loadDirectory(key, crumb.path),
+                          }, crumb.label),
+                    ),
+                  ),
+            ),
+            h('button', {
+              type: 'button',
+              className: 'dshpw-dir-picker-tool dshpw-dir-picker-parent',
+              disabled: busy || data === null || data.parentPath === null,
+              'aria-label': t('permsDirParent'),
+              title: t('permsDirParent'),
+              onClick: () => { if (data !== null && data.parentPath !== null) loadDirectory(key, data.parentPath); },
+            }, dirIcon(ICON_CHEVRON_UP)),
+            h('button', {
+              type: 'button',
+              className: 'dshpw-dir-picker-tool dshpw-dir-picker-close',
+              'aria-label': t('permsDirClose'),
+              title: t('permsDirClose'),
+              onClick: () => closePicker(userId),
+            }, dirIcon(ICON_X)),
+          ),
+          h('button', {
+            type: 'button',
+            className: 'dshpw-btn dshpw-dir-picker-select-current',
+            disabled: busy || data === null || data.selectable !== true || data.currentPath === null,
+            onClick: () => { if (data !== null && data.currentPath !== null) selectDirectory(userId, data.currentPath); },
+          }, t('permsDirSelectCurrent')),
+          h(
+            'div',
+            { className: 'dshpw-dir-picker-body' },
+            listing.kind === 'loading'
+              ? h('div', { className: 'dshpw-hint', role: 'status' }, t('permsDirLoading'))
+              : listing.kind === 'error'
+                ? h('div', { className: 'dshpw-hint', role: 'alert' }, `${t('permsDirError')}: ${listing.message}`)
+                : [
+                    listing.data.truncated
+                      ? h('div', { className: 'dshpw-hint', key: 'truncated' }, t('permsDirTruncated'))
+                      : null,
+                    listing.data.entries.length === 0
+                      ? h('div', { className: 'dshpw-hint', key: 'empty' }, t('permsDirEmpty'))
+                      : h(
+                          'div',
+                          { className: 'dshpw-dir-picker-list', key: 'list' },
+                          ...listing.data.entries.map((entry) =>
+                            h(
+                              'div',
+                              { className: 'dshpw-dir-picker-row', key: entry.path },
+                              h('span', { className: 'dshpw-dir-picker-name', title: entry.path }, entry.name),
+                              h(
+                                'span',
+                                { className: 'dshpw-dir-picker-actions' },
+                                h('button', {
+                                  type: 'button',
+                                  className: 'dshpw-btn dshpw-dir-picker-enter',
+                                  disabled: busy,
+                                  onClick: () => loadDirectory(key, entry.path),
+                                }, t('permsDirEnter')),
+                                h('button', {
+                                  type: 'button',
+                                  className: 'dshpw-btn dshpw-dir-picker-select',
+                                  disabled: busy || entry.selectable !== true,
+                                  onClick: () => selectDirectory(userId, entry.path),
+                                }, t('permsDirSelect')),
+                              ),
+                            ),
+                          ),
+                        ),
+                  ],
+          ),
+        ],
+      },
+    );
+  };
+
+  // 可读取目录：目录浏览器选择，编辑 allowedFolders。
+  //   · ['__deny__'] = 无读权限（不是 [] 无限）；
+  //   · [] = 所有目录，保留现值不转换；一旦加入即切到具体 array；
+  //   · 移除最后一个提交 ['__deny__']。
+  //   开启「新建工作区权限」后，也以这些目录作为创建文件夹/工作区的范围。
+  const renderReadFolders = (userId: number, draft: PermDraft) => {
+    const denyAll = draft.folders.includes('__deny__');
+    const unrestricted = !denyAll && draft.folders.length === 0;
+    const concrete = draft.folders.filter((folder) => folder !== '__deny__');
+    const open = dirPickers[pickerKey(userId)] !== undefined;
+    return h(
+      'div',
+      { className: 'dshpw-read-folders' },
+      h('label', { className: 'dshpw-label' }, t('permsReadTitle')),
+      denyAll
+        ? h('div', { className: 'dshpw-hint' }, t('permsReadEmpty'))
+        : unrestricted
+          ? h('div', { className: 'dshpw-hint' }, t('permsReadUnrestricted'))
+          : h('div', { className: 'dshpw-chip-row' }, ...concrete.map((folder) => renderChip(userId, folder))),
+      h(
+        'div',
+        { className: 'dshpw-row' },
+        h('button', {
+          type: 'button',
+          className: 'dshpw-btn dshpw-read-add',
+          disabled: busy,
+          'aria-expanded': open,
+          'aria-controls': pickerPanelId(userId),
+          onClick: () => { if (open) closePicker(userId); else openPicker(userId); },
+        }, t('permsReadAdd')),
+      ),
+      renderDirectoryBrowser(userId),
+      h('small', { className: 'dshpw-hint' }, t('permsReadDesc')),
+    );
+  };
 
   const patchOk =
     patchState !== null &&
@@ -1399,9 +2001,13 @@ export function DshPasswordsCard(props: DshpwCardProps) {
                 u.permissions.banned ? h('span', { className: 'dshpw-badge' }, t('banned')) : null,
               ),
               h('div', { className: 'dshpw-label' }, t('permsFolders')),
-              workspaces.length === 0
-                ? h('div', { className: 'dshpw-hint' }, t('permsNoWorkspaces'))
-                : h(
+              workspaceStatus === 'loading'
+                ? h('div', { className: 'dshpw-hint', role: 'status' }, t('permsWorkspacesLoading'))
+                : workspaceStatus === 'error'
+                  ? h('div', { className: 'dshpw-hint', role: 'alert' }, `${t('permsWorkspacesUnavailable')}: ${workspaceError}`)
+                  : workspaces.length === 0
+                    ? h('div', { className: 'dshpw-hint' }, t('permsNoWorkspaces'))
+                  : h(
                     'div',
                     { className: 'dshpw-workspaces' },
                     ...workspaces.map((workspace) => {
@@ -1459,6 +2065,7 @@ export function DshPasswordsCard(props: DshpwCardProps) {
                       );
                     }),
                   ),
+              renderReadFolders(u.id, d),
               agentPresetStatus === 'unavailable'
                 ? h(
                     'div',
@@ -1592,6 +2199,7 @@ export function DshPasswordsCard(props: DshpwCardProps) {
                 {
                   className: 'dshpw-input',
                   value: d.sandbox,
+                  disabled: busy,
                   'aria-label': t('permsSandbox'),
                   onChange: (e: { target: { value: string } }) => setDraft(u.id, { sandbox: e.target.value }),
                 },
@@ -1612,6 +2220,7 @@ export function DshPasswordsCard(props: DshpwCardProps) {
                   name: 'dshpw-tokenlimit',
                   placeholder: t('permsToken'),
                   value: d.token,
+                  disabled: busy,
                   onChange: (e: { target: { value: string } }) => setDraft(u.id, { token: e.target.value }),
                 }),
                 h('input', {
@@ -1623,6 +2232,7 @@ export function DshPasswordsCard(props: DshpwCardProps) {
                   name: 'dshpw-minlimit',
                   placeholder: t('permsMinutes'),
                   value: d.minutes,
+                  disabled: busy,
                   onChange: (e: { target: { value: string } }) => setDraft(u.id, { minutes: e.target.value }),
                 }),
               ),
@@ -1635,6 +2245,7 @@ export function DshPasswordsCard(props: DshpwCardProps) {
                   h('input', {
                     type: 'checkbox',
                     checked: d.upload,
+                    disabled: busy,
                     onChange: (e: { target: { checked: boolean } }) => setDraft(u.id, { upload: e.target.checked }),
                   }),
                   t('permsUpload'),
@@ -1645,21 +2256,38 @@ export function DshPasswordsCard(props: DshpwCardProps) {
                   h('input', {
                     type: 'checkbox',
                     checked: d.git,
+                    disabled: busy,
                     onChange: (e: { target: { checked: boolean } }) => setDraft(u.id, { git: e.target.checked }),
                   }),
                   t('permsGit'),
                 ),
-
+                h(
+                  'label',
+                  { className: 'dshpw-check' },
+                  h('input', {
+                    type: 'checkbox',
+                    checked: d.ssh,
+                    disabled: busy,
+                    'aria-label': t('permsSsh'),
+                    onChange: (e: { target: { checked: boolean } }) => setDraft(u.id, { ssh: e.target.checked }),
+                  }),
+                  t('permsSsh'),
+                ),
                 h(
                   'label',
                   { className: 'dshpw-check' },
                   h('input', {
                     type: 'checkbox',
                     checked: d.workspaceCreate,
+                    disabled: busy,
                     onChange: (e: { target: { checked: boolean } }) => setDraft(u.id, { workspaceCreate: e.target.checked }),
                   }),
                   t('permsWorkspaceCreate'),
                 ),
+              ),
+              h(
+                'div',
+                { className: 'dshpw-row' },
                 h(
                   'label',
                   { className: 'dshpw-check' },
@@ -1678,6 +2306,7 @@ export function DshPasswordsCard(props: DshpwCardProps) {
                   h('input', {
                     type: 'checkbox',
                     checked: d.banned,
+                    disabled: busy,
                     onChange: (e: { target: { checked: boolean } }) => setDraft(u.id, { banned: e.target.checked }),
                   }),
                   t('permsBanned'),
@@ -1697,7 +2326,7 @@ export function DshPasswordsCard(props: DshpwCardProps) {
               ),
             );
           }),
-            ),
+          ),
       ),
 
 

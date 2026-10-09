@@ -1,7 +1,8 @@
 // 端点登记表热更新（改 .env 无需重启网关）回归测试：
 //   1) 写入部署 .env 的登记表规则后，运行中的网关在轮询周期内自动生效；
-//   2) 登记在 MCP_GATEWAY_SSH_ENDPOINTS 的 SSH/owner 路由对子用户一律拒绝
-//      （不论 allowSsh true/false，HTTP 与 WS cross transport 都拒），主用户正常；
+//   2) 登记在 MCP_GATEWAY_SSH_ENDPOINTS 的 SSH/owner 路由：owner: 规则对子用户
+//      始终拒绝；其余规则由子用户 allowSsh 开关控制（关闭拒绝、开启放行，HTTP 与
+//      WS 共用一个开关），主用户正常；
 //   3) 规则被清空后立即收紧，并断开已授权 WebSocket（撤销语义）；
 //   4) 非法规则保留上一次有效快照（不静默放宽，也不打断已有授权）。
 import { after, before, test } from 'node:test';
@@ -205,40 +206,73 @@ after(() => {
   try { rmSync(tempDir, { recursive: true, force: true }); } catch { /* Windows 清理尽力而为 */ }
 });
 
-test('热更新：普通插件未登记直通，写入 SSH 表后子用户一律拒绝（allowSsh 不再放行）', async () => {
+test('热更新：普通插件未登记直通，写入 SSH 表后子用户按 allowSsh 放行/拒绝', async () => {
   assert.equal(await request('/api/plugin/terminal', subCookie), 200, '普通插件未登记时直通');
   assert.equal(await request('/api/plugin/terminal', adminCookie), 200, '未登记：主用户不受登记表限制');
 
   writeEnv('/api/plugin/terminal');
   await wait(SETTLE_MS);
-  assert.equal(await request('/api/plugin/terminal', subCookie), 403, '热更新生效：已登记 SSH 路由对子用户拒绝');
   assert.equal(await request('/api/plugin/terminal', adminCookie), 200, '已登记：主用户仍然正常');
 
-  // allowSsh 不再是登记路由的放行开关：旧 allowSsh=true 的放行期望收紧为拒绝。
+  // 已登记 SSH 路由：未勾选 allowSsh 时拒绝，勾选后放行。
   setSubPermissions(false);
-  assert.equal(await request('/api/plugin/terminal', subCookie), 403, '未勾选 SSH：拒绝');
+  assert.equal(await request('/api/plugin/terminal', subCookie), 403, '热更新生效：未勾选 SSH 时已登记路由拒绝');
   setSubPermissions(true);
-  assert.equal(await request('/api/plugin/terminal', subCookie), 403, '旧 allowSsh=true 也不得越权使用登记路由');
+  assert.equal(await request('/api/plugin/terminal', subCookie), 200, '勾选 allowSsh 后放行已登记路由');
   setSubPermissions(false);
 });
 
-test('热更新：owner:/ws:/http: 规则在运行中变更，子用户 HTTP 与 WS 一律拒绝，主用户正常', async () => {
+test('热更新：owner: 规则始终拒绝；ws:/http: 规则由 allowSsh 按对应通道放行，主用户正常', async () => {
   try {
-    for (const registry of ['owner:/api/plugin/terminal', 'ws:/api/plugin/terminal', 'http:/api/plugin/terminal']) {
+    // owner: 规则优先于 allowSsh：即使勾选 SSH，子用户两条通道仍一律拒绝。
+    writeEnv('owner:/api/plugin/terminal');
+    await wait(SETTLE_MS);
+    setSubPermissions(true);
+    assert.equal(await request('/api/plugin/terminal', subCookie), 403, 'owner: 规则 HTTP 拒绝（allowSsh=true 也不例外）');
+    const ownerWs = await wsHandshake('/api/plugin/terminal', subCookie);
+    try {
+      assert.equal(ownerWs.status, 403, 'owner: 规则 WS 拒绝（allowSsh=true 也不例外）');
+    } finally {
+      ownerWs.socket?.destroy();
+    }
+
+    // ws: / http: 前缀只放开对应通道：未勾选 SSH 时该通道拒绝，勾选后放行。
+    for (const { registry, channel } of [
+      { registry: 'ws:/api/plugin/terminal', channel: 'ws' as const },
+      { registry: 'http:/api/plugin/terminal', channel: 'http' as const },
+    ]) {
       writeEnv(registry);
       await wait(SETTLE_MS);
-      assert.equal(await request('/api/plugin/terminal', subCookie), 403, `${registry}：子用户 HTTP 一律拒绝`);
-      const deniedWs = await wsHandshake('/api/plugin/terminal', subCookie);
-      try {
-        assert.equal(deniedWs.status, 403, `${registry}：子用户 WS 一律拒绝（cross transport）`);
-      } finally {
-        deniedWs.socket?.destroy();
+      setSubPermissions(false);
+      if (channel === 'http') {
+        assert.equal(await request('/api/plugin/terminal', subCookie), 403, `${registry}：未勾选 SSH 时 HTTP 拒绝`);
+      } else {
+        const deniedWs = await wsHandshake('/api/plugin/terminal', subCookie);
+        try {
+          assert.equal(deniedWs.status, 403, `${registry}：未勾选 SSH 时 WS 拒绝`);
+        } finally {
+          deniedWs.socket?.destroy();
+        }
       }
-      assert.equal(await request('/api/plugin/terminal', adminCookie), 200, `${registry}：主用户 HTTP 正常`);
+
+      setSubPermissions(true);
+      if (channel === 'http') {
+        assert.equal(await request('/api/plugin/terminal', subCookie), 200, `${registry}：勾选 SSH 后 HTTP 放行`);
+      } else {
+        const allowedWs = await wsHandshake('/api/plugin/terminal', subCookie);
+        try {
+          assert.equal(allowedWs.status, 101, `${registry}：勾选 SSH 后 WS 放行`);
+        } finally {
+          allowedWs.socket?.destroy();
+        }
+      }
+      setSubPermissions(false);
     }
+
+    assert.equal(await request('/api/plugin/terminal', adminCookie), 200, '主用户 HTTP 始终正常');
   } finally {
-    // 旧 allowSsh 语义下子用户 WS 会升级成功；断言失败时用一次登记表变更服务端撤销，
-    // 避免已升级连接挂在网关↔上游之间让测试进程无法退出。
+    setSubPermissions(false);
+    // 放行过的 WS 需要一次登记表变更做服务端撤销，避免隧道挂在网关↔上游让进程无法退出。
     await forceRegistryRevocation();
   }
 });

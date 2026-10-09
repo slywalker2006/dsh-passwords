@@ -7,12 +7,17 @@
 //   - dailyMinutesLimit      每日使用时长上限，分钟（从当天首次使用起算；null = 不限）
 //   - allowUpload            是否使用大请求体/大文件上传档位（false = 64 MiB，true = 300 MiB）
 //   - allowGitDownload       是否允许 git 下载（clone/pull 等）
-//   - allowWorkspaceCreate   是否允许创建/删除/重命名工作区
-//   - allowSsh               旧数据库兼容字段；不再授予子用户 SSH/terminal 能力
+//   - allowWorkspaceCreate   是否允许创建/删除/重命名工作区（创建总开关；能读才能创建）
+//   - allowSsh               是否允许使用主用户配置的 SSH 端点与官方 terminal
 //   - allowedSessionIds      显式会话授权（未初始化前自动种子化可见会话；保存后新会话不再自动加入）
 //   - disabledSessions       已授权工作区内逐会话关闭的会话 ID（兼容旧行为）
 //   - sandboxMode            沙盒级别（read-only / workspace-write / danger-full-access）
 //   - banned                 是否封禁（封禁后经密码门的请求全部 403）
+//
+// 统一目录授权：allowedFolders 是**唯一**的读取/创建范围（父目录与目标路径都以词法 +
+// canonical 两个口径同时命中 folderAllowed，并拒绝文件系统根/敏感基）。旧列
+// workspace_creation_roots 已退役：不再作为独立创建根参与任何活跃授权判定，也不存在
+// 主目录（home）或 pending 绕过创建白名单的例外；旧 API 提交该字段由 admin 端点显式 400。
 //
 // 说明：folder / upload / git 的网关层拦截是"尽力而为"（基于 dsh 的 HTTP API
 // 路径与请求体字段）。主用户账号不受任何限制。
@@ -31,6 +36,26 @@ export function normalizePath(p: string): string {
   n = path.posix.normalize(n);
   if (n.length >= 2 && n[1] === ':') n = n[0].toLowerCase() + n.slice(1);
   return n;
+}
+
+/** 平台实际认可的完全限定路径；Windows 不接受隐含当前盘符的 /foo 或 \\foo。 */
+export function isFullyQualifiedPath(candidate: string): boolean {
+  return process.platform === 'win32'
+    ? /^[A-Za-z]:[\\/]/.test(candidate)
+    : candidate.startsWith('/');
+}
+
+/** 该输入是否带有绝对/盘符语义；Windows 下还拒绝 drive-relative 的 C:foo。 */
+export function isAbsoluteLikePath(candidate: string): boolean {
+  return process.platform === 'win32'
+    ? candidate.startsWith('/') || /^[A-Za-z]:/.test(candidate)
+    : candidate.startsWith('/');
+}
+
+/** 词法或 canonical 路径是否为 POSIX 根或 Windows 盘符根。 */
+export function isFilesystemRootPath(candidate: string): boolean {
+  const normalized = normalizePath(candidate);
+  return normalized === '/' || /^[a-z]:\/$/i.test(normalized);
 }
 
 /**
@@ -235,6 +260,7 @@ export const OFFICIAL_API_NAMESPACES: ReadonlySet<string> = new Set([
   'skills',
   'subagents',
   'workspace',
+  'userQuestions',
   'workspaceFiles',
   // ── 非 RPC 的官方通道 ──
   '$events', // dsh-api-gateway：remote mux 上的逻辑事件流端点（/api/$events*）
@@ -328,14 +354,15 @@ export function isLegacyOfficialApiRoute(pathname: string): boolean {
  * `dynamicCordisRunner` 涉及动态包定义、host half 生命周期和宿主代码执行，
  * 仍然硬拒。
  * `terminal`（dsh-api-terminal-controller）的 create/write/follow 等
- * 是宿主侧远程 shell，不能由官方命名空间或第三方登记表自动开放。Agent Teams
- * 等普通扩展须以宿主动态 manifest 作为已安装扩展面。命中 `/api/*`
- * 这类宽泛规则（或精确规则）时仍归入 third-party；子用户的 terminal RPC
- * 只能取得无能力 UX 桩或被拒绝。主用户不经分类，不受影响。
+ * 是宿主侧远程 shell，不能由官方命名空间或第三方登记表自动开放。命中 `/api/*`
+ * 这类宽泛规则（或精确规则）时仍归入 third-party，随后由 gateway 的统一 allowSsh
+ * 分支决定是否允许：关闭时 terminal/list/environment/shells/close 回固定的本地
+ * UX 桩、其余方法 403；开启时仅官方 terminal 的已知 HTTP/mux 端点原样透传。
+ * 未知 terminal 方法仍 fail-closed。terminal 仍不进 OFFICIAL_API_NAMESPACES；
+ * 主用户不经分类，官方 terminal 对主用户由网关原样透传。
  *
  * officeToPdf 在作用域隔离经过验证前 fail-closed。productAnalytics、
  * pluginRegistryProbe 和可选的 speech 是宿主级能力，不属于普通扩展透传面。
- * 未知 terminal 方法仍 fail-closed；历史 allowSsh 权限不改变此边界。
  */
 export const SUBUSER_BLOCKED_API_NAMESPACES: ReadonlySet<string> = new Set([
   'pluginManager',
@@ -414,6 +441,7 @@ export const SUBUSER_BLOCKED_API_ENDPOINTS: ReadonlySet<string> = new Set([
   'settings/update',
   'session/openWorkspacePath',
   'session/canOpenWorkspacePath',
+  'session/initializeDefaultModel',
   'session/workspacePathApplications',
 ]);
 
@@ -497,7 +525,7 @@ export function isOfficialRootPath(pathname: string): boolean {
  *
  *   platform    —— 网关自身插件路由（/api/dsh-passwords/*），由其自身守卫鉴权
  *   owner-only  —— 登记表中 owner: 规则：子用户两条通道一律拒绝
- *   ssh         —— 登记表中其余规则：仅主用户可使用
+ *   ssh         —— 登记表中其余规则：子用户需勾选 allow_ssh（两把钥匙）
  *   official    —— 官方 dsh 面 + 宿主运行时已注册的普通插件面
  *   third-party —— 其余未登记插件路径：普通 HTTP 直通，WS 须命中清单
  *
@@ -615,7 +643,7 @@ function queryInteger(query: unknown, name: string): number | null {
 
 /** 该路径是否绝对（POSIX 根 或 Windows 盘符）；归一化后再判定。 */
 function isAbsoluteLike(candidate: string): boolean {
-  return candidate.startsWith('/') || /^[a-z]:\//i.test(candidate);
+  return isAbsoluteLikePath(candidate);
 }
 
 /**
@@ -1336,12 +1364,9 @@ export function workspaceRegistrationAllowed(
   return false;
 }
 
-/**
- * 目录浏览条目可见性：条目位于某个授权根内，或某个授权根位于条目子树内
- * （祖先导航：只保留通往授权根的路径，其余目录名对子用户隐藏）。
- */
-export function directoryEntryVisible(entryPath: string, allowedRoots: readonly string[]): boolean {
-  return allowedRoots.some((root) => pathWithin(entryPath, root) || pathWithin(root, entryPath));
+/** 目录浏览条目可见性：只显示授权子树或通往授权根的祖先。 */
+export function directoryEntryVisible(entryPath: string, authorizedRoots: readonly string[]): boolean {
+  return authorizedRoots.some((root) => pathWithin(entryPath, root) || pathWithin(root, entryPath));
 }
 
 // ── 工作区/会话文件夹限制：需要读 JSON 请求体 ──────────────────────────
@@ -1410,7 +1435,7 @@ export const WORKSPACE_ENDPOINT_RE = /^\/api\/session[.\/](create)([.\/]|$)/;
  * 开流校验，account 的登录写操作由 SUBUSER_BLOCKED_API_ENDPOINTS 硬拒绝。
  */
 export const SESSION_SCOPED_RE =
-  /^\/api\/(?:schedule[.\/](?:list|history|update|delete)|session[.\/](?:history|prompt|respond|archive|delete|rename|retitle|title|resume|fork|truncate|export|attachment|updateQueue|cancel|page|projections|selectModel)|workspace[.\/](?:archiveSession|pinSession|unpinSession|unarchiveSession)|commands[.\/](?:list|execute)|subagents[.\/](?:list|prompt|interruptByParent)|fileUploads[.\/](?:upload)|fileReferences[.\/](?:list)|sessionReferenceResolver[.\/](?:candidates)|skills[.\/](?:list)|messageFeedback[.\/](?:list|put|delete)|sessionFeedback[.\/](?:record)|goals[.\/](?:clear|complete|create|edit|get|pause|resume)|workspaceFiles[.\/](?:read|readAll|readBytes|stat|readRelated|list|changes)|present[.\/](?:open)|changes[.\/](?:open)|job[.\/](?:kill))([.\/]|$)/;
+  /^\/api\/(?:schedule[.\/](?:list|history|update|delete)|session[.\/](?:history|prompt|respond|archive|delete|rename|retitle|title|resume|fork|truncate|export|attachment|updateQueue|cancel|page|projections|selectModel)|workspace[.\/](?:archiveSession|pinSession|unpinSession|unarchiveSession)|commands[.\/](?:list|execute)|subagents[.\/](?:list|prompt|interruptByParent)|fileUploads[.\/](?:upload)|fileReferences[.\/](?:list)|sessionReferenceResolver[.\/](?:candidates)|skills[.\/](?:list)|messageFeedback[.\/](?:list|put|delete)|sessionFeedback[.\/](?:record)|goals[.\/](?:clear|complete|create|edit|get|pause|resume)|workspaceFiles[.\/](?:read|readAll|readBytes|stat|readRelated|list|changes)|present[.\/](?:open)|changes[.\/](?:open)|userQuestions[.\/](?:answer)|job[.\/](?:kill))([.\/]|$)/;
 
 /**
  * workspaceFiles 的会话作用域方法（与 SESSION_SCOPED_RE 里的方法列表一致）。
@@ -1994,7 +2019,7 @@ export function extractPathFromBody(value: unknown, depth = 0): string | null {
     if (request !== null && typeof request === 'object' && !Array.isArray(request)) {
       return extractPathFromBody(request, depth + 1);
     }
-    // directoryPicker/createDirectory 的真实 0.1.7 参数直接位于 args.path。
+    // directoryPicker/createDirectory 的真实 0.1.7 参数直接位于 args.path.
     for (const field of PATH_FIELDS) {
       const candidate = args[field];
       if (typeof candidate === 'string' && candidate.length > 0) return candidate;
@@ -2012,6 +2037,32 @@ export function extractPathFromBody(value: unknown, depth = 0): string | null {
     if (nested !== null) return nested;
   }
   return null;
+}
+
+/**
+ * 取 directoryPicker/createDirectory 的实际 wire 路径。
+ * 已识别的 ClientConnection envelope 只能使用 args.path；不能用 cwd 等
+ * 兼容字段替代它，因为上游会忽略这些字段而仍按 path 执行。
+ */
+export function extractDirectoryCreatePath(value: unknown): string | null {
+  const args = clientConnectionArgs(value);
+  if (args !== null) return typeof args.path === 'string' && args.path.length > 0 ? args.path : null;
+  return extractPathFromBody(value);
+}
+
+/**
+ * 取 workspace/create 的实际 wire 路径。
+ * 已识别的 envelope 只能使用 args.request.path；其余形状走旧协议解析。
+ */
+export function extractWorkspaceCreatePath(value: unknown): string | null {
+  const args = clientConnectionArgs(value);
+  if (args !== null) {
+    const request = args.request;
+    if (request === null || typeof request !== 'object' || Array.isArray(request)) return null;
+    const path = (request as Record<string, unknown>).path;
+    return typeof path === 'string' && path.length > 0 ? path : null;
+  }
+  return extractPathFromBody(value);
 }
 
 // ── token 用量：已迁移到客户端 TokenReporter（client/token.tsx 读 dsh 的

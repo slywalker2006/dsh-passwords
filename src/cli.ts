@@ -135,8 +135,8 @@ const SEMVER_VERSION_RE = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-(?
 /**
  * Supported DSH runtime window: the single patch line `>=0.2.1-alpha.1 <0.2.2-0`.
  *
- * `0.2.1-alpha.1` is the reviewed pin (the npm `alpha` dist-tag and the only DSH
- * tree the lockfile resolves). Later `0.2.1` prereleases (alpha.2, beta, rc) and the
+ * `0.2.1-alpha.2` is the resolved development pin (the npm `alpha` dist-tag and the
+ * DSH tree the lockfile resolves). Later `0.2.1` prereleases (beta, rc) and the
  * stable `0.2.1` release are the same wire/bundle contract and stay inside the patch
  * line. This is an identity boundary, not a claim that every build received
  * profile-level acceptance: the retired 0.1.x and 0.2.0 lines, the pre-pin
@@ -510,7 +510,6 @@ async function boot() {
       } catch {
         console.error(`[dsh-passwords] ${tr('cli.parentGone')}`);
         process.exit(0);
-        return;
       }
       // PID 仍在但启动时刻变了 → 原父进程已死，PID 被复用 → 退出
       if (parentStart !== null) {

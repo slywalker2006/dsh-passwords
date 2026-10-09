@@ -22,6 +22,7 @@ let gateway: http.Server;
 let upstream: http.Server;
 let gatewayPort = 0;
 let cookie = '';
+let adminId = 0;
 
 interface JsonResponse {
   status: number;
@@ -65,6 +66,7 @@ before(async () => {
   db = new Database(path.join(tempDir, 'test.db'), createFieldCrypto('testkey', 'testkey'));
   db.init();
   const user = db.createUser('admin', '$2a$10$dummyhashdummyhashdummyhashdu', 'admin');
+  adminId = user.id;
 
   // 上游 mock：本测试只走网关自带 /gateway/* 路由，mock 仅兜底
   upstream = http.createServer((_req, res) => {
@@ -143,4 +145,51 @@ test('留言：POST 三条 → since 增量拉取只返回新消息（升序）'
   const empty = await req('GET', `/gateway/api/messages?since=${ids[2]}`);
   assert.equal(empty.status, 200);
   assert.deepEqual(empty.body.messages ?? [], [], 'since 超出最新 id 时应为空');
+});
+
+// ── 聊天 SSE 的撤权窗口 ─────────────────────────────────────────
+// 未登记到网关撤销表的长连接，在登出/封禁/删号/改密/权限变更后仍会继续推送。
+
+test('留言 SSE：登出后服务端必须立即断开长连接（不留撤权窗口）', async () => {
+  // 用本用例专属的 token，避免吊销影响模块级共享 cookie。
+  const token = jwt.sign({ sub: String(adminId), username: 'admin', cv: 0 }, 'test-secret', { expiresIn: '12h' });
+  const sseCookie = `dsh_gateway_token=${token}`;
+
+  let sseReq: http.ClientRequest | null = null;
+  let resolveClosed: () => void = () => {};
+  const closed = new Promise<void>((resolve) => { resolveClosed = resolve; });
+  await new Promise<void>((resolveOpen, reject) => {
+    sseReq = http.request(
+      { host: '127.0.0.1', port: gatewayPort, method: 'GET', path: '/gateway/api/messages/stream', headers: { cookie: sseCookie } },
+      (res) => {
+        res.on('data', () => { /* 消费，保持连接 */ });
+        res.on('close', () => resolveClosed());
+        res.on('end', () => resolveClosed());
+        resolveOpen();
+      },
+    );
+    sseReq.on('error', reject);
+    sseReq.end();
+  });
+
+  try {
+    const logoutStatus = await new Promise<number>((resolve, reject) => {
+      const r = http.request(
+        { host: '127.0.0.1', port: gatewayPort, method: 'POST', path: '/gateway/logout', headers: { cookie: sseCookie } },
+        (res) => { res.on('data', () => { /* 丢弃 */ }); res.on('end', () => resolve(res.statusCode ?? 0)); },
+      );
+      r.on('error', reject);
+      r.end();
+    });
+    assert.equal(logoutStatus, 302, '登出必须成功');
+
+    const outcome = await Promise.race([
+      closed.then(() => 'closed'),
+      new Promise<string>((resolve) => setTimeout(() => resolve('still-open'), 2000)),
+    ]);
+    assert.equal(outcome, 'closed', '登出后聊天 SSE 必须被服务端立即断开');
+  } finally {
+    // 即使断言失败也要释放连接，否则 gateway.close() 会因未关闭的长连接挂住。
+    sseReq?.destroy();
+  }
 });

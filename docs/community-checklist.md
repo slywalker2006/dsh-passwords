@@ -11,7 +11,7 @@ This checklist records the current community surface and turns recurring reposit
 - [x] GitHub Pull Requests reviewed: 5 total, all closed and merged. Contributions came through forks and generally included a problem statement, implementation notes, validation, and an issue reference.
 - [x] GitHub Discussions reviewed: 3 public threads. They cover chat-entry visibility, cross-user workspace/session isolation, and workspace cleanup ideas. Discussion #27 was open at the time of review.
 - [x] Forks reviewed: 11 public forks. Forks include compatibility fixes, UI changes, archive handling, and downstream feature experiments. Fork behavior must not be treated as an endorsement or as a supported distribution.
-- [x] GitHub Actions workflow reviewed: CI runs `npm ci`, `npm run build`, and `npm test` on Node 22 and Node 24 for pushes and pull requests targeting `main`.
+- [x] GitHub Actions workflow reviewed: CI runs `npm ci --include=optional`, `npm run build`, and `node --import tsx --test "test/**/*.test.ts"` on Node 22 and Node 24 for pushes and pull requests targeting `main`.
 
 ## Community entry points / 社区入口
 
@@ -79,7 +79,7 @@ This checklist records the current community surface and turns recurring reposit
 - [ ] One focused change or one tightly coupled behavior.
 - [ ] Issue linked with `Fixes #N`, `Closes #N`, or `Refs #N` where applicable.
 - [ ] Root cause, affected roles, supported versions, compatibility impact, and rollback behavior described.
-- [ ] `npm ci`, `npm run build`, and `npm test` run, with exact results and skips recorded.
+- [ ] `npm ci --include=optional`, `npm run build`, and `node --import tsx --test "test/**/*.test.ts"` run, with exact results and skips recorded.
 - [ ] Security, authorization, tenant isolation, data-loss, race, reconnect, and failure behavior reviewed for affected paths.
 - [ ] No accidental version bump, release asset, package publication, dependency churn, or generated-file noise.
 - [ ] User-facing behavior and configuration changes documented in both README languages when appropriate.

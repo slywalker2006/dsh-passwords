@@ -467,14 +467,21 @@ function toIsoTimestamp(value: string | null | undefined): string | null {
   return raw.includes('T') ? raw : `${raw.replace(' ', 'T')}Z`;
 }
 
-/** 安全解析 JSON 字符串数组（权限目录 / 留言标签）；损坏时返回空数组 */
-function parseJsonArray(raw: string | null): string[] {
-  if (!raw) return [];
+/**
+ * 安全解析 JSON 字符串数组（权限集合 / 留言标签 / 清理意图会话）：
+ *   - NULL 表示列缺省，保持「空集合」兼容语义；
+ *   - 非空但非法 JSON、非数组或含非字符串元素表示数据损坏，返回 null 由调用方决定
+ *     fail-closed（拒绝全部）还是 fail-open（视为空集合），不再静默降级为空数组。
+ */
+function parseJsonArray(raw: string | null): string[] | null {
+  if (raw === null) return [];
   try {
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed.filter((x): x is string => typeof x === 'string') : [];
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return null;
+    const items = parsed.filter((x): x is string => typeof x === 'string');
+    return items.length === parsed.length ? items : null;
   } catch {
-    return [];
+    return null;
   }
 }
 
@@ -495,6 +502,7 @@ function parseAllowedFolders(raw: string | null): string[] {
   }
 }
 
+
 function sanitizeAllowedFolders(folders: string[]): string[] {
   if (folders.length === 0) return [];
   if (folders.includes('__deny__')) return ['__deny__'];
@@ -506,7 +514,10 @@ function sanitizeAllowedFolders(folders: string[]): string[] {
     const normalized = path.posix.normalize(folder);
     return normalized === '.' || normalized === '/' || /^[a-z]:\/$/i.test(normalized);
   });
-  return invalid ? ['__deny__'] : cleaned;
+  if (invalid) return ['__deny__'];
+  const unique = new Map<string, string>();
+  for (const folder of cleaned) unique.set(path.posix.normalize(folder), folder);
+  return [...unique.values()];
 }
 
 /**
@@ -746,6 +757,8 @@ export class Database {
   private normalizeMediaPermissionColumns(): void {
     this.db.exec('UPDATE user_permissions SET allow_chat_media = 0 WHERE allow_chat_media IS NULL');
   }
+
+
 
   // ── 迁移：users.username 明文 → 密文 + username_hash ──────────
   private migrateUsers(): boolean {
@@ -1439,7 +1452,7 @@ export class Database {
     const row = this.stmt('SELECT disabled_sessions FROM user_permissions WHERE user_id = ?').get(userId) as
       | { disabled_sessions: string | null }
       | undefined;
-    return Database.normalizeSessionIdSet(parseJsonArray(row?.disabled_sessions ?? null)).sort();
+    return Database.normalizeSessionIdSet(parseJsonArray(row?.disabled_sessions ?? null) ?? []).sort();
   }
 
   getPermissions(userId: number): UserPermissionsRow | null {
@@ -1480,12 +1493,14 @@ export class Database {
       allow_git_download: row.allow_git_download === 1,
       allow_workspace_create: row.allow_workspace_create === 1,
       allow_ssh: row.allow_ssh === 1,
-      allowed_agent_presets: row.allowed_agent_presets === null ? null : parseJsonArray(row.allowed_agent_presets),
-      allowed_models: row.allowed_models === null ? null : parseJsonArray(row.allowed_models),
+      // 非 NULL 的损坏值（parseJsonArray 返回 null）保持原「禁止全部」语义（[]），
+      // 不因解析器改为可区分损坏而静默放宽为「不限制」。
+      allowed_agent_presets: row.allowed_agent_presets === null ? null : parseJsonArray(row.allowed_agent_presets) ?? [],
+      allowed_models: row.allowed_models === null ? null : parseJsonArray(row.allowed_models) ?? [],
       allow_chat_media: row.allow_chat_media === 1,
       banned: row.banned === 1,
       sandbox_mode: sandboxMode,
-      disabled_sessions: parseJsonArray(row.disabled_sessions),
+      disabled_sessions: parseJsonArray(row.disabled_sessions) ?? [],
       updated_at: row.updated_at,
     };
   }
@@ -2044,7 +2059,7 @@ export class Database {
       if (!samePathForMatch(row.root, root)) continue;
       return {
         root: row.root,
-        sessionIds: parseJsonArray(row.session_ids)
+        sessionIds: (parseJsonArray(row.session_ids) ?? [])
           .filter((id) => id.length > 0 && id.length <= 200)
           .slice(0, 2000),
         ownerUserId: Number.isInteger(row.owner_user_id) ? row.owner_user_id : 0,
@@ -2211,7 +2226,7 @@ export class Database {
       sender_name: this.crypto.decrypt(row.username) ?? '',
       recipient_id: row.recipient_id,
       content: row.content,
-      tags: parseJsonArray(row.tags),
+      tags: parseJsonArray(row.tags) ?? [],
       created_at: row.created_at,
       media: this.listMessageMedia(row.id),
     }));

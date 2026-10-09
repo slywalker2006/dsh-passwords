@@ -127,8 +127,31 @@ interface NpmInstallTarget {
   deploymentRoot: string | null;
 }
 
+export function npmGlobalInstallArgs(artifact: string): string[] {
+  return ['install', '-g', '--omit=dev', '--ignore-scripts', '--no-audit', '--no-fund', artifact];
+}
+
 /** 只能保留部署状态，不能把旧包中的运行代码带进新包。 */
 const PRESERVED_DEPLOYMENT_ENTRIES = ['.env', 'data', 'setup-key.txt'];
+
+/**
+ * 计算固定部署替换必须保留的实际 env 文件相对路径。DSH_PASSWORDS_ENV_FILE 可指向
+ * 部署目录内的其它文件名（如 harness.env），只靠硬编码 .env 会在替换时丢失配置。
+ * 仅当文件确实位于部署目录内、且路径分隔正常时返回相对路径；越界（部署目录本身或
+ * 外部）与分隔异常的路径一律返回 null，避免交换时移动或错位保留范围外的条目。
+ * 未显式指定时返回 null，交由默认 .env，保持既有行为。
+ */
+export function deploymentEnvFileRelativeEntry(deploymentRoot: string, configuredEnvFile: string): string | null {
+  const raw = configuredEnvFile.trim();
+  if (raw === '') return null;
+  const relative = path.relative(deploymentRoot, path.resolve(raw));
+  if (relative === '' || path.isAbsolute(relative)) return null;
+  // 非本机分隔符混入相对路径，说明文件名被下游误当成子目录，拒绝以免交换错位。
+  const foreignSeparator = path.sep === '\\' ? '/' : '\\';
+  if (relative.includes(foreignSeparator)) return null;
+  if (relative.split(path.sep).some((segment) => segment === '' || segment === '.' || segment === '..')) return null;
+  return relative;
+}
 
 /** 版本号比较：'v2.6.0' / '2.5.10' → 数字逐级比较；格式非法返回 null */
 export function compareVersions(a: string, b: string): number | null {
@@ -296,13 +319,21 @@ function runProcess(command: string, args: string[], env: NodeJS.ProcessEnv, cwd
     };
     child.stdout.on('data', append);
     child.stderr.on('data', append);
-    const timer = setTimeout(() => child.kill(), UPDATE_NPM_TIMEOUT_MS);
-    child.on('error', (error) => {
+    let killTimer: NodeJS.Timeout | null = null;
+    const timer = setTimeout(() => {
+      child.kill();
+      killTimer = setTimeout(() => child.kill('SIGKILL'), 5000);
+    }, UPDATE_NPM_TIMEOUT_MS);
+    const cleanup = () => {
       clearTimeout(timer);
+      if (killTimer !== null) clearTimeout(killTimer);
+    };
+    child.on('error', (error) => {
+      cleanup();
       resolve({ ok: false, output: error instanceof Error ? error.message : '命令启动失败' });
     });
     child.on('close', (code) => {
-      clearTimeout(timer);
+      cleanup();
       const output = Buffer.concat(chunks).toString('utf8').trim().slice(0, 800);
       resolve({ ok: code === 0, output });
     });
@@ -1038,7 +1069,7 @@ export class UpdateEngine {
   }
 
   private async installIntoNpmTarget(target: NpmInstallTarget, version: string): Promise<boolean> {
-    const result = await this.ops.runInstall(['install', '-g', this.artifactPath(version)], target.env);
+    const result = await this.ops.runInstall(npmGlobalInstallArgs(this.artifactPath(version)), target.env);
     if (!result.ok) {
       this.setError(`安装失败：${result.message}`);
       return false;
@@ -1455,6 +1486,8 @@ export class UpdateEngine {
 
   private preservedDeploymentEntries(deploymentRoot: string): string[] {
     const entries = [...PRESERVED_DEPLOYMENT_ENTRIES];
+    const envEntry = deploymentEnvFileRelativeEntry(deploymentRoot, this.env.DSH_PASSWORDS_ENV_FILE ?? '');
+    if (envEntry !== null) entries.push(envEntry);
     for (const key of ['MCP_GATEWAY_TLS_CERT', 'MCP_GATEWAY_TLS_KEY']) {
       const value = this.env[key]?.trim() ?? '';
       if (value === '') continue;
@@ -1482,6 +1515,14 @@ export class UpdateEngine {
     }
   }
 
+  /**
+   * 整目录交换失败后回滚到旧程序。回滚会把部署目录先改名为 failedRoot，再把其中
+   * 的保留项（.env、data、TLS 等）移回旧程序备份，最后把备份改回部署目录。
+   *
+   * failedRoot 里可能仍含有尚未移回的保留项；只有确认所有保留项都已离开 failedRoot
+   * （即已安全回到部署目录）才允许删除它。任何一步失败都保留 failedRoot 并记录可操作
+   * 错误，绝不能因为回滚失败就把用户数据一起删掉。
+   */
   private async rollbackFixedDeployment(
     deploymentRoot: string,
     backupRoot: string,
@@ -1489,6 +1530,7 @@ export class UpdateEngine {
     entries: string[],
     env: NodeJS.ProcessEnv,
   ): Promise<void> {
+    let failure: string | null = null;
     try {
       if (existsSync(deploymentRoot)) renameSync(deploymentRoot, failedRoot);
       if (existsSync(backupRoot)) {
@@ -1502,10 +1544,26 @@ export class UpdateEngine {
         );
       }
     } catch (error) {
-      this.ops.log(`update rollback failed: ${error instanceof Error ? error.message : String(error)}`);
-    } finally {
-      rmSync(failedRoot, { recursive: true, force: true });
+      failure = error instanceof Error ? error.message : String(error);
     }
+    // 仍留在 failedRoot 中的保留项即仍可能被删除的用户数据；只有全部移出、且部署目录
+    // 已恢复，删除 failedRoot 才是安全的。
+    const stranded = existsSync(failedRoot)
+      ? entries.filter((entry) => existsSync(path.join(failedRoot, entry)))
+      : [];
+    if (failure === null && stranded.length === 0) {
+      try {
+        rmSync(failedRoot, { recursive: true, force: true });
+      } catch (error) {
+        this.ops.log(`update: 清理回滚残留目录失败 ${failedRoot}：${error instanceof Error ? error.message : String(error)}`);
+      }
+      return;
+    }
+    const reason = failure ?? `保留项仍残留在备份目录中：${stranded.join('、')}`;
+    const kept = [failedRoot, backupRoot].filter((candidate) => existsSync(candidate));
+    const message = `固定部署目录回滚未完成：${reason}；已保留 ${kept.join('、')}，请人工核对 .env、data 等保留数据后再清理`;
+    this.setError(message);
+    this.ops.log(`update: ${message}`);
   }
 
   private removeReplacedNpmRuntime(deploymentRoot: string): void {

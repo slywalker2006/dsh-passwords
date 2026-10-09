@@ -1,0 +1,9 @@
+# Only README-linked user documentation is published from docs/.
+# Internal plans, screenshots and review/investigation artifacts stay in the repository.
+plans/
+screenshots/
+
+dsh-better-sidebar-conflict-investigation.md
+issue-29-remote-mux-proxy-audit.md
+loading-timeline-observation.md
+testing-gaps-docker-installer.md

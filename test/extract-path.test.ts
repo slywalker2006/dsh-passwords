@@ -14,6 +14,8 @@ import {
   collectIdPathPairs,
   extractWorkspaceId,
   extractPathFromBody,
+  extractDirectoryCreatePath,
+  extractWorkspaceCreatePath,
   WORKSPACE_ENDPOINT_RE,
   isWorkspaceCreate,
   isWorkspaceDirectoryCreate,
@@ -70,6 +72,24 @@ test('R-A：extractPathFromBody 只采信 alpha.2 的 payload.args（防外层 d
     payload: { args: {} }, path: '/root/11', cwd: '/root/11',
   };
   assert.equal(extractPathFromBody(decoy), null, 'args 无路径时不得回退到信封外层字段');
+});
+
+test('R-A：创建端点只采信上游实际执行的 path 字段', () => {
+  const directory = {
+    type: 'client-request', rpcId: 'create-directory', method: 'directoryPicker/createDirectory',
+    payload: { args: { cwd: '/allowed', path: '/outside', name: 'x' } },
+  };
+  assert.equal(extractDirectoryCreatePath(directory), '/outside');
+
+  const workspace = {
+    type: 'client-request', rpcId: 'create-workspace', method: 'workspace/create',
+    payload: { args: { request: { cwd: '/allowed', path: '/outside' } } },
+  };
+  assert.equal(extractWorkspaceCreatePath(workspace), '/outside');
+  assert.equal(extractDirectoryCreatePath({
+    type: 'client-request', rpcId: 'missing-path', method: 'directoryPicker/createDirectory',
+    payload: { args: { cwd: '/allowed', name: 'x' } },
+  }), null);
 });
 
 test('R-A：extractWorkspaceId 只采信 alpha.2 的 payload.args', () => {

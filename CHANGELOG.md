@@ -1,5 +1,33 @@
 # Changelog
 
+## 2.7.8 - 2026-10-10
+
+### 中文
+
+更新公告：
+
+1. 兼容 DSH `0.2.1-alpha.2`：9 个 `@deepseek-ai/dsh*` 开发依赖、`npm-shrinkwrap.json`、安装器与 bundled Docker 默认运行时统一升级并锁定到官方 alpha.2；声明范围保持 `>=0.2.1-alpha.1 <0.2.2-0` 不变。
+2. 新增 Issue #38：目录权限收口为单一 `allowedFolders`（「可读取目录」），可读与可创建合二为一——主用户通过受限目录浏览器为子用户分配，浏览起点取自 `MCP_GATEWAY_DIRECTORY_PICKER_ROOTS`（未配置时默认用户家目录，全盘根永不作为起点，绝不从整机根枚举）。白名单内即可读；开启「新建工作区权限」后，同一批可读目录也是创建范围，子用户可在其中新建文件夹并登记为工作区；白名单外不可读也无法创建。`[]` 沿用既有「不限目录」语义，`['__deny__']` 禁止全部；关闭开关只禁止创建、保留可读范围。不再提供独立的创建根配置。
+3. 新增 Issue #39 处理与多用户协作改进：`listAssignableWorkspaces()` 改为批量标题快照、仅对缺标题 session 读取 surface；三个超时/TTL 键纳入 managed env 并支持可选 inventory TTL，修复工作区展示 504 与权限保存 502。权限保存提交后立即撤销旧的 legacy/Remote 订阅发送资格，缩小沙盒异步处理期间的权限撤回窗口；对 `workspaceFiles/changes` 的每个变化帧重新执行工作区、归属与敏感路径检查；归档/解档成功响应与 Remote 归档增量立即更新子用户会话列表投影，较早的慢列表响应不得回滚新归档状态。
+4. 修复 Issue #36：当 `DSH_PASSWORDS_ENV_FILE` 指向尚不存在的 `.env` 时，非 root 首次安装会命中「自动 HTTPS 需要 root」门禁并在插件注册前退出。修复为 fail-closed：仅明确关闭自动 HTTPS（`0/false/no`）或同时提供自管证书时允许非 root 首次安装，默认/开启/未知值与单边/空白证书仍要求 root；非 root 安装默认目录改为 `$HOME/dsh-passwords`，非特权首次生成的配置不再硬编码 443/80。
+5. 修复 alpha.2 的可选 bind-all 补丁：同时适配 CLI 与 WebServer 配置中的通配监听限制，状态检测、关闭开关恢复和回滚覆盖两处；默认不修改监听限制。
+6. 发布包纳入 `docs/`，避免 README 中的相对文档链接在 npm 包内失效；Docker 镜像补充就绪探针与构建期版本断言。
+
+### English
+
+Release notes:
+
+1. DSH `0.2.1-alpha.2` compatibility: the nine `@deepseek-ai/dsh*` dev dependencies, `npm-shrinkwrap.json`, the installers, and the bundled Docker default runtime are upgraded and locked to the official alpha.2; the declared range stays `>=0.2.1-alpha.1 <0.2.2-0`.
+2. New in Issue #38: directory authorization is folded into the single `allowedFolders` ("Readable directories"), merging read and create scope. The owner assigns them with the restricted directory browser, whose roots come from `MCP_GATEWAY_DIRECTORY_PICKER_ROOTS` (defaults to the user home when unset; a filesystem root is never a starting point, so the whole disk is never enumerated). Anything inside the allowlist is readable; with "Workspace creation permission" enabled those same readable directories are also the creation scope, so a subuser can create new folders there and register them as workspaces, while anything outside is neither readable nor creatable. `[]` keeps the existing unrestricted-directory semantics and `['__deny__']` denies all; turning the switch off only denies creation and preserves the readable scope. No separate creation-root configuration remains.
+3. New Issue #39 handling and multi-user collaboration improvements: `listAssignableWorkspaces()` now uses batched title snapshots and reads surface only for sessions without a title; the three timeout/TTL keys are wired into the managed env with an optional inventory TTL, fixing the workspace-view 504 and the permission-save 502. A permission update immediately revokes legacy and Remote subscription delivery eligibility, shrinking the revocation window while sandbox enforcement completes; every `workspaceFiles/changes` frame re-checks workspace, ownership, and sensitive-path boundaries; archive/unarchive responses and Remote archive updates refresh the subuser session-list projection immediately, so older slow list responses cannot roll back the newer archive state.
+4. Fixed Issue #36: when `DSH_PASSWORDS_ENV_FILE` pointed at a not-yet-existing `.env`, a non-root first install hit the "automatic HTTPS needs root" gate and exited before plugin registration. Fixed fail-closed: a non-root first install is allowed only when automatic HTTPS is explicitly off (`0/false/no`) or a self-managed certificate pair is supplied; default/on/unknown values and one-sided or blank certificates still require root. Non-root installs now default to `$HOME/dsh-passwords`, and the non-privileged first-run config no longer hardcodes 443/80.
+5. Adapt the opt-in bind-all patch to both alpha.2 wildcard-listener guards (CLI and WebServer configuration), including status checks, switch-off restoration, and rollback. Default listener restrictions remain unchanged.
+6. Include `docs/` in the npm package so relative documentation links from the README remain available; the Docker image gains a readiness probe and a build-time version assertion.
+
+验证：本地 `npm run build` 通过；`node --import tsx --test "test/**/*.test.ts"` 全量通过（1 项 Windows 符号链接用例按平台预期跳过）；`npm pack --dry-run` 内容检查通过；测试服务器实际部署 `2.7.8` / DSH `0.2.1-alpha.2`，healthz/readyz/login 均 200、patch 四项全绿；Docker 镜像内置 DSH `0.2.1-alpha.2` 并完成 `:2.7.8` 与 `:latest` 推送。
+
+Validation: local `npm run build` passed; the full `node --import tsx --test "test/**/*.test.ts"` suite passed with one platform-expected Windows symlink skip; the `npm pack --dry-run` content check passed; the test server runs `2.7.8` with DSH `0.2.1-alpha.2`, reporting healthz/readyz/login 200 and all four patches green; the Docker image bundles DSH `0.2.1-alpha.2` and is pushed as `:2.7.8` and `:latest`.
+
 ## 2.7.7 - 2026-10-03
 
 ### 中文
@@ -16,8 +44,9 @@
 8. 流与进程健壮性：SSE 过滤按 LF/CRLF/CR 解析并保留跨 chunk UTF-8；无法解析的 session history/page 响应 fail-closed；Remote mux 发送缓冲限制为 2 MiB 余量加单个最大合法帧；插件卸载期间不再创建孤儿网关进程，spawn 错误可正确重试。
 9. 客户端可用性与维护：文件下载和目录删除控件支持键盘访问，移除无消费者的客户端导出。
 10. 发布打包卫生：`prepack` 在构建前运行 `scripts/clean-dist.mjs`，删除 `src/` 已无同名 `.ts` 的陈旧成对编译产物（例如旧版 `dist/gateway-admin.js`、`gateway-media.js`、`gateway-messages.js`、`gateway-proxy.js`、`plugin-compat.js` 及其 `.d.ts`），避免 `files:["dist/"]` 把旧构建残留打进 npm 包；普通 `npm test` / `npm run build` 不清理 `dist`，保留用户本地已生成产物。
+11. 权限模型补充：恢复 `allowSsh` 为官方 Terminal 与第三方 SSH / 宿主端点的统一开关，默认关闭，由主用户在权限卡片「SSH 和终端使用」为子用户显式授权。开启后放行官方 terminal `terminal/*` HTTP unary RPC 与 `terminal/follow`、`terminal/retain` Remote mux 流；对已登记的第三方 SSH / 宿主端点，`allowSsh` 只放行 HTTP 与 WS，匹配的 Remote mux 流仍按 v2.7.5 的 owner-only 逐流拒绝、不受 `allowSsh` 影响，`owner:` 规则在所有通道永远拒绝子用户。关闭时维持无能力 UX 桩 / 403 / `terminal/unavailable`。运行中撤销 `allowSsh` 立即断开旧 Remote mux carrier 并回收终端流。
 
-验证：本地 `npm test` 705/705、独立 dist 回归脚本 `node test/issue-35-standalone.mjs`（A 组 8/8 断言，P0 畸形多字节签名 cookie 未崩溃）、`npm run build`、`npx tsc -p tsconfig.json --noEmit` 与 `git diff --check` 通过；`npm-shrinkwrap.json` 经官方 registry 重建后零版本漂移，280 个 `@deepseek-ai/dsh*` 条目全部锁定 `0.2.1-alpha.1`。
+验证：本地 `npm test` 705/705、独立 dist 回归脚本 `node test/issue-35-standalone.mjs`（A 组 8/8 断言，P0 畸形多字节签名 cookie 未崩溃）、`npm run build`、`npx tsc -p tsconfig.json --noEmit` 与 `git diff --check` 通过；`npm-shrinkwrap.json` 经官方 registry 重建后零版本漂移，280 个 `@deepseek-ai/dsh*` 条目全部锁定 `0.2.1-alpha.1`。第 11 条为发布后权限模型补充说明，其 HTTP/mux/撤销回归与测试服务器验收独立进行，未计入以上验证数字。
 
 ### English
 
@@ -33,8 +62,9 @@ Release notes:
 8. Stream and process hardening: SSE filtering handles LF/CRLF/CR and split UTF-8 chunks; unprocessable session history/page responses fail closed; Remote mux buffering permits 2 MiB of queue headroom plus one maximum legal frame; plugin disposal no longer spawns orphan gateways and spawn failures can retry.
 9. Client usability and maintenance: file-download and directory-delete controls are keyboard accessible; unused client exports were removed.
 10. Packaging hygiene: `prepack` now runs `scripts/clean-dist.mjs` before the build to delete obsolete paired compiled outputs whose `src/` `.ts` source no longer exists (for example the old `dist/gateway-admin.js`, `gateway-media.js`, `gateway-messages.js`, `gateway-proxy.js`, and `plugin-compat.js` plus their `.d.ts`), so `files:["dist/"]` no longer packs leftovers from an older build; ordinary `npm test` / `npm run build` do not clean `dist`, preserving the user's local generated artifacts.
+11. Permission-model supplement: restored `allowSsh` as the single switch for official terminal and third-party SSH/host endpoints. It defaults to off and is granted per subuser explicitly by the owner via the "SSH and terminal access" toggle in the permissions card. When enabled, the gateway forwards official terminal `terminal/*` HTTP unary RPCs and `terminal/follow` / `terminal/retain` Remote mux streams; for registered third-party SSH/host endpoints it forwards HTTP and WS only, while matching Remote mux streams keep the v2.7.5 owner-only per-stream rejection and are not opened by `allowSsh`, and `owner:` rules always reject subusers on every channel. When disabled it keeps the no-capability UX stubs / 403 / `terminal/unavailable`. Revoking `allowSsh` at runtime immediately closes the old Remote mux carrier and reclaims terminal streams.
 
-Validation: local `npm test` 705/705, the standalone dist regression script `node test/issue-35-standalone.mjs` (A-group 8/8 assertions, and the malformed multibyte-signature P0 cookie did not crash), `npm run build`, `npx tsc -p tsconfig.json --noEmit`, and `git diff --check` passed. `npm-shrinkwrap.json` was rebuilt against the official registry with zero version drift, with all 280 `@deepseek-ai/dsh*` entries pinned to `0.2.1-alpha.1`.
+Validation: local `npm test` 705/705, the standalone dist regression script `node test/issue-35-standalone.mjs` (A-group 8/8 assertions, and the malformed multibyte-signature P0 cookie did not crash), `npm run build`, `npx tsc -p tsconfig.json --noEmit`, and `git diff --check` passed. `npm-shrinkwrap.json` was rebuilt against the official registry with zero version drift, with all 280 `@deepseek-ai/dsh*` entries pinned to `0.2.1-alpha.1`. Item 11 is a post-release permission-model supplement; its HTTP/mux/revocation regressions and test-server acceptance are run separately and are not included in the numbers above.
 
 ## 2.7.6 - 2026-09-29
 

@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, rmdirSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -12,6 +12,7 @@ import { resolveNpmCommand, windowsNpmShimArgs } from '../src/patch.ts';
 import {
   compareVersions,
   detectRuntime,
+  deploymentEnvFileRelativeEntry,
   isContainerRuntime,
   parseNpmPackageInfo,
   parseReleaseInfo,
@@ -23,6 +24,7 @@ import {
   UPDATE_CHECK_MS,
   UPDATE_GATE_TTL_MS,
   UPDATE_IDLE_MS,
+  npmGlobalInstallArgs,
 } from '../src/update.ts';
 
 function config(dbPath: string, restartService = 'dsh-web'): PlatformConfig {
@@ -120,8 +122,10 @@ function setupDocker(root: string, autoEnabled: boolean, nowRef: { value: number
   return { engine, db, ops, calls, installAudits: () => installAudits, composeDir };
 }
 
-function setup(root: string, autoEnabled: boolean, nowRef: { value: number }, restartOk = true, restartService = 'dsh-web', extraEnv: NodeJS.ProcessEnv = {}, inPlaceDeploymentSwap = true) {
-  writeFileSync(path.join(root, 'package.json'), JSON.stringify({ name: 'dsh-passwords', version: '2.6.2' }));
+// currentVersion = 部署中正在运行的旧版本；targetVersion = 线上/本地待升级到的版本。
+// 默认值与历史契约保持一致，既有测试无需改动；2.7.7 → 本地 2.7.8 的回归用例显式覆盖它们。
+function setup(root: string, autoEnabled: boolean, nowRef: { value: number }, restartOk = true, restartService = 'dsh-web', extraEnv: NodeJS.ProcessEnv = {}, inPlaceDeploymentSwap = true, currentVersion = '2.6.2', targetVersion = '2.6.3') {
+  writeFileSync(path.join(root, 'package.json'), JSON.stringify({ name: 'dsh-passwords', version: currentVersion }));
   writeFileSync(path.join(root, 'obsolete-runtime.js'), 'old program file\n');
   const envFile = path.join(root, '.env');
   writeFileSync(envFile, 'SETUP_KEY=test-setup-key\n');
@@ -135,8 +139,8 @@ function setup(root: string, autoEnabled: boolean, nowRef: { value: number }, re
   const payload = Buffer.from('verified package');
   const ops: UpdateEngineOps = {
     now: () => nowRef.value,
-    fetchRelease: async () => release(),
-    fetchNpmMetadata: async () => metadata(),
+    fetchRelease: async () => release(targetVersion),
+    fetchNpmMetadata: async () => metadata(targetVersion),
     download: async (_url, dest, maxBps, resumed, progress) => {
       assert.equal(resumed, 0);
       progress?.(payload.length, payload.length);
@@ -145,13 +149,17 @@ function setup(root: string, autoEnabled: boolean, nowRef: { value: number }, re
       return createHash('sha512').update(payload).digest('hex');
     },
     runInstall: async (args) => {
+      if (args.includes('--prefix')) {
+        assert.ok(args.includes('--omit=dev'));
+        assert.ok(args.includes('--ignore-scripts'));
+      }
       const prefixIndex = args.indexOf('--prefix');
       if (prefixIndex >= 0) {
         const stagingRoot = args[prefixIndex + 1];
         const packageRoot = path.join(stagingRoot, 'node_modules', 'dsh-passwords');
         mkdirSync(path.join(packageRoot, 'dist'), { recursive: true });
         mkdirSync(path.join(packageRoot, 'scripts'), { recursive: true });
-        writeFileSync(path.join(packageRoot, 'package.json'), JSON.stringify({ name: 'dsh-passwords', version: '2.6.3' }));
+        writeFileSync(path.join(packageRoot, 'package.json'), JSON.stringify({ name: 'dsh-passwords', version: targetVersion }));
         writeFileSync(path.join(packageRoot, 'dist', 'cli.js'), 'export {};\n');
         writeFileSync(path.join(packageRoot, 'scripts', 'register-plugin.mjs'), 'export {};\n');
         writeFileSync(path.join(stagingRoot, 'node_modules', 'runtime-dependency.js'), 'export {};\n');
@@ -189,11 +197,136 @@ test('update apply maps NOT_READY to an actionable 422 instead of HTTP 409', () 
   assert.equal(updateApplyHttpStatus({ ok: true, code: 'NO_UPDATE' }), 200);
 });
 
-test('test package flow targets the current package version from a 2.6.4 baseline', () => {
+// 2.7.7 → 本地 package 版本（当前 2.7.8）的固定部署升级回归。
+// 复用既有 ops 夹具（不真实执行 npm install / 不连远程）：runInstall 只把目标版本写进 staging，
+// 断言集中在升级必须保留的部署状态与 profile 指向，绝不声称为真实 npm/远程验收。
+test('2.7.7 → 本地 package 版本固定部署升级：保留 .env、打开中的数据库句柄与 profile，并替换旧程序', async () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'dshpw-update-'));
   const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as { version: string };
-  assert.match(pkg.version, /^2\.7\.\d+(?:-[0-9A-Za-z.-]+)?$/);
-  // compareVersions 只接受 X.Y.Z；预发布标记（-pre）不参与数值比较。
-  assert.equal(compareVersions(pkg.version.replace(/-.*$/, ''), '2.6.4'), 1);
+  // 升级链方向必须是 2.7.7 < 本地版本，且本地版本是 X.Y.Z 形态（compareVersions 只接受该形态）。
+  assert.equal(compareVersions(pkg.version, '2.7.7'), 1, `本地版本 ${pkg.version} 必须高于 2.7.7`);
+  const dbFile = path.join(root, 'data', 'platform.db');
+  try {
+    const now = { value: 1_000_000 };
+    const { engine, restarts } = setup(root, false, now, true, 'dsh-web', {}, true, '2.7.7', pkg.version);
+    // 复刻真实前提：2.7.7 进程正打开部署内 SQLite 文件句柄（Windows 上会阻止 rename 部署目录）。
+    rmSync(dbFile);
+    const sqlite = new DatabaseSync(dbFile);
+    sqlite.exec("CREATE TABLE probe (value TEXT); INSERT INTO probe VALUES ('kept');");
+    try {
+      assert.match(readFileSync(path.join(root, '.env'), 'utf8'), /^SETUP_KEY=test-setup-key$/m);
+      await runManualInstall(engine);
+      assert.equal(restarts(), 1, '升级完成后应触发一次服务重启');
+      // .env 保留原配置，并补写指向保留数据库的 MCP_DB_PATH。
+      const envAfter = readFileSync(path.join(root, '.env'), 'utf8');
+      assert.match(envAfter, /^SETUP_KEY=test-setup-key$/m);
+      assert.match(envAfter, /^MCP_DB_PATH=.*platform\.db$/m);
+      // 打开中的数据库句柄在升级后仍能读到原数据（data 目录未被移动）。
+      assert.equal(sqlite.prepare('SELECT value FROM probe').get()?.value, 'kept');
+      // 旧程序被替换为本地目标版本，旧程序文件不残留。
+      assert.equal((JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf8')) as { version: string }).version, pkg.version);
+      assert.equal(existsSync(path.join(root, 'obsolete-runtime.js')), false);
+      // profile 指向本部署目录，且链接到的包版本即升级目标。
+      const profile = JSON.parse(readFileSync(path.join(root, 'dsh-home', 'profiles', 'web', 'package.json'), 'utf8')) as { dependencies: Record<string, string> };
+      assert.equal(profile.dependencies['dsh-passwords'], `link:${root}`);
+      const linked = JSON.parse(readFileSync(path.join(root, 'dsh-home', 'profiles', 'web', 'node_modules', 'dsh-passwords', 'package.json'), 'utf8')) as { version: string };
+      assert.equal(linked.version, pkg.version);
+      assert.deepEqual(deploymentSiblings(root), [], '不应留下 staging/backup/failed/lock 残留');
+      assert.equal(existsSync(path.join(root, 'update')), false, '下载临时目录应被清理');
+    } finally {
+      sqlite.close();
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('固定部署自定义 env 文件名：只保留部署目录内的相对路径，越界与分隔异常拒绝', () => {
+  const root = path.join(tmpdir(), 'dshpw-env-scope');
+  // 未显式指定：返回 null，保持 .env 默认行为。
+  assert.equal(deploymentEnvFileRelativeEntry(root, ''), null);
+  assert.equal(deploymentEnvFileRelativeEntry(root, '   '), null);
+  // 部署目录内的相对路径按原样保留。
+  assert.equal(deploymentEnvFileRelativeEntry(root, path.join(root, '.env')), '.env');
+  assert.equal(deploymentEnvFileRelativeEntry(root, path.join(root, 'harness.env')), 'harness.env');
+  assert.equal(deploymentEnvFileRelativeEntry(root, path.join(root, 'config', 'app.env')), path.join('config', 'app.env'));
+  // 越界：等于部署目录本身，或位于其外部。
+  assert.equal(deploymentEnvFileRelativeEntry(root, root), null);
+  assert.equal(deploymentEnvFileRelativeEntry(root, path.join(root, '..', 'outside.env')), null);
+  if (process.platform !== 'win32') {
+    // POSIX 上反斜杠是合法文件名字符，下游会把它误当路径分隔符，必须拒绝。
+    assert.equal(deploymentEnvFileRelativeEntry(root, path.join(root, 'nested\\app.env')), null);
+  }
+});
+
+test('固定部署使用自定义 env 文件名（就地交换）：保留配置与打开的数据库句柄', async () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'dshpw-envname-'));
+  const envFile = path.join(root, 'harness.env');
+  const dbFile = path.join(root, 'data', 'platform.db');
+  try {
+    const now = { value: 1_000_000 };
+    const { engine, restarts } = setup(root, false, now, true, 'dsh-web', { DSH_PASSWORDS_ENV_FILE: envFile }, true);
+    writeFileSync(envFile, 'SETUP_KEY=custom-env-key\n');
+    // 复刻真实前提：部署内 SQLite 文件句柄处于打开状态，数据目录不得被移动。
+    rmSync(dbFile);
+    const sqlite = new DatabaseSync(dbFile);
+    sqlite.exec("CREATE TABLE probe (value TEXT); INSERT INTO probe VALUES ('kept');");
+    try {
+      await runManualInstall(engine);
+      assert.equal(restarts(), 1);
+      const envAfter = readFileSync(envFile, 'utf8');
+      assert.match(envAfter, /^SETUP_KEY=custom-env-key$/m, '自定义 env 文件必须原地保留');
+      assert.match(envAfter, /^MCP_DB_PATH=.*platform\.db$/m);
+      assert.equal(sqlite.prepare('SELECT value FROM probe').get()?.value, 'kept', '打开的数据库句柄必须原地保留');
+      assert.equal((JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf8')) as { version: string }).version, '2.6.3');
+      assert.equal(existsSync(path.join(root, 'obsolete-runtime.js')), false);
+      assert.deepEqual(deploymentSiblings(root), [], '不应留下 staging/backup/failed/lock 残留');
+    } finally {
+      sqlite.close();
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('固定部署使用自定义 env 文件名（整目录交换）：保留配置与数据', async () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'dshpw-envname-'));
+  const envFile = path.join(root, 'harness.env');
+  try {
+    const now = { value: 1_000_000 };
+    const { engine, restarts } = setup(root, false, now, true, 'dsh-web', { DSH_PASSWORDS_ENV_FILE: envFile }, false);
+    writeFileSync(envFile, 'SETUP_KEY=custom-env-key\n');
+    await runManualInstall(engine);
+    assert.equal(restarts(), 1);
+    const envAfter = readFileSync(envFile, 'utf8');
+    assert.match(envAfter, /^SETUP_KEY=custom-env-key$/m, '整目录交换后自定义 env 文件必须被移回部署目录');
+    assert.match(envAfter, /^MCP_DB_PATH=.*platform\.db$/m);
+    assert.equal(readFileSync(path.join(root, 'data', 'platform.db'), 'utf8'), 'user database\n');
+    assert.equal(existsSync(path.join(root, 'obsolete-runtime.js')), false);
+    assert.deepEqual(deploymentSiblings(root), [], '不应留下 staging/backup/failed/lock 残留');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('固定部署使用自定义 env 文件名时 profile 注册失败：回滚旧程序并保留配置', async () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'dshpw-envname-'));
+  const envFile = path.join(root, 'harness.env');
+  try {
+    const now = { value: 1_000_000 };
+    const { engine, ops, restarts } = setup(root, false, now, true, 'dsh-web', { DSH_PASSWORDS_ENV_FILE: envFile }, false);
+    writeFileSync(envFile, 'SETUP_KEY=custom-env-key\n');
+    let registrations = 0;
+    ops.runCommand = async (command, args) => {
+      if (command === process.execPath && args[0]?.endsWith('register-plugin.mjs')) {
+        registrations += 1;
+        return { ok: false, message: 'register boom' };
+      }
+      return { ok: true, message: '' };
+    };
+    await runManualInstall(engine);
+    assert.equal(restarts(), 0, '注册失败不得重启到未注册的新版本');
+    assert.equal(registrations, 2, '回滚后应尝试重新注册旧 profile');
+    assert.match(engine.status().lastError ?? '', /profile/);
+    assert.equal((JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf8')) as { version: string }).version, '2.6.2', '失败后必须回滚到旧程序');
+    assert.match(readFileSync(envFile, 'utf8'), /^SETUP_KEY=custom-env-key$/m, '回滚必须保留自定义 env 文件');
+    assert.equal(readFileSync(path.join(root, 'data', 'platform.db'), 'utf8'), 'user database\n');
+    assert.deepEqual(deploymentSiblings(root), [], '回滚后不应留下 staging/backup/failed/lock');
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 test('source archives without .git still use the npm update runtime', () => {
@@ -218,6 +351,13 @@ test('detectRuntime 把调用方 env 传入 npm 探测子进程', () => {
     assert.equal(detectRuntime(installRoot, env), 'npm-global', '探测子进程必须拿到调用方 env（npm --prefix 等配置随之生效）');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('普通 npm 更新只安装生产依赖并跳过第三方脚本', () => {
+  assert.deepEqual(npmGlobalInstallArgs('C:/cache/dsh-passwords-2.7.8.tgz'), [
+    'install', '-g', '--omit=dev', '--ignore-scripts', '--no-audit', '--no-fund', 'C:/cache/dsh-passwords-2.7.8.tgz',
+  ]);
+});
+
 
 test('container detection covers explicit runtime, data homes and standard container markers', () => {
   assert.equal(isContainerRuntime({ DSH_PASSWORDS_RUNTIME: 'docker' }, () => false), true);
@@ -600,6 +740,85 @@ test('Issue #33：profile 注册失败时固定部署替换回滚旧程序并保
     assert.equal(readFileSync(path.join(root, 'data', 'platform.db'), 'utf8'), 'user database\n');
     assert.deepEqual(deploymentSiblings(root), [], '回滚后不应留下 staging/backup/failed/lock');
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+// 2.7.7 → 本地 package 版本的注册失败恢复：新程序已进部署目录但 profile 切换失败时，
+// 必须回滚到 2.7.7 旧程序、保留 .env/data，并如实用旧 profile 重注册（不谎报升级成功）。
+test('2.7.7 → 本地版本升级时 profile 注册失败：回滚旧程序、保留 .env/data、二次注册旧 profile', async () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'dshpw-update-'));
+  const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as { version: string };
+  assert.equal(compareVersions(pkg.version, '2.7.7'), 1, `本地版本 ${pkg.version} 必须高于 2.7.7`);
+  try {
+    const now = { value: 1_000_000 };
+    // 用 inPlace=false 走整目录交换分支（Linux/systemd 非 git 固定部署的生产路径），
+    // 与保留用例的就地分支互补。
+    const { engine, ops, restarts } = setup(root, false, now, true, 'dsh-web', {}, false, '2.7.7', pkg.version);
+    let registrations = 0;
+    ops.runCommand = async (command, args) => {
+      if (command === process.execPath && args[0]?.endsWith('register-plugin.mjs')) {
+        registrations += 1;
+        return { ok: false, message: 'register boom' };
+      }
+      return { ok: true, message: '' };
+    };
+    await runManualInstall(engine);
+    assert.equal(restarts(), 0, '注册失败不得重启到未注册的新版本');
+    assert.equal(registrations, 2, '回滚后应尝试重新注册旧 profile');
+    assert.match(engine.status().lastError ?? '', /profile/);
+    // 必须回滚到 2.7.7 旧程序，旧文件归位。
+    assert.equal((JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf8')) as { version: string }).version, '2.7.7');
+    assert.equal(existsSync(path.join(root, 'obsolete-runtime.js')), true);
+    // 用户数据不受回滚影响。
+    assert.match(readFileSync(path.join(root, '.env'), 'utf8'), /^SETUP_KEY=test-setup-key$/m);
+    assert.equal(readFileSync(path.join(root, 'data', 'platform.db'), 'utf8'), 'user database\n');
+    assert.deepEqual(deploymentSiblings(root), [], '回滚后不应留下 staging/backup/failed/lock');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+// 回归：整目录交换回滚失败时，绝不能无条件删除仍含保留数据的 failedRoot。
+// 正向注册故意失败触发回滚，并在旧程序备份里把已空的证书父目录换成同名文件，
+// 让回滚把保留的 TLS 证书移回旧程序时确定性失败；此时 failedRoot 必须保留且证书完好。
+test('固定部署回滚失败时保留仍含保留数据的 failedRoot 并记录可操作错误', async () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'dshpw-rollback-'));
+  const cert = path.join(root, 'certs', 'tls.crt');
+  try {
+    const now = { value: 1_000_000 };
+    // inPlace=false 走整目录交换分支，才会退化到 rollbackFixedDeployment。
+    const { engine, ops, restarts } = setup(root, false, now, true, 'dsh-web', { MCP_GATEWAY_TLS_CERT: cert }, false);
+    mkdirSync(path.dirname(cert), { recursive: true });
+    writeFileSync(cert, 'tls certificate\n');
+    let registrations = 0;
+    ops.runCommand = async (command, args) => {
+      if (command === process.execPath && args[0]?.endsWith('register-plugin.mjs')) {
+        registrations += 1;
+        // 正向注册失败以触发回滚；同时把旧程序备份中已空的保留项父目录占成文件，
+        // 使回滚 movePreservedEntries 重建 certs 目录时确定性抛错。
+        const backupName = deploymentSiblings(root).find((name) => name.includes('.backup-'));
+        assert.ok(backupName, '回滚前应存在旧程序备份目录');
+        const blocker = path.join(path.dirname(root), backupName, 'certs');
+        rmdirSync(blocker);
+        writeFileSync(blocker, 'blocked\n');
+        return { ok: false, message: 'register boom' };
+      }
+      return { ok: true, message: '' };
+    };
+    await runManualInstall(engine);
+    assert.equal(restarts(), 0, '回滚失败不得重启到未注册的新版本');
+    assert.equal(registrations, 1, '回滚移动保留项即失败，不应再注册旧 profile');
+    assert.match(engine.status().lastError ?? '', /回滚未完成/);
+    const failedName = deploymentSiblings(root).find((name) => name.includes('.failed-'));
+    assert.ok(failedName, '回滚失败必须保留 failedRoot，而不是无条件删除');
+    // 未移出的保留数据仍在 failedRoot 中，未被删除。
+    assert.equal(readFileSync(path.join(path.dirname(root), failedName, 'certs', 'tls.crt'), 'utf8'), 'tls certificate\n');
+    // 已移出的保留数据也不丢失，仍在旧程序备份里等待人工恢复。
+    const backupName = deploymentSiblings(root).find((name) => name.includes('.backup-'));
+    assert.ok(backupName, '回滚未完成时必须保留旧程序备份');
+    assert.match(readFileSync(path.join(path.dirname(root), backupName, '.env'), 'utf8'), /^SETUP_KEY=test-setup-key$/m);
+    assert.equal(readFileSync(path.join(path.dirname(root), backupName, 'data', 'platform.db'), 'utf8'), 'user database\n');
+  } finally {
+    for (const name of deploymentSiblings(root)) rmSync(path.join(path.dirname(root), name), { recursive: true, force: true });
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('update status polling is background traffic, while user actions remain activity', () => {

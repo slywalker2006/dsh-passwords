@@ -35,6 +35,114 @@ export function internalProbeTimeoutMs(env: NodeJS.ProcessEnv = process.env): nu
   return Number.isFinite(raw) && raw >= 1_000 && raw <= 600_000 ? raw : 10_000;
 }
 
+/**
+ * internal/assignable-resources 探针的响应体上限。
+ *
+ * 该端点旧实现把响应缓冲硬编码在 256 KiB 之内，清单随工作区/会话规模增长后，一份
+ * 完全合法的清单会被这个固定上限拒绝，直接让管理员保存权限失败（R4）。真正的容量
+ * 约束是条目数上限（folders ≤ 10_000、assignable/retained sessions 各 ≤ 20_000）；
+ * 这里的字节上限只负责让缓冲内存有界，不参与条目判定。取 160 MiB 是为了覆盖条目
+ * 上限内的合法清单经 UTF-8/JSON 放大后的字节数，超出才 fail-closed。解析只拒绝
+ * U+0000–U+001F 控制字符，合法 Unicode 路径/ID（含非 ASCII）原样保留。
+ */
+export const ASSIGNABLE_RESOURCES_MAX_BYTES = 160 * 1024 * 1024;
+
+type AssignableResources = {
+  folders: Set<string>;
+  assignableSessions: Set<string>;
+  retainedSessions: Set<string>;
+};
+
+/**
+ * 解析 assignable-resources 清单：字段/条目任一不符契约（ok≠true、缺数组、含非法元素、
+ * 超条目上限）一律返回 null，调用方 fail-closed，绝不把截断/伪造清单当成权威资源。
+ */
+export function parseAssignableResources(raw: Buffer): AssignableResources | null {
+  try {
+    const parsed = JSON.parse(raw.toString('utf8')) as Record<string, unknown>;
+    let rawAssignable: unknown;
+    if (parsed.assignableSessions === undefined) {
+      rawAssignable = parsed.sessions;
+    } else if (!Array.isArray(parsed.assignableSessions)) {
+      return null;
+    } else if (parsed.sessions !== undefined) {
+      if (!Array.isArray(parsed.sessions)) return null;
+      const canonical = new Set(parsed.assignableSessions);
+      const legacy = new Set(parsed.sessions);
+      if (canonical.size !== legacy.size || [...canonical].some((id) => !legacy.has(id))) return null;
+      rawAssignable = parsed.assignableSessions;
+    } else {
+      rawAssignable = parsed.assignableSessions;
+    }
+    if (parsed.ok !== true || !Array.isArray(parsed.folders) || !Array.isArray(rawAssignable)) return null;
+    if (!Array.isArray(parsed.retainedSessions)) return null;
+    const rawRetained = parsed.retainedSessions;
+    const validResourceString = (value: unknown, maxLength: number): value is string =>
+      typeof value === 'string' && value.length > 0 && value.length <= maxLength && !/[\u0000-\u001f]/.test(value);
+    const folders = parsed.folders.filter((value): value is string => validResourceString(value, 4096));
+    const assignableSessions = rawAssignable.filter((value): value is string => validResourceString(value, 200));
+    const retainedSessions = rawRetained.filter((value): value is string => validResourceString(value, 200));
+    if (folders.length !== parsed.folders.length || assignableSessions.length !== rawAssignable.length || retainedSessions.length !== rawRetained.length || folders.length > 10_000 || assignableSessions.length > 20_000 || retainedSessions.length > 20_000) {
+      return null;
+    }
+    const assignableSet = new Set(assignableSessions);
+    const retainedSet = new Set(retainedSessions);
+    if ([...assignableSet].some((id) => retainedSet.has(id))) return null;
+    return { folders: new Set(folders.map(normalizePath)), assignableSessions: assignableSet, retainedSessions: retainedSet };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 有界读取上游响应体。resolve 覆盖所有终止形态：正常 'end'（返回缓冲体）、超出 maxBytes
+ * 或连接中断（'aborted'/'error'/'close' 早于 'end'，返回 null 并销毁 socket）。
+ *
+ * R2：截断响应（连接结束但从未 emit 'end'）必须在这里有界结束，不能等独立的探测
+ * 超时——否则探针 Promise 永不 settle，管理员保存请求会一直挂起。maxMs 是墙钟截止
+ * 时间，独立于 socket 空闲超时，防止持续 trickle 永久延长请求。'close' 在正常响应里
+ * 排在 'end' 之后（settled 哨兵使其 no-op），只在截断时先于 'end' 触发。
+ */
+export function readBoundedResponseBody(
+  response: IncomingMessage,
+  maxBytes: number,
+  maxMs = 10_000,
+): Promise<Buffer | null> {
+  return new Promise((resolve) => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    let settled = false;
+    let timer: NodeJS.Timeout | undefined;
+    // settled 哨兵而非 in-flight 摘监听器：'error' 监听必须留到流真正结束，
+    // 否则截断/超限后迟到的 socket error 会变成 uncaughtException。
+    const settle = (value: Buffer | null): void => {
+      if (settled) return;
+      settled = true;
+      if (timer !== undefined) clearTimeout(timer);
+      resolve(value);
+    };
+    timer = setTimeout(() => {
+      response.destroy();
+      settle(null);
+    }, maxMs);
+    timer.unref?.();
+    response.on('data', (chunk: Buffer) => {
+      if (settled) return;
+      size += chunk.length;
+      if (size > maxBytes) {
+        response.destroy();
+        settle(null);
+        return;
+      }
+      chunks.push(chunk);
+    });
+    response.on('end', () => settle(Buffer.concat(chunks)));
+    response.on('aborted', () => settle(null));
+    response.on('error', () => settle(null));
+    response.on('close', () => settle(null));
+  });
+}
+
 const WebSocket = require('ws') as {
   OPEN: number;
   WebSocket: new (url: string, options?: {
@@ -48,7 +156,7 @@ const WebSocket = require('ws') as {
   };
 };
 import type { PlatformConfig } from './config.js';
-import { hardenSecretsAfterSetup, readEndpointRuntimeConfig } from './config.js';
+import { hardenSecretsAfterSetup, readEndpointRuntimeConfig, resolveRemoteMuxConfig } from './config.js';
 import { AuthService, AuthError, type RequestMeta } from './auth.js';
 import { Database, PermissionStateConflictError, SessionGrantsConflictError, canonicalForMatch, pathWithinDeletedTree, samePathForMatch, type UserPermissionsRow, type WorkspaceCleanupIntent } from './db.js';
 import {
@@ -66,7 +174,9 @@ import {
   isWorkspaceCreate,
   isWorkspaceDirectoryCreate,
   isWorkspaceDeleteOrRename,
+  isAbsoluteLikePath,
   isDirectoryListRequest,
+  isFullyQualifiedPath,
   isUploadRequest,
   isGitRequest,
   pathWithin,
@@ -116,10 +226,14 @@ import { registerMessageRoutes } from './messages.js';
 import { registerAdminRoutes } from './admin.js';
 import { createSandboxApplier, registerProxyRoutes } from './proxy.js';
 import { SseFrameBuffer } from './sse-frames.js';
+import { createSensitivePathChecker } from './sensitive-paths.js';
+import { loadingTimeline } from './loading-timeline.js';
 
 /** 网关内部扩展请求：权限执行时把用户/权限附在 req 上，供后续中间件与代理读取 */
 type Req = Request & {
   dshpwUser?: number;
+  /** 已认证用户名（审计用 actor 归属）；权限行仍只挂子用户。 */
+  dshpwUsername?: string;
   dshpwPerms?: UserPermissionsRow;
   /** 会话目录白名单校验用：本次请求判定出的目标工作区路径（session.create/fork 时）；
    *  由 needsFolderCheck 写入，供 session.create 响应回调记录 sessionId→cwd 缓存 */
@@ -150,12 +264,13 @@ const AGENT_PRESET_SELECT_RE = /^\/api\/agentPresets?[.\/]select$/;
 const AGENT_PRESET_LIST_RE = /^\/api\/agentPresets?[.\/]list$/;
 const AGENT_PRESET_MUTATION_RE = /^\/api\/agentPresets?[.\/](?:copy|openDocument|remove|read|deletePreset)$/;
 
-/** DSH 官方 terminal HTTP unary RPC：主用户直通，子用户真实能力始终拒绝。 */
+/** DSH 官方 terminal HTTP unary RPC：主用户直通，子用户由 allowSsh 控制。 */
 const OFFICIAL_TERMINAL_HTTP_RE = /^\/api\/terminal[.\/](?:environment|shells|list|create|write|resize|rename|close)$/;
-/** DSH 官方 terminal Remote 流：主用户直通，子用户逐逻辑流拒绝。 */
+/** DSH 官方 terminal Remote 流：主用户直通，子用户由 allowSsh 控制。 */
 const OFFICIAL_TERMINAL_REMOTE_ENDPOINTS = new Set(['terminal/follow', 'terminal/retain']);
 /** 子用户 terminal UX 桩路径（点号/斜杠两种官方写法）：list / environment /
- *  shells / close。对子用户只回不放开能力的 server-response，见下方中间件。 */
+ *  shells / close。allowSsh 关闭时只回不放开能力的 server-response，见下方中间件；
+ *  allowSsh 开启后这些请求也原样透传。 */
 const TERMINAL_STUB_RE = /^\/api\/terminal[.\/](list|environment|shells|close)$/;
 
 /** 与 Remote mux 侧共用：两条通道对同一个「terminal 不可用」失败给出同一文案。 */
@@ -317,7 +432,7 @@ function workspaceFileScopeRequest(
  */
 function resolveWorkspaceFileTarget(root: string, requestedPath: string, relativePath: string | null): string | null {
   const normalizedRoot = normalizePath(root);
-  const base = path.isAbsolute(requestedPath)
+  const base = isAbsoluteLikePath(requestedPath)
     ? normalizePath(requestedPath)
     : normalizePath(`${normalizedRoot}/${requestedPath}`);
   if (relativePath === null) return base;
@@ -1221,84 +1336,6 @@ function renderSetupPage(params: { lang: Lang; error?: string; csrf: string }): 
   });
 }
 
-/**
- * F-A2 隐藏 Unicode 清洗的字节级流（插件面板流式文本内容用）：
- * 按 UTF-8 字节模式剥离零宽/bidi 等隐形字符序列，跨 chunk 安全。
- * 用 latin1 做 1:1 字节映射，正则匹配字节序列，不破坏任何非目标字节。
- *
- * tail 策略：保留尾部「可能不完整的多字节 UTF-8 序列」——固定保留 3 字节会把
- * 完整零宽序列（如 E2 80 8B）拆散到 body/tail 两侧，永远无法被正则匹配（实测）。
- * 这里从尾部倒查：找到最后一个非续字节（0x80-0xBF 之外），若其声明长度 > 已见
- * 字节数则整体保留，否则全部进 body。
- */
-// 目标字符的 UTF-8 字节序列（latin1 字符串形式，逐字节 1:1）
-//   E2 80 8B-8F：ZWSP/ZWNJ/ZWJ/LRM/RLM
-//   E2 80 AA-AE：LRE/RLE/PDF/LRO/RLO（bidi）
-//   E2 81 A0-A9：WJ + 隐形运算符 + 新 bidi 隔离（LRI/RLI/FSI/PDI）
-//   EF BB BF：BOM/ZWNBSP
-//   C2 AD：软连字符 SHY
-//   E1 80 8E：蒙古元音分隔符 MVS
-//   CD 8F：组合字连接符 CGJ
-//   D8 9C：阿拉伯字母标记 ALM
-//   E1 85 9F/A0：谚文填充符
-const HIDDEN_BYTES_RE =
-  /(?:\xe2\x80[\x8b-\x8f\xaa-\xae]|\xe2\x81[\xa0-\xa9]|\xef\xbb\xbf|\xc2\xad|\xe1\x80\x8e|\xcd\x8f|\xd8\x9c|\xe1\x85[\x9f\xa0])/g;
-
-function stripHiddenUnicodeBytes(buf: Buffer): Buffer {
-  return Buffer.from(buf.toString('latin1').replace(HIDDEN_BYTES_RE, ''), 'latin1');
-}
-
-function incompleteTailLen(buf: Buffer): number {
-  const len = buf.length;
-  if (len === 0) return 0;
-  const last = buf[len - 1];
-  if (last < 0x80) return 0; // ASCII：无跨 chunk 风险
-  let n = 0; // 尾部续字节数
-  for (let i = len - 1; i >= 0 && i >= len - 4; i--) {
-    const b = buf[i];
-    if ((b & 0xc0) === 0x80) {
-      n++;
-      continue;
-    }
-    let total = 0;
-    if ((b & 0xe0) === 0xc0) total = 2;
-    else if ((b & 0xf0) === 0xe0) total = 3;
-    else if ((b & 0xf8) === 0xf0) total = 4;
-    else return 0; // 异常字节：不保留
-    const have = n + 1;
-    return have < total ? have : 0;
-  }
-  return n; // 全为续字节（异常）：保留，等下一个首字节再判定
-}
-
-function hiddenUnicodeStripStream(): Transform {
-  let tail: Buffer = Buffer.alloc(0);
-  return new Transform({
-    transform(chunk: Buffer, _enc, cb) {
-      const buf = tail.length > 0 ? Buffer.concat([tail, chunk]) : chunk;
-      const keep = incompleteTailLen(buf);
-      const body = buf.subarray(0, buf.length - keep);
-      tail = buf.subarray(buf.length - keep);
-      cb(null, stripHiddenUnicodeBytes(body));
-    },
-    flush(cb) {
-      cb(null, stripHiddenUnicodeBytes(tail));
-    },
-  });
-}
-
-/** 是否为文本类 content-type（二进制/图片/压缩包不做字节清洗，防损坏） */
-function isTextContentType(contentType: string): boolean {
-  const t = contentType.split(';')[0].trim().toLowerCase();
-  if (t === '') return false;
-  if (t.startsWith('text/')) return true;
-  return (
-    /^application\/(json|xml|javascript|x-www-form-urlencoded|yaml|x-yaml|rtf|graphql|toml|x-toml)(\s*|\+.*)$/.test(t) ||
-    /\+json$/.test(t) ||
-    /\+xml$/.test(t)
-  );
-}
-
 /** F-A2：递归清洗 JSON 里所有字符串字段的隐藏 Unicode（read 端点返回文件内容） */
 function sanitizeHiddenUnicodeJson(value: unknown, depth = 0): unknown {
   if (depth > 8 || value === null) return value;
@@ -1367,6 +1404,11 @@ export function createGatewayServer(
   // 测试服务器由本机反向代理转发；只信任 loopback，恢复按真实客户端
   // X-Forwarded-For 计算的 req.ip，同时避免信任公网伪造的代理头。
   app.set('trust proxy', 'loopback');
+  // 请求是否应视为 HTTPS：网关自身 TLS，或受信本地反代转发的
+  // X-Forwarded-Proto=https（trust proxy=loopback 保证只有回环对端生效，公网直连
+  // 伪造该头无效）。nginx/caddy 在 80/443 终结 TLS 时网关收到的是明文 HTTP，
+  // 仅凭 config.gateway.tls 会把会话/CSRF/语言 Cookie 漏掉 Secure 标志。
+  const requestIsSecure = (req: Request): boolean => config.gateway.tls !== null || req.secure;
   // ── 传统端点登记表（代码不内置扩展路径）──
   // owner: 和其余 SSH/宿主登记项都只供主用户使用；
   // DSH 运行时已登记的普通扩展面由动态清单直接放行，不经过这张表。
@@ -1386,7 +1428,7 @@ export function createGatewayServer(
   const csrfSecret = createHash('sha256').update('dshpw-csrf:' + config.jwtSecret).digest('hex');
 
   // HTTPS 模式：全站 HSTS（浏览器强制后续走 HTTPS）+ 会话 Cookie 加 Secure
-  //（Cookie 标志在登录处理器内按 config.gateway.tls 决定）
+  //（Cookie 标志在写入处按 requestIsSecure 决定：网关 TLS 或受信反代 https）
   if (config.gateway.tls !== null) {
     app.use((_req, res, next) => {
       res.setHeader('Strict-Transport-Security', 'max-age=31536000');
@@ -1599,9 +1641,17 @@ export function createGatewayServer(
     ? new https.Agent({ keepAlive: true, maxSockets: 64, keepAliveMsecs: 30_000, rejectUnauthorized: process.env.MCP_GATEWAY_UPSTREAM_TLS_VERIFY !== '0' })
     : new http.Agent({ keepAlive: true, maxSockets: 64, keepAliveMsecs: 30_000 });
 
-  type AssignableResources = { folders: Set<string>; sessions: Set<string> };
-
   const fetchAssignableResources = (): Promise<AssignableResources | null> => new Promise((resolve) => {
+    let settled = false;
+    const timeoutMs = internalProbeTimeoutMs();
+    const deadline = Date.now() + timeoutMs;
+    let deadlineTimer: NodeJS.Timeout | undefined;
+    const finish = (value: AssignableResources | null): void => {
+      if (settled) return;
+      settled = true;
+      if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
+      resolve(value);
+    };
     const request = upstreamTransport.request({
       hostname: upstreamHost,
       port: upstreamPort,
@@ -1613,32 +1663,19 @@ export function createGatewayServer(
         ...(upstreamAuthCookie === '' ? {} : { cookie: upstreamAuthCookie }),
       },
       agent: upstreamAgent,
-      timeout: internalProbeTimeoutMs(),
+      timeout: timeoutMs,
     }, (response) => {
-      const chunks: Buffer[] = [];
-      let size = 0;
-      response.on('data', (chunk: Buffer) => {
-        size += chunk.length;
-        if (size <= 256 * 1024) chunks.push(chunk);
-      });
-      response.on('end', () => {
-        if (response.statusCode !== 200 || size > 256 * 1024) { resolve(null); return; }
-        try {
-          const parsed = JSON.parse(Buffer.concat(chunks).toString('utf8')) as Record<string, unknown>;
-          if (parsed.ok !== true || !Array.isArray(parsed.folders) || !Array.isArray(parsed.sessions)) { resolve(null); return; }
-          const folders = parsed.folders.filter((value): value is string => typeof value === 'string' && value.length > 0 && value.length <= 4096);
-          const sessions = parsed.sessions.filter((value): value is string => typeof value === 'string' && value.length > 0 && value.length <= 200);
-          if (folders.length !== parsed.folders.length || sessions.length !== parsed.sessions.length || folders.length > 10_000 || sessions.length > 20_000) {
-            resolve(null); return;
-          }
-          resolve({ folders: new Set(folders.map(normalizePath)), sessions: new Set(sessions) });
-        } catch {
-          resolve(null);
-        }
+      const remainingMs = Math.max(1, deadline - Date.now());
+      void readBoundedResponseBody(response, ASSIGNABLE_RESOURCES_MAX_BYTES, remainingMs).then((body) => {
+        // body === null 涵盖超限与截断：两者都必须 fail-closed，不得用半截清单授权。
+        if (body === null || response.statusCode !== 200) { finish(null); return; }
+        finish(parseAssignableResources(body));
       });
     });
-    request.on('error', () => resolve(null));
-    request.on('timeout', () => { request.destroy(); resolve(null); });
+    deadlineTimer = setTimeout(() => { request.destroy(); finish(null); }, timeoutMs);
+    deadlineTimer.unref?.();
+    request.on('error', () => finish(null));
+    request.on('timeout', () => { request.destroy(); finish(null); });
     request.end();
   });
 
@@ -1658,6 +1695,9 @@ export function createGatewayServer(
   // 更新的快照）。它不是授权版本：授权回写栅栏必须用 userAccessEpoch，绝不能把
   // 这个全局计数器当作授权 revision（详见 replaceUserSessionAccess 的注释）。
   let workspaceListRequestRevision = 0;
+  /** 分配一个新的列表请求序号。workspace.list 与归档动作共用它：归档动作也推进序号，
+   *  令在途的更旧 workspace.list 响应失去回滚该用户归档投影的资格。 */
+  const bumpWorkspaceListRequestRevision = (): number => ++workspaceListRequestRevision;
 
   // 普通用户各自独立的会话授权快照：不能用全局 sessionId → cwd 映射，
   // 否则一个用户的 workspace.list 会给另一个用户的 session RPC 提供授权依据。
@@ -1736,7 +1776,7 @@ export function createGatewayServer(
   // alpha.3 opens session.list and workspace/follow independently. session.list must
   // wait for the latter's filtered baseline, but an invalidated old baseline is not a
   // valid replacement. Only replaceUserSessionAccess may wake this wait.
-  const waitForUserSessionAccess = (userId: number, timeoutMs = 5_000, requireWorkspacePaths = false): Promise<boolean> => {
+  const awaitUserSessionAccess = (userId: number, timeoutMs = 5_000, requireWorkspacePaths = false): Promise<boolean> => {
     const ready = () => userSessionAccess.has(userId) && (!requireWorkspacePaths || userWorkspacePaths.has(userId));
     if (ready()) return Promise.resolve(true);
     return new Promise((resolve) => {
@@ -1759,6 +1799,14 @@ export function createGatewayServer(
       userSessionAccessWaiters.set(userId, waiters);
     });
   };
+  // 观测：baseline 有界等待耗时与结果。只记录数值/布尔，不涉及任何请求内容；
+  // 时间线关闭时 spanAsync 直接透传原 Promise，不改变语义。
+  const waitForUserSessionAccess = (userId: number, timeoutMs?: number, requireWorkspacePaths?: boolean): Promise<boolean> =>
+    loadingTimeline.spanAsync(
+      'baseline.wait',
+      () => awaitUserSessionAccess(userId, timeoutMs, requireWorkspacePaths),
+      (ready) => ({ ok: ready }),
+    );
   const userSessionAccessFor = (userId: number): Map<string, string> => userSessionAccess.get(userId) ?? new Map();
   const userAccessEpochFor = (userId: number): number => userAccessEpoch.get(userId) ?? 0;
   /** 推进该用户的授权 epoch（授权/权限实际变更时调用）；单调递增，绝不回退。 */
@@ -1838,6 +1886,11 @@ export function createGatewayServer(
     remoteMuxClientsByUser.delete(userId);
     // 同上：连接关闭会回调 unregisterClient，必须先复制后逐个关闭。
     for (const connection of [...clients]) {
+      // 先经受限 teardown 立即收敛发送器/心跳、锁定 permission-revoked 首因诊断并 arm 5s grace，
+      // 再下发既有的 socket close/terminate（保留既有 code/reason 与权限行为）。
+      try { connection.teardownCarrier(code); } catch {
+        // teardown 失败不能阻断撤销：仍按既有路径关闭连接。
+      }
       try {
         if (connection.socket.readyState === WebSocket.OPEN) connection.socket.close(code, reason);
         else connection.socket.terminate();
@@ -2254,14 +2307,16 @@ export function createGatewayServer(
   const REMOTE_MUX_MAX_PAYLOAD_BYTES = 100 * 1024 * 1024;
   const REMOTE_MUX_MAX_STREAMS = 64;
   const REMOTE_MUX_MAX_PENDING_BYTES = 2 * 1024 * 1024;
-  const REMOTE_MUX_HEARTBEAT_INTERVAL_MS = 2_000;
-  const REMOTE_MUX_MAX_MISSED_HEARTBEATS = 2;
+  // Remote mux 心跳/写停滞期限来自已验证配置（loadConfig 解析 MCP_GATEWAY_MUX_*）；
+  // 直接以字面量构造 PlatformConfig 的调用方（测试）缺省时按同一解析器回退默认。
+  const remoteMuxConfig = config.mux ?? resolveRemoteMuxConfig();
 
   const upstreamWsOptions = (): {
     headers: Record<string, string>;
     rejectUnauthorized?: boolean;
     agent?: any;
     maxPayload: number;
+    perMessageDeflate: false;
   } => ({
     headers: {
       host: upstreamAuthority,
@@ -2273,6 +2328,7 @@ export function createGatewayServer(
       agent: upstreamAgent,
     } : {}),
     maxPayload: REMOTE_MUX_MAX_PAYLOAD_BYTES,
+    perMessageDeflate: false,
   });
 
   /**
@@ -2406,6 +2462,12 @@ export function createGatewayServer(
     socket: any;
     publishSessionAttachment: (sessionId: string, cwd: string) => void;
     publishWorkspaceUpsert: (workspace: Record<string, unknown>) => void;
+    /**
+     * 权限/身份撤销的受限入口：gateway 在下发 socket.close 之前调用它，立即 dispose 两条腿的
+     * 发送器与心跳、把诊断首因锁定为 permission-revoked 并 arm 5s grace；物理 socket 关闭仍由
+     * gateway 保留。只接受受限的关闭码，不向调用方暴露内部状态；重复调用幂等。
+     */
+    teardownCarrier: (code?: number) => void;
   };
   type RemoteEventOwnership = {
     userId: number;
@@ -2451,8 +2513,11 @@ export function createGatewayServer(
     address.kind === 'session' ? address.sessionId : address.parentSessionId;
   const sessionFollowTargetId = (address: NonNullable<ReturnType<typeof parseSessionAddress>>): string =>
     address.kind === 'session' ? address.sessionId : address.childSessionId;
-  const sessionFollowIdentityAllowed = (userId: number, address: NonNullable<ReturnType<typeof parseSessionAddress>>): boolean =>
-    authorizedSubuserSessionRoot(userId, sessionAuthorizationId(address), effectivePermissions(userId)) !== null;
+  const sessionFollowIdentityAllowed = (
+    userId: number,
+    address: NonNullable<ReturnType<typeof parseSessionAddress>>,
+    perms: UserPermissionsRow = effectivePermissions(userId),
+  ): boolean => authorizedSubuserSessionRoot(userId, sessionAuthorizationId(address), perms) !== null;
   /**
    * 子用户「该会话现在可否被访问」的唯一判定（HTTP 与 Remote 两条通道同口径）：
    *   · 必须命中该用户的会话授权快照（baseline 已给出可信 cwd）；
@@ -2540,9 +2605,12 @@ export function createGatewayServer(
     if (target === null) return null;
     const rootCanonical = canonicalizePathBestEffort(root);
     const targetCanonical = canonicalizePathBestEffort(target);
+    // 与 HTTP workspaceFiles 检查（proxy.ts 的 needsWorkspaceFilesCheck）同口径：通过
+    // 会话根/白名单/归属后仍须拒绝敏感路径。管理员可能把敏感目录的祖先误登记为工作区，
+    // 此时目标会同时命中白名单与归属，只有敏感基能挡住文件变化流。
     if (!pathWithin(target, root) || !pathWithin(targetCanonical, rootCanonical) ||
       !folderAllowed(target, perms.allowed_folders) || !folderAllowed(targetCanonical, perms.allowed_folders) ||
-      workspaceSubtreeOverlap(userId, target)) return null;
+      workspaceSubtreeOverlap(userId, target) || isSensitivePath(target) || isSensitivePath(targetCanonical)) return null;
     return { scopeId: request.scopeId, root, target, rootCanonical, targetCanonical };
   };
   const sessionFollowSnapshotMatches = (address: NonNullable<ReturnType<typeof parseSessionAddress>>, value: unknown): boolean => {
@@ -2687,7 +2755,7 @@ export function createGatewayServer(
     // anything racing behind that close.
     if (state.endpoint === 'session/follow') {
       const address = state.followAddress;
-      if (address === null || address === undefined || !sessionFollowIdentityAllowed(userId, address)) return null;
+      if (address === null || address === undefined || !sessionFollowIdentityAllowed(userId, address, fallbackPerms)) return null;
       if (!state.followSnapshotSeen) {
         if (!sessionFollowSnapshotMatches(address, value)) return null;
         state.followSnapshotSeen = true;
@@ -2715,7 +2783,10 @@ export function createGatewayServer(
     const allowedSession = (id: unknown): id is string => {
       if (typeof id !== 'string' || access === undefined || perms.disabled_sessions.includes(id)) return false;
       const workspacePath = access.get(id);
-      return workspacePath !== undefined && (currentGrants.has(id) || workspaceOwnedByUser(userId, workspacePath));
+      return workspacePath !== undefined &&
+        (currentGrants.has(id) || workspaceOwnedByUser(userId, workspacePath)) &&
+        folderAllowed(workspacePath, perms.allowed_folders) &&
+        !workspaceOwnedByAnotherSubuser(userId, workspacePath);
     };
     const workspacePathAllowed = (row: Record<string, unknown>): boolean => {
       const pathValue = row.path;
@@ -2760,6 +2831,7 @@ export function createGatewayServer(
         pathWithin(changedCanonical, state.workspaceFileRootCanonical);
       if (!withinTarget || !withinRoot ||
         (!folderAllowed(changedPath, perms.allowed_folders) && !folderAllowed(changedCanonical, perms.allowed_folders)) ||
+        isSensitivePath(changedPath) || isSensitivePath(changedCanonical) ||
         workspaceOwnedByAnotherSubuser(userId, changedPath)) return null;
       return frame;
     }
@@ -2876,7 +2948,14 @@ export function createGatewayServer(
         return { type: 'order', workspaceIds: ids };
       }
       if (frame.type === 'archived' && Array.isArray(frame.archivedSessionIds)) {
-        return { type: 'archived', archivedSessionIds: frame.archivedSessionIds.filter(allowedSession) };
+        const projected = frame.archivedSessionIds.filter(allowedSession);
+        if (access !== undefined) {
+          // 归档动作是权威投影：立即刷新该用户的内存归档集合（只含已授权会话），并推进
+          // 同一用户列表顺序水位，令在途更旧的 workspace.list 响应无法回滚它。
+          userArchivedSessionIds.set(userId, new Set(projected));
+          replaceUserSessionAccess(userId, access, userAccessEpochFor(userId), bumpWorkspaceListRequestRevision());
+        }
+        return { type: 'archived', archivedSessionIds: projected };
       }
       if (frame.type === 'pinned' && Array.isArray(frame.pinnedSessionIds)) {
         return { type: 'pinned', pinnedSessionIds: frame.pinnedSessionIds.filter(allowedSession) };
@@ -3013,6 +3092,17 @@ export function createGatewayServer(
     ? path.dirname(path.resolve(process.env.DSH_PASSWORDS_ENV_FILE.trim()))
     : gatewayRoot;
 
+  // 敏感路径屏蔽（与 admin.ts /gateway/api/download 同口径，实现见 sensitive-paths.ts）：
+  // 基列表与惰性缓存共享，避免两处漂移。workspaceFiles 与 /api/file 在通过会话/白名单/
+  // 归属之后仍须独立拒绝这些路径：管理员可能把敏感目录的祖先误登记为工作区，此时目标
+  // 会同时命中白名单与归属，只有敏感基能挡住。
+  const { isSensitivePath } = createSensitivePathChecker({
+    dbPath: config.dbPath,
+    dshRoot: config.patch.dshRoot,
+    gatewayRoot,
+    configuredRoot,
+  });
+
   /**
    * 从 Cookie 校验会话；返回用户或 null（用户已不存在时旧 token 立即失效）。
    * 性能：同一 token 的验签 + 用户存在性查询结果缓存 30 秒——每个代理
@@ -3062,8 +3152,12 @@ export function createGatewayServer(
       // F-04：登出后的 token 立即拒绝（不重新进入缓存）
       if (isTokenRevoked(token)) return null;
       // 用户被删除/重置/改密后旧会话必须失效（缓存有效期 30 秒内生效）
-      const row = db.getUserByUsername(user.username);
+      // 按 sub（用户 ID）定位，而非按 token.username：否则用户改名后新建同名用户，
+      // 旧 token 会以新用户身份（sub 仍是旧 ID）通过校验。ID 命中后仍比对用户名，
+      // 确保被指向的用户确实是 token 签发时的那个身份。
+      const row = db.getUserById(user.userId);
       if (row === null) return null;
+      if (row.username !== user.username) return null;
       if (user.cv !== row.credential_version) return null;
       // 缓存 TTL 与 JWT 到期时间取最小值：否则刚过期就被缓存的 token 会在
       // 命中路径上绕过验签，额外存活最多 30 秒
@@ -3089,7 +3183,7 @@ export function createGatewayServer(
         allow_upload: false,
         allow_workspace_create: false,
         allow_ssh: false,
-        allowed_agent_presets: [],
+        allowed_agent_presets: null,
         allowed_models: null,
         allow_chat_media: false,
         // F-12 残余: 新子用户默认禁 git 下载（含插件下载等外带通道），
@@ -3147,12 +3241,12 @@ export function createGatewayServer(
       existingCsrf !== null && csrfMatches(csrfSecret, existingCsrf, existingCsrf)
         ? existingCsrf
         : newCsrfToken(csrfSecret);
-    setCsrfCookie(res, csrf, config.gateway.tls !== null);
+    setCsrfCookie(res, csrf, requestIsSecure(req));
     // 显式 ?lang= 选择持久化到 cookie（语言切换链接点出来的）。
     // 注意 Set-Cookie 头已由 CSRF 占用，这里用数组追加而不是 setHeader 覆盖。
     if (queryLang === 'zh' || queryLang === 'en') {
       const langCookie = `${LANG_COOKIE}=${queryLang}; Path=/gateway; SameSite=Lax; Max-Age=31536000${
-        config.gateway.tls !== null ? '; Secure' : ''
+        requestIsSecure(req) ? '; Secure' : ''
       }`;
       const existing = res.getHeader('Set-Cookie');
       const prev: string[] = Array.isArray(existing)
@@ -3206,7 +3300,7 @@ export function createGatewayServer(
     const csrfField = typeof req.body?.csrf === 'string' ? req.body.csrf : '';
     if (!csrfMatches(csrfSecret, readCookie(req.headers.cookie, CSRF_COOKIE), csrfField)) {
       const csrf = newCsrfToken(csrfSecret);
-      setCsrfCookie(res, csrf, config.gateway.tls !== null);
+      setCsrfCookie(res, csrf, requestIsSecure(req));
       res
         .status(403)
         .type('html')
@@ -3235,7 +3329,7 @@ export function createGatewayServer(
             ? error.message
             : t(lang, 'gw.initFailed');
       const csrf = newCsrfToken(csrfSecret);
-      setCsrfCookie(res, csrf, config.gateway.tls !== null);
+      setCsrfCookie(res, csrf, requestIsSecure(req));
       res.status(status).type('html').send(renderSetupPage({ lang, error: message, csrf }));
     }
   });
@@ -3264,7 +3358,7 @@ export function createGatewayServer(
     if (!csrfMatches(csrfSecret, readCookie(req.headers.cookie, CSRF_COOKIE), csrfField)) {
       const dbHealthy = await db.health().catch(() => false);
       const csrf = newCsrfToken(csrfSecret);
-      setCsrfCookie(res, csrf, config.gateway.tls !== null);
+      setCsrfCookie(res, csrf, requestIsSecure(req));
       res
         .status(403)
         .type('html')
@@ -3289,7 +3383,7 @@ export function createGatewayServer(
         loginSuccessRate.set(loggedInAs, recent);
         const dbHealthy = await db.health().catch(() => false);
         const csrf = newCsrfToken(csrfSecret);
-        setCsrfCookie(res, csrf, config.gateway.tls !== null);
+        setCsrfCookie(res, csrf, requestIsSecure(req));
         res
           .status(429)
           .type('html')
@@ -3301,7 +3395,7 @@ export function createGatewayServer(
       res.setHeader(
         'Set-Cookie',
         `${COOKIE_NAME}=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=43200${
-          config.gateway.tls !== null ? '; Secure' : ''
+          requestIsSecure(req) ? '; Secure' : ''
         }`,
       );
       // 中文/非 ASCII 路径需重新编码（Node 的 Location 头只接受 latin1，
@@ -3319,7 +3413,7 @@ export function createGatewayServer(
             : t(lang, 'gw.loginFailed');
       const dbHealthy = await db.health().catch(() => false);
       const csrf = newCsrfToken(csrfSecret);
-      setCsrfCookie(res, csrf, config.gateway.tls !== null);
+      setCsrfCookie(res, csrf, requestIsSecure(req));
       res.status(status).type('html').send(renderLoginPage({ lang, next, error: message, dbHealthy, csrf }));
     }
   });
@@ -3348,7 +3442,12 @@ export function createGatewayServer(
       closeUserWebSocketClients(session.userId, 1008, 'Session ended');
       closeUserRemoteMuxClients(session.userId, 1008, 'Session ended');
     }
-    res.setHeader('Set-Cookie', `${COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`);
+    // 清除会话 Cookie 时必须与写入时同样带 Secure：部分浏览器不允许无 Secure
+    // 的 Set-Cookie 覆盖已存在的 Secure Cookie，否则登出后客户端仍持有旧会话。
+    res.setHeader(
+      'Set-Cookie',
+      `${COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${requestIsSecure(req) ? '; Secure' : ''}`,
+    );
     res.redirect(302, '/gateway/login');
   });
 
@@ -3424,46 +3523,53 @@ export function createGatewayServer(
   //   set-auto — 持久化自动更新开关（仅主用户通过插件调用）
   if (updateEngine !== undefined) {
     app.post('/gateway/internal/update', express.json({ limit: '4kb' }), async (req, res) => {
-      const remoteIp = req.socket.remoteAddress ?? '';
-      if (remoteIp !== '127.0.0.1' && remoteIp !== '::1' && remoteIp !== '::ffff:127.0.0.1') {
-        res.status(403).json({ ok: false, error: 'forbidden' });
-        return;
-      }
-      const secret = typeof req.headers['x-internal-secret'] === 'string' ? req.headers['x-internal-secret'] : '';
-      const expected = config.internalSecret;
-      const a = Buffer.from(secret);
-      const b = Buffer.from(expected);
-      if (a.length !== b.length || !timingSafeEqual(a, b)) {
-        res.status(403).json({ ok: false, error: 'forbidden' });
-        return;
-      }
-      const body = (req.body ?? {}) as Record<string, unknown>;
-      const action = typeof body.action === 'string' ? body.action : '';
-      if (action === 'status') {
-        res.json({ ok: true, status: updateEngine.status() });
-        return;
-      }
-      if (action === 'check') {
-        // 手动检查只发现版本；设置页轮询状态展示结果。
-        void updateEngine.checkNow({ downloadIfAllowed: false }).catch(() => undefined);
-        res.json({ ok: true, started: true });
-        return;
-      }
-      if (action === 'apply') {
-        // applyNow 自带 ok/code/message（含冷却与未就绪分支）
-        res.json(await updateEngine.applyNow());
-        return;
-      }
-      if (action === 'set-auto') {
-        if (typeof body.enabled !== 'boolean') {
-          res.status(400).json({ ok: false, code: 'INVALID', error: 'enabled 必须为布尔值' });
+      // Express 4 不会捕获 async handler 的 rejection：applyNow() 的手动下载分支
+      // 会等待 fetchNpmMetadata 等网络调用，失败时若无人捕获会变成未处理 rejection
+      // 并可能终止进程。整段限界内包 try/catch，鉴权与响应格式保持不变。
+      try {
+        const remoteIp = req.socket.remoteAddress ?? '';
+        if (remoteIp !== '127.0.0.1' && remoteIp !== '::1' && remoteIp !== '::ffff:127.0.0.1') {
+          res.status(403).json({ ok: false, error: 'forbidden' });
           return;
         }
-        const effective = updateEngine.setAutoUpdateEnabled(body.enabled);
-        res.json({ ok: true, requested: body.enabled, enabled: effective, status: updateEngine.status() });
-        return;
+        const secret = typeof req.headers['x-internal-secret'] === 'string' ? req.headers['x-internal-secret'] : '';
+        const expected = config.internalSecret;
+        const a = Buffer.from(secret);
+        const b = Buffer.from(expected);
+        if (a.length !== b.length || !timingSafeEqual(a, b)) {
+          res.status(403).json({ ok: false, error: 'forbidden' });
+          return;
+        }
+        const body = (req.body ?? {}) as Record<string, unknown>;
+        const action = typeof body.action === 'string' ? body.action : '';
+        if (action === 'status') {
+          res.json({ ok: true, status: updateEngine.status() });
+          return;
+        }
+        if (action === 'check') {
+          // 手动检查只发现版本；设置页轮询状态展示结果。
+          void updateEngine.checkNow({ downloadIfAllowed: false }).catch(() => undefined);
+          res.json({ ok: true, started: true });
+          return;
+        }
+        if (action === 'apply') {
+          // applyNow 自带 ok/code/message（含冷却与未就绪分支）；网络异常会 reject
+          res.json(await updateEngine.applyNow());
+          return;
+        }
+        if (action === 'set-auto') {
+          if (typeof body.enabled !== 'boolean') {
+            res.status(400).json({ ok: false, code: 'INVALID', error: 'enabled 必须为布尔值' });
+            return;
+          }
+          const effective = updateEngine.setAutoUpdateEnabled(body.enabled);
+          res.json({ ok: true, requested: body.enabled, enabled: effective, status: updateEngine.status() });
+          return;
+        }
+        res.status(400).json({ ok: false, code: 'INVALID', error: 'action 无效' });
+      } catch (error) {
+        res.status(500).json({ ok: false, code: 'INTERNAL', message: error instanceof Error ? error.message : String(error) });
       }
-      res.status(400).json({ ok: false, code: 'INVALID', error: 'action 无效' });
     });
   }
 
@@ -3601,6 +3707,8 @@ export function createGatewayServer(
     chatMediaAllowed: mediaRoutes.chatMediaAllowed,
     nullableInt,
     stringArray,
+    // 聊天 SSE 与 WS 同口径登记撤销：封禁/登出/删号/改密/权限变更立即断开。
+    registerRevocableClient: registerUserWebSocketClient,
   });
 
   // ── 认证门卫：非 /gateway 请求必须带有效会话 ─────────────────
@@ -3782,6 +3890,7 @@ export function createGatewayServer(
       // 记录所有登录用户（含主用户）的用户 id：供 session.create/fork 响应回调
       // 登记 sessionId→cwd 缓存与已登记 SSH 端点的 SSRF 校验使用；权限行仍只挂子用户
       (req as Req).dshpwUser = user.userId;
+      (req as Req).dshpwUsername = row.username;
       (req as Req).dshpwIsAdmin = row.role === 'admin';
       if (row.role !== 'admin') {
         const perms = effectivePermissions(user.userId);
@@ -3854,11 +3963,18 @@ export function createGatewayServer(
           const normalizedPath = requestedPath === null ? null : normalizePath(requestedPath);
           const canonicalPath = requestedPath === null ? null : canonicalizePathBestEffort(requestedPath);
           const allowed = requestedPath !== null && requestedPath !== '' &&
-            !requestedPath.includes('\0') && path.isAbsolute(requestedPath) &&
+            !requestedPath.includes('\0') && isAbsoluteLikePath(requestedPath) &&
             normalizedPath !== null && canonicalPath !== null &&
             pathBoundToAuthorizedWorkspace(user.userId, perms, normalizedPath) &&
             pathBoundToAuthorizedWorkspace(user.userId, perms, canonicalPath);
           if (!allowed) {
+            res.status(403).type('html').send(forbiddenPage(lang, t(lang, 'gw.folderDenied')));
+            return;
+          }
+          // 通过会话根/白名单/归属之后，仍须拒绝敏感路径：管理员可能把敏感目录的祖先
+          // 误登记为工作区，此时目标会同时命中白名单与归属，只有敏感基能挡住。
+          if (normalizedPath !== null && isSensitivePath(normalizedPath) ||
+            canonicalPath !== null && isSensitivePath(canonicalPath)) {
             res.status(403).type('html').send(forbiddenPage(lang, t(lang, 'gw.folderDenied')));
             return;
           }
@@ -3889,30 +4005,38 @@ export function createGatewayServer(
           }
         }
         // ── 端点分类（不包含任何扩展专属路径）──
-        //   owner:/SSH 登记 → 子用户 403；官方面与普通 DSH 扩展面继续走
-        //   对象级权限逻辑；普通未知 HTTP 路由直通，敏感宿主面仍拒绝。
+        //   owner: 登记 → 403；其余登记 → 需 allow_ssh（主用户登记 + 子用户勾选，
+        //   缺一不可）；官方面与普通 DSH 扩展面继续走对象级权限逻辑；普通未知
+        //   HTTP 路由直通，敏感宿主面仍拒绝。
         const pathClass = classifySubuserPath(requestPath, {
           endpointRules,
           transport: 'http',
           dynamicManifest: dynamicPluginManifest,
         });
-        // 官方 terminal 与登记的宿主能力对子用户不可用；普通 DSH 扩展
-        // 不经过该分支，按通用转发策略处理。
+        // 官方 terminal 不依赖登记表：同一个 allowSsh 开关同时控制官方 terminal
+        // 与已登记的第三方 SSH/宿主端点。terminal 仍保留硬拒绝分类，避免宽泛
+        // 登记规则绕过这里的显式授权分支；本分支是唯一允许子用户进入官方
+        // terminal 的入口。
         const officialTerminalHttp = req.method === 'POST' && OFFICIAL_TERMINAL_HTTP_RE.test(requestPath);
         const terminalStub = officialTerminalHttp ? TERMINAL_STUB_RE.exec(requestPath) : null;
-        // owner: 规则仍优先于 SSH 总开关：真实宿主能力始终拒绝；四个无能力 UX 桩
+        // owner: 规则优先于 SSH 总开关：真实宿主能力始终拒绝；四个无能力 UX 桩
         // 无论 allowSsh 状态都返回固定本地响应，保持客户端恢复流程稳定。
-        if (isSubuserBlockedApiPath(requestPath) && terminalStub === null) {
-          res.status(403).type('html').send(forbiddenPage(lang, t(lang, 'gw.adminOnly')));
-          return;
-        }
         if (pathClass === 'owner-only' && terminalStub === null) {
           res.status(403).type('html').send(forbiddenPage(lang, t(lang, 'gw.adminOnly')));
           return;
         }
-        // 官方 terminal 的真实方法返回明确的权限错误；四个恢复/清理桩走固定
-        // 响应，避免客户端进入无休止重试。登记的宿主端点由 ssh 分类拒绝。
-        if (officialTerminalHttp && terminalStub === null) {
+        // 子用户硬拒绝的敏感命名空间/端点（pluginManager / settings 写 / 凭据等）：
+        // 先于 SSH 授权分支判定，任何登记规则都不能放行。官方 terminal 是唯一例外——
+        // 它命中硬拒绝分类，但由下方显式 allowSsh 分支决定能否透传；未知 terminal
+        // 方法（不匹配 OFFICIAL_TERMINAL_HTTP_RE）仍落到这里被拒绝。
+        if (isSubuserBlockedApiPath(requestPath) && !officialTerminalHttp && terminalStub === null) {
+          res.status(403).type('html').send(forbiddenPage(lang, t(lang, 'gw.adminOnly')));
+          return;
+        }
+        // allowSsh 关闭时，官方 terminal 的真实方法返回明确的权限错误；四个恢复/
+        // 清理桩仍走下面的固定响应，避免客户端进入无休止重试。开启后官方 terminal
+        // 直接继续进入通用上游代理。
+        if (officialTerminalHttp && pathClass !== 'owner-only' && !perms.allow_ssh && terminalStub === null) {
           res.status(403).type('html').send(forbiddenPage(lang, t(lang, 'gw.noSsh')));
           return;
         }
@@ -3924,9 +4048,11 @@ export function createGatewayServer(
           return;
         }
         if (pathClass === 'ssh') {
-          res.status(403).type('html').send(forbiddenPage(lang, t(lang, 'gw.noSsh')));
-          return;
-        } else if (terminalStub !== null && changesRoute === null) {
+          if (!perms.allow_ssh) {
+            res.status(403).type('html').send(forbiddenPage(lang, t(lang, 'gw.noSsh')));
+            return;
+          }
+        } else if (terminalStub !== null && (pathClass === 'owner-only' || !perms.allow_ssh) && changesRoute === null) {
           // ── 子用户 terminal 无能力 UX 桩 ───────────────────────────
           // 官方客户端 TerminalRecovery / 终端面板会调用 list、environment、shells、
           // close。直接回 403 会让 restore/setup 常驻重试，所以这四者只在本地回
@@ -3978,18 +4104,11 @@ export function createGatewayServer(
         }
 
         // ── 官方上传 / git 下载开关（仅子用户；普通第三方插件不受影响）──────────
-        // allow_upload 关闭时官方二进制上传与 fileUploads 上传一律拒绝，请求体上限
-        // 也维持默认 64 MiB（见 proxy 的 requestBodyLimitFor）；开启时才提升到
-        // 300 MiB。allow_git_download 关闭时官方 git 取数据动词（clone/pull/fetch
-        // 等）与 session.export 会话日志下载通道一律拒绝。两条谓词
-        // （isUploadRequest 为精确上传端点；isGitRequest 按 git 前缀与 session.export
-        // 判定）只覆盖官方面，不依赖已移除的插件协议启发式（compat.isFileWrite /
-        // isFileRead / isExfilEndpoint），因此未登记的普通第三方插件路径照常转发。
-        // 官方工作区与会话的对象级路径校验仍由 proxy 层承担。
-        if (!perms.allow_upload && isUploadRequest(req.method, requestPath)) {
-          res.status(403).type('html').send(forbiddenPage(lang, t(lang, 'gw.noUpload')));
-          return;
-        }
+        // allow_upload 只决定官方请求体档位：关闭时仍允许 64 MiB 以内的官方上传，
+        // 开启时提升到 300 MiB。上传端点的会话归属、工作区白名单和 disabled 状态
+        // 仍由 proxy 层独立校验，不能用该档位替代对象级授权。
+        // allow_git_download 关闭时官方 git 取数据动词（clone/pull/fetch 等）与
+        // session.export 会话日志下载通道一律拒绝。普通第三方插件路径照常转发。
         if (!perms.allow_git_download && isGitRequest(requestPath)) {
           res.status(403).type('html').send(forbiddenPage(lang, t(lang, 'gw.noGit')));
           return;
@@ -4040,6 +4159,20 @@ export function createGatewayServer(
           (isWorkspaceWrite(requestPath) && !workspaceOrderWrite && (!isManagedWorkspaceWrite || !workspaceManagementAllowed)) ||
           (isWorkspaceDirectoryCreate(requestPath) && !perms.allow_workspace_create)
         ) {
+          // Issue #38 审计：关闭 allowWorkspaceCreate 时的目录创建 / 工作区登记拒绝。
+          // 用与 proxy 层路径级拒绝同一组事件名与 detail 形状，且不落完整敏感路径
+          // （此处仅开关关闭，无用户选定的可记路径）。
+          const auditEventType = isWorkspaceDirectoryCreate(requestPath)
+            ? 'directory_create_denied'
+            : isWorkspaceCreate(requestPath) ? 'workspace_registration_denied' : null;
+          if (auditEventType !== null) {
+            db.audit(auditEventType, {
+              username: row.username,
+              ip: req.ip,
+              userAgent: req.headers['user-agent'] ?? null,
+              detail: JSON.stringify({ result: 'denied', reason: 'create_disabled' }),
+            });
+          }
           res.status(403).type('html').send(forbiddenPage(lang, t(lang, 'gw.workspaceDenied')));
           return;
         }
@@ -4104,6 +4237,7 @@ export function createGatewayServer(
     hostEventFilter,
     INJECT_SCRIPT,
     isPlainJsonRecord,
+    isSensitivePath,
     isTokenRevoked,
     langOf,
     mergeAuthorizedAccess,
@@ -4116,6 +4250,7 @@ export function createGatewayServer(
     OFFICIAL_ACCOUNT_REMOTE_ENDPOINTS,
     OFFICIAL_JOB_REMOTE_ENDPOINTS,
     OFFICIAL_TERMINAL_HTTP_RE,
+    OFFICIAL_TERMINAL_REMOTE_ENDPOINTS,
     originHostMatches: (req) => originHostMatches(req, configuredOriginHosts),
     parseRemoteMuxClientFrame,
     parseRemoteMuxServerFrame,
@@ -4128,11 +4263,13 @@ export function createGatewayServer(
     recordSessionModelSelection,
     registerUserWebSocketClient,
     registryAuthorizedSockets,
-    REMOTE_MUX_HEARTBEAT_INTERVAL_MS,
-    REMOTE_MUX_MAX_MISSED_HEARTBEATS,
+    REMOTE_MUX_FRAGMENT_BYTES: remoteMuxConfig.fragmentBytes,
     REMOTE_MUX_MAX_PAYLOAD_BYTES,
     REMOTE_MUX_MAX_PENDING_BYTES,
     REMOTE_MUX_MAX_STREAMS,
+    REMOTE_MUX_PING_INTERVAL_MS: remoteMuxConfig.pingIntervalMs,
+    REMOTE_MUX_PONG_TIMEOUT_MS: remoteMuxConfig.pongTimeoutMs,
+    REMOTE_MUX_WRITE_STALL_MS: remoteMuxConfig.writeStallMs,
     remoteAccountRequestIsEmpty,
     remoteEventOwnership,
     remoteEventOwnershipKey,
@@ -4188,7 +4325,7 @@ export function createGatewayServer(
     setArchivedSessionSnapshotReady: (v) => { archivedSessionSnapshotReady = v; },
     getArchivedSessionSnapshotRevision: () => archivedSessionSnapshotRevision,
     setArchivedSessionSnapshotRevision: (v) => { archivedSessionSnapshotRevision = v; },
-    bumpWorkspaceListRequestRevision: () => ++workspaceListRequestRevision,
+    bumpWorkspaceListRequestRevision,
   });
 
   const hasTls = config.gateway.tls !== null;

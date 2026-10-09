@@ -42,9 +42,9 @@ test('Remote mux 有界发送：单个大帧（超过 pending 预算）在未积
 
 test('Remote mux 有界发送：超最大帧和总积压预算时拒绝且不写出', () => {
   const socket = new StubSocket();
-  assert.equal(sendMuxFrameBounded(socket, 'x'.repeat(MAX_FRAME_BYTES + 1), LIMIT, MAX_FRAME_BYTES), 'overflow');
+  assert.equal(sendMuxFrameBounded(socket, 'x'.repeat(MAX_FRAME_BYTES + 1), LIMIT, MAX_FRAME_BYTES), 'oversized');
   socket.bufferedAmount = LIMIT + MAX_FRAME_BYTES;
-  assert.equal(sendMuxFrameBounded(socket, 'x', LIMIT, MAX_FRAME_BYTES), 'overflow');
+  assert.equal(sendMuxFrameBounded(socket, 'x', LIMIT, MAX_FRAME_BYTES), 'backpressure');
   assert.deepEqual(socket.sent, []);
 });
 
@@ -75,7 +75,7 @@ test('Remote mux 有界发送：慢对端逐帧积压，超过预算后停止并
   assert.equal(sendMuxFrameBounded(socket, chunk, LIMIT, MAX_FRAME_BYTES), 'sent');
   // 越过 2 MiB 余量仍允许最后一个合法帧；余量+帧总上限后拒绝后续帧。
   socket.bufferedAmount = LIMIT + MAX_FRAME_BYTES - 1;
-  assert.equal(sendMuxFrameBounded(socket, 'xy', LIMIT, MAX_FRAME_BYTES), 'overflow');
+  assert.equal(sendMuxFrameBounded(socket, 'xy', LIMIT, MAX_FRAME_BYTES), 'backpressure');
   assert.deepEqual(socket.sent, [chunk, chunk]);
   // 对端恢复消费后即可继续发送，顺序不受影响。
   socket.drain();

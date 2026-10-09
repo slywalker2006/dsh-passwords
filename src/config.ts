@@ -7,18 +7,32 @@ import { fileURLToPath } from 'node:url';
 import { createHash, randomBytes } from 'node:crypto';
 import { chmodSync, existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
+import os from 'node:os';
 import path from 'node:path';
-import { parseEndpointAllowlist } from './permissions.js';
+import { isFilesystemRootPath, isFullyQualifiedPath, normalizePath, parseEndpointAllowlist } from './permissions.js';
 
 const moduleDir = path.dirname(fileURLToPath(import.meta.url));
 // dsh 进程里没有本项目的 .env（通过 DSH_PASSWORDS_ENV_FILE 显式指定网关 .env 路径）。
 // npm 更新会切换模块目录；部署配置和数据必须跟随这个显式配置文件，而不能跟随新包目录。
 const explicitEnvFile = process.env.DSH_PASSWORDS_ENV_FILE?.trim();
 const configRoot = explicitEnvFile ? path.dirname(path.resolve(explicitEnvFile)) : path.resolve(moduleDir, '..');
-if (explicitEnvFile) {
-  loadEnv({ path: explicitEnvFile, quiet: true });
-} else {
-  loadEnv({ path: path.join(moduleDir, '..', '.env'), quiet: true });
+const deploymentEnvFile = explicitEnvFile ? path.resolve(explicitEnvFile) : path.join(moduleDir, '..', '.env');
+loadEnv({ path: deploymentEnvFile, quiet: true });
+
+// 卷内持久化的密钥：Docker Compose 以 `${VAR:-}` 兜底未设置的 secret，容器内因此存在
+// 空字符串环境变量。dotenv 默认 override:false——已存在的键即使值为空串也不会被文件
+// 覆盖，卷内 .env 里持久化的这些密钥就被空串遮蔽：容器启动时 SETUP_KEY 被判空而拒绝
+// 启动，或静默失去显式配置的 JWT/DB 密钥（网关与插件随后派生出不同密钥而撕裂）。
+// 这里对这四个密钥做一次显式回填：仅当环境变量为空或纯空白、且文件中确有非空值时采用
+// 文件值；显式非空环境变量（含 docker/.env 透传与 `-e` 注入）仍然优先。
+const FILE_BACKED_SECRET_ENV_KEYS = ['SETUP_KEY', 'MCP_JWT_SECRET', 'MCP_INTERNAL_SECRET', 'MCP_DB_ENC_KEY'] as const;
+if (existsSync(deploymentEnvFile)) {
+  const fileValues = parseEnv(readFileSync(deploymentEnvFile));
+  for (const name of FILE_BACKED_SECRET_ENV_KEYS) {
+    if ((process.env[name] ?? '').trim() !== '') continue;
+    const fileValue = fileValues[name];
+    if (fileValue !== undefined && fileValue.trim() !== '') process.env[name] = fileValue;
+  }
 }
 
 // 插件拉起的网关子进程与插件初始快照共享部署文件：这些键必须以文件为准，
@@ -39,6 +53,15 @@ const MANAGED_ENV_KEYS = [
   // is not managed, a .env value never reaches the gateway process and the 504
   // cannot be worked around by configuration alone.
   'MCP_GATEWAY_UPSTREAM_HEADER_TIMEOUT_MS',
+  // Remote mux 大消息传输调优（Remote mux 规格 §6）。未纳入托管时，插件拉起的
+  // 网关子进程拿不到部署 .env 里的新值，运维改文件后无法生效。
+  'MCP_GATEWAY_MUX_FRAGMENT_BYTES',
+  'MCP_GATEWAY_MUX_PING_INTERVAL_MS',
+  'MCP_GATEWAY_MUX_PONG_TIMEOUT_MS',
+  'MCP_GATEWAY_MUX_WRITE_STALL_MS',
+  // 管理员目录选择器安全起点（browse roots）。未纳入托管时，插件拉起的网关子进程拿不到
+  // 部署 .env 里的新值，运维改文件后选择器仍按家目录兜底，无法收窄到目标子树。
+  'MCP_GATEWAY_DIRECTORY_PICKER_ROOTS',
 ] as const;
 const managedFileKeys = new Map<string, Set<string>>();
 
@@ -80,6 +103,72 @@ if (explicitEnvFile && process.env.DSH_GATEWAY_PARENT_PID?.trim() && existsSync(
 export function resolveConfigPath(value: string, configRoot: string, fallbackName: string): string {
   const raw = value.trim() || fallbackName;
   return path.isAbsolute(raw) ? raw : path.resolve(configRoot, raw);
+}
+
+/**
+ * Remote mux 大消息传输调优（`MCP_GATEWAY_MUX_*`，见 Remote mux 规格 §6 的配置表）。
+ * 分片、nonce 心跳、Pong 与写停滞的期限都从这里取值，消费点在 gateway/proxy 的发送器。
+ */
+export interface RemoteMuxConfig {
+  /** 分片字节数；`0` 关闭分片与排水等待，回退单帧发送路径。 */
+  fragmentBytes: number;
+  /** 保活探测（Ping）间隔。 */
+  pingIntervalMs: number;
+  /** Ping 本地提交后等待 nonce 匹配 Pong 的时限。 */
+  pongTimeoutMs: number;
+  /** Sender busy 且本地写入无进展的时限。 */
+  writeStallMs: number;
+}
+
+/** 四个调优项的默认值与合法区间（严格十进制整数）。 */
+export const REMOTE_MUX_DEFAULTS = {
+  fragmentBytes: { value: 131_072, min: 16_384, max: 1_048_576 },
+  pingIntervalMs: { value: 2_000, min: 250, max: 60_000 },
+  pongTimeoutMs: { value: 30_000, min: 2_000, max: 600_000 },
+  writeStallMs: { value: 30_000, min: 5_000, max: 600_000 },
+} as const;
+
+/**
+ * 严格十进制整数解析：只接受 `^[0-9]+$`（允许前导零），其余一律非法。
+ * 不使用 `Number(v) || fallback`——它会把 `''`、`0x10`、`1e3` 静默当作合法值。
+ */
+function parseDecimalInt(raw: string | undefined): number | null {
+  if (raw === undefined) return null;
+  const trimmed = raw.trim();
+  if (!/^[0-9]+$/.test(trimmed)) return null;
+  const value = Number(trimmed);
+  return Number.isSafeInteger(value) ? value : null;
+}
+
+/**
+ * 解析 Remote mux 调优环境变量：未设置/纯空白用默认值（不告警）；非法或越界回退
+ * 默认并发一次 warning；`FRAGMENT_BYTES=0` 是唯一允许的零值。
+ * `PING_INTERVAL_MS > PONG_TIMEOUT_MS` 时按已验证配置使用，仅告警。
+ * 纯函数：只读传入的 env，不读取或修改 process.env。
+ */
+export function resolveRemoteMuxConfig(env: NodeJS.ProcessEnv = process.env): RemoteMuxConfig {
+  const read = (name: string, spec: { value: number; min: number; max: number }, zeroValid = false): number => {
+    const raw = env[name];
+    if (raw === undefined || raw.trim() === '') return spec.value;
+    const parsed = parseDecimalInt(raw);
+    const valid = parsed !== null && ((zeroValid && parsed === 0) || (parsed >= spec.min && parsed <= spec.max));
+    if (!valid) {
+      console.warn(`[dsh-passwords] ${name} 非法（${JSON.stringify(raw)}），回退默认 ${spec.value}`);
+      return spec.value;
+    }
+    return parsed;
+  };
+  const fragmentBytes = read('MCP_GATEWAY_MUX_FRAGMENT_BYTES', REMOTE_MUX_DEFAULTS.fragmentBytes, true);
+  const pingIntervalMs = read('MCP_GATEWAY_MUX_PING_INTERVAL_MS', REMOTE_MUX_DEFAULTS.pingIntervalMs);
+  const pongTimeoutMs = read('MCP_GATEWAY_MUX_PONG_TIMEOUT_MS', REMOTE_MUX_DEFAULTS.pongTimeoutMs);
+  const writeStallMs = read('MCP_GATEWAY_MUX_WRITE_STALL_MS', REMOTE_MUX_DEFAULTS.writeStallMs);
+  if (pingIntervalMs > pongTimeoutMs) {
+    console.warn(
+      `[dsh-passwords] MCP_GATEWAY_MUX_PING_INTERVAL_MS (${pingIntervalMs}) 大于 ` +
+        `MCP_GATEWAY_MUX_PONG_TIMEOUT_MS (${pongTimeoutMs})，按已验证配置使用`,
+    );
+  }
+  return { fragmentBytes, pingIntervalMs, pongTimeoutMs, writeStallMs };
 }
 
 export interface PlatformConfig {
@@ -124,10 +213,58 @@ export interface PlatformConfig {
    * 该表只保留无法由宿主运行时登记的传统 HTTP/WS 端点和 owner-only 面。
    */
   endpointRules: string[];
+  /**
+   * 管理员目录选择器安全起点（`MCP_GATEWAY_DIRECTORY_PICKER_ROOTS`）：逗号/换行分隔的
+   * 绝对路径。未配置时为 `[os.homedir()]`；全盘根与相对路径在解析时即被丢弃，绝不让
+   * 选择器从整机根枚举。声明为可选以兼容既有测试中的 PlatformConfig 字面量。
+   */
+  directoryPickerRoots?: string[];
+  /**
+   * Remote mux 大消息传输调优（`MCP_GATEWAY_MUX_*`）；loadConfig 始终填充。
+   * 声明为可选以兼容既有测试中的 PlatformConfig 字面量。
+   */
+  mux?: RemoteMuxConfig;
 }
 
 /** 第三方端点登记表变量名。 */
 export const SSH_ENDPOINT_ENV = 'MCP_GATEWAY_SSH_ENDPOINTS';
+
+/** 管理员目录选择器安全起点变量名。 */
+export const DIRECTORY_PICKER_ROOTS_ENV = 'MCP_GATEWAY_DIRECTORY_PICKER_ROOTS';
+
+/**
+ * 解析目录选择器安全起点候选：逗号或换行分隔，去空白、去重，只保留平台合规的绝对路径。
+ * 全盘根（`/` 或 `X:\`）与相对路径一律丢弃——它们会让选择器从整机根枚举。纯字符串解析，
+ * 不访问文件系统：真实存在性、目录性、符号链接越界与敏感基判定由调用方在使用前按当前
+ * 文件系统状态校验（fail-closed）。
+ */
+export function parseDirectoryPickerRootList(raw: string): string[] {
+  const roots: string[] = [];
+  const seen = new Set<string>();
+  for (const part of raw.split(/[,\r\n]+/)) {
+    const candidate = part.trim();
+    if (candidate === '' || candidate.includes('\u0000')) continue;
+    if (!isFullyQualifiedPath(candidate)) continue;
+    const normalized = normalizePath(candidate);
+    if (isFilesystemRootPath(normalized)) continue;
+    if (seen.has(normalized)) continue;
+    seen.add(normalized);
+    roots.push(candidate);
+  }
+  return roots;
+}
+
+/**
+ * 解析生效的目录选择器安全起点：`MCP_GATEWAY_DIRECTORY_PICKER_ROOTS` 未配置或纯空白时，
+ * 唯一安全起点为 `os.homedir()`（绝不回退到全盘根）。已配置时返回其中合规的绝对路径候选；
+ * 若配置项全部非法则返回空列表——此时选择器 fail-closed，不返回任何可浏览目录，而不是
+ * 悄悄放宽到更宽的路径。
+ */
+export function resolveDirectoryPickerRoots(env: NodeJS.ProcessEnv = process.env): string[] {
+  const raw = env[DIRECTORY_PICKER_ROOTS_ENV];
+  if (raw === undefined || raw.trim() === '') return [os.homedir()];
+  return parseDirectoryPickerRootList(raw);
+}
 
 export function loadConfig(options: { requireSetupKey?: boolean; env?: NodeJS.ProcessEnv } = {}): PlatformConfig {
   const env = options.env ?? process.env;
@@ -185,9 +322,11 @@ export function loadConfig(options: { requireSetupKey?: boolean; env?: NodeJS.Pr
   const autoOn =
     autoTlsRaw === '1' || autoTlsRaw === 'true' || autoTlsRaw === 'yes' || autoTlsRaw === 'auto';
   const autoOff = autoTlsRaw === '0' || autoTlsRaw === 'false' || autoTlsRaw === 'no';
+  const autoTlsValueIsKnown = autoTlsRaw === '' || autoOn || autoOff;
   // 留空 = 自动判断：未自备证书且未显式关闭即启用（域名由 cli 启动时补全，
-  // 零配置路径会探测公网 IP 推导 <IP>.sslip.io）
-  const autoTls = !userCerts && !autoOff && (autoOn || autoTlsRaw === '');
+  // 零配置路径会探测公网 IP 推导 <IP>.sslip.io）。非法显式值 fail-closed，
+  // 与安装器 root gate 保持一致。
+  const autoTls = !userCerts && autoTlsValueIsKnown && !autoOff && (autoOn || autoTlsRaw === '');
   const acmeDir = path.join(path.dirname(dbPathResolved), 'acme');
 
   // 自动 HTTPS 的 CLI 默认监听 443；插件、网关 Broker 和健康轮询必须在
@@ -242,6 +381,9 @@ export function loadConfig(options: { requireSetupKey?: boolean; env?: NodeJS.Pr
     },
     // 端点登记表：HTTP 与 WebSocket 合并一条（代码不内置任何插件路径）。
     endpointRules,
+    // 目录选择器安全起点：未配置时为 [os.homedir()]（见 resolveDirectoryPickerRoots）。
+    directoryPickerRoots: resolveDirectoryPickerRoots(env),
+    mux: resolveRemoteMuxConfig(env),
   };
 }
 

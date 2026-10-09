@@ -33,9 +33,8 @@ Fixes #
 
 ## Testing / 测试
 
-- [ ] `npm ci`
-- [ ] `npm run build`
-- [ ] `npm test`
+- [ ] `npm ci --include=optional`
+- [ ] `npm run build && node --import tsx --test "test/**/*.test.ts"` (build first / 需先构建)
 - [ ] Focused regression test added or updated / 已新增或更新针对性回归测试
 - [ ] Manual browser or deployment test performed where relevant / 必要时已完成浏览器或部署人工测试
 

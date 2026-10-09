@@ -43,7 +43,7 @@ Do not paste `.env`, `setup-key.txt`, JWTs, cookies, API keys, SSH passwords, pr
 Supported development baseline:
 
 - Node.js `22.19+` or `24+`
-- DSH `0.2.1-alpha.1` — the current working-tree development and bundled Docker pin for the DSH `0.2.1` patch line, and the newest `0.2.1`-line identity published on npm (the `alpha` dist-tag); the nine `@deepseek-ai/dsh*` devDependencies declare `>=0.2.1-alpha.1 <0.2.2-0` and the lockfile is locked against alpha.1. The declared range accepts `0.2.1-alpha.1` and later alpha/beta/rc prereleases plus stable `0.2.1`, and rejects the retired `0.1.x` / `0.2.0` lines, `0.2.1-alpha.0`, and every `0.2.2+` identity, but with only `0.2.1-alpha.1` published on that line the later acceptance is a range/identity guarantee only, never a run or a full gateway acceptance. dsh-passwords 2.7.7 is the current release. The version gate is tested against the accepted 0.2.1 variants and the rejection paths.
+- DSH `0.2.1-alpha.2` — the current working-tree development and bundled Docker pin for the DSH `0.2.1` patch line, and the newest `0.2.1`-line identity published on npm (the `alpha` dist-tag); the nine `@deepseek-ai/dsh*` devDependencies declare `>=0.2.1-alpha.1 <0.2.2-0` and the lockfile is locked against alpha.2. The declared range accepts `0.2.1-alpha.1` and later alpha/beta/rc prereleases plus stable `0.2.1`, and rejects the retired `0.1.x` / `0.2.0` lines, `0.2.1-alpha.0`, and every `0.2.2+` identity; with the later prereleases and the stable release still unpublished, that acceptance is a range/identity guarantee only, never a run or a full gateway acceptance. dsh-passwords 2.7.7 is the current published release; the working tree is 2.7.8 and is not published yet. The version gate is tested against the accepted 0.2.1 variants and the rejection paths.
 - npm and git
 
 Clone and install:
@@ -79,10 +79,10 @@ Run the same checks as CI:
 ```bash
 npm ci --include=optional
 npm run build
-npm test
+node --import tsx --test "test/**/*.test.ts"
 ```
 
-Tests use Node's built-in test runner through `tsx`. Add a focused regression test before or with a bug fix. Include malformed input, unauthorized access, failure, and reconnect/race cases when the changed path handles them. For browser or deployment behavior, add a manual verification note with the tested topology; do not claim a real end-to-end result from a unit test.
+Run `npm run build` before the test command; the test step does not build on its own. Tests use Node's built-in test runner through `tsx`. Add a focused regression test before or with a bug fix. Include malformed input, unauthorized access, failure, and reconnect/race cases when the changed path handles them. For browser or deployment behavior, add a manual verification note with the tested topology; do not claim a real end-to-end result from a unit test.
 
 The CI matrix currently tests Node 22 and Node 24 on Ubuntu. A local pass does not replace testing the relevant DSH runtime, reverse proxy, or third-party plugin when the change crosses that boundary.
 

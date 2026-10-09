@@ -398,6 +398,42 @@ test('审计 P2：POST /gateway/setup 拒绝跨源 Origin，且不消耗限速�
   }
 });
 
+// ── Secure Cookie：TLS 终止反向代理（网关自身 tls=null）──────────────
+// nginx/caddy 在 80/443 终结 TLS 时，网关收到的是明文 HTTP（config.gateway.tls=null）。
+// 受信回环反代转发的 X-Forwarded-Proto=https 必须让会话/CSRF Cookie 带 Secure；
+// 公网直连伪造该头无效（trust proxy=loopback），明文直连则不得声明 Secure。
+test('反向代理 TLS 终止：受信回环转发 X-Forwarded-Proto=https 时会话/CSRF Cookie 带 Secure', async () => {
+  const first = await call(login.port, {
+    method: 'GET',
+    path: '/gateway/login',
+    headers: { 'x-forwarded-proto': 'https' },
+  });
+  assert.equal(first.status, 200);
+  const csrfCookie = first.setCookies.find((c) => c.startsWith('dsh_csrf=')) ?? '';
+  assert.match(csrfCookie, /;\s*Secure/i, '反代 https 下 CSRF cookie 必须带 Secure');
+
+  const submit = await call(login.port, {
+    method: 'POST',
+    path: '/gateway/login',
+    headers: {
+      cookie: `dsh_csrf=${csrfCookieOf(first)}`,
+      'content-type': 'application/x-www-form-urlencoded',
+      'x-forwarded-proto': 'https',
+    },
+    body: `csrf=${encodeURIComponent(csrfFieldOf(first))}&username=admin&password=Admin123!`,
+  });
+  assert.equal(submit.status, 302, `反代 https 下登录必须成功：${submit.body.slice(0, 200)}`);
+  const sessionCookie = submit.setCookies.find((c) => c.startsWith('dsh_gateway_token=')) ?? '';
+  assert.match(sessionCookie, /;\s*Secure/i, '反代 https 下会话 cookie 必须带 Secure');
+});
+
+test('直连明文 HTTP：不带 X-Forwarded-Proto 时 Cookie 不得误加 Secure', async () => {
+  const first = await call(login.port, { method: 'GET', path: '/gateway/login' });
+  assert.equal(first.status, 200);
+  const csrfCookie = first.setCookies.find((c) => c.startsWith('dsh_csrf=')) ?? '';
+  assert.doesNotMatch(csrfCookie, /;\s*Secure/i, '明文直连不得声明 Secure');
+});
+
 // ── 审计 P2：Referrer-Policy 必须 same-origin（no-referrer 会把真实同源表单 POST
 //    降级为 Origin: null + Sec-Fetch-Site: same-origin，被同源校验误判 403）──────
 test('审计 P2：登录 / 首次配置页 Referrer-Policy 必须为 same-origin', async () => {
@@ -476,8 +512,9 @@ test('审计 P3：非探针 / 近似路径仍 302，保持精确归一化边界'
 });
 
 test('审计 P3：幽灵会话（用户行不存在）探针路径仍 204', async () => {
-  // sub 与 username 不一致：sessionOf 用 username 查到 cv 匹配的行，路由再用
-  // getUserById(sub) 得到空 → 幽灵会话分支；该分支必须与未认证分支共用同一 Set。
+  // sub 与 username 不一致：sessionOf 现按 sub（getUserById）定位并比对 username，
+  // 伪造的 sub=999999 无对应行 → 直接判未认证（不再产生“已解析出会话但路由二次
+  // 查询为空”的幽灵会话分支）。无论走哪条分支，都必须与未认证分支共用同一探针 Set。
   const ghost = jwt.sign({ sub: '999999', username: 'admin', cv: 0 }, login.config.jwtSecret, {
     expiresIn: '12h',
   });

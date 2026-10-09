@@ -1,3 +1,3 @@
-# Local backup copies are not release artifacts.
-README.md.old
-README_en.md.old
+# The published file set is the "files" whitelist in package.json. A root
+# .npmignore cannot exclude entries inside that whitelist; per-directory
+# ignores do, for example docs/.npmignore trims the published docs/ set.

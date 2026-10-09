@@ -4,14 +4,75 @@ services:
       context: ..
       dockerfile: docker/Dockerfile.bundled
       args:
-        DSH_VERSION: ${DSH_VERSION:-0.2.1-alpha.1}
+        DSH_VERSION: ${DSH_VERSION:-0.2.1-alpha.2}
     restart: unless-stopped
     environment:
+      # 必需变量：缺失时 Docker 直接拒绝启动。
       DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:?set DEEPSEEK_API_KEY in docker/.env}
       MCP_GATEWAY_PUBLIC_HOST: ${MCP_GATEWAY_PUBLIC_HOST:-}
       MCP_GATEWAY_SSH_ENDPOINTS: ${MCP_GATEWAY_SSH_ENDPOINTS:-}
+      # 上游 dsh：镜像默认容器内回环；可覆盖
+      MCP_GATEWAY_UPSTREAM: ${MCP_GATEWAY_UPSTREAM:-http://127.0.0.1:3080}
+      # 上游 HTTPS/WSS 证书校验：留空=校验，0=关闭（仅调试）
+      MCP_GATEWAY_UPSTREAM_TLS_VERIFY: ${MCP_GATEWAY_UPSTREAM_TLS_VERIFY:-}
 
-      MCP_GATEWAY_UPSTREAM: http://127.0.0.1:3080
+      # 以下为可选变量，仅在 docker/.env（或 --env-file）中显式设置时才覆盖镜像默认值。
+      # 注意：对镜像已定义 ENV 默认的变量必须带镜像默认值兜底（`${VAR:-<镜像默认>}`），
+      # 否则未设置时会写入空字符串、把镜像默认值清空（例如 MCP_GATEWAY_PORT 会退回 8080）。
+      #
+      # 密钥类（SETUP_KEY/MCP_JWT_SECRET/MCP_INTERNAL_SECRET/MCP_DB_ENC_KEY）由卷内
+      # /data/dsh-passwords/.env 持久化。未设置时下面的 `${VAR:-}` 会向容器注入空串，但
+      # src/config.ts 对这四个密钥把空值视为“未设置”，因此不会遮蔽卷内 .env；显式非空值
+      # （docker/.env 透传或 `-e VAR=...`）仍然优先。
+      SETUP_KEY: ${SETUP_KEY:-}
+      MCP_JWT_SECRET: ${MCP_JWT_SECRET:-}
+      MCP_INTERNAL_SECRET: ${MCP_INTERNAL_SECRET:-}
+      MCP_DB_ENC_KEY: ${MCP_DB_ENC_KEY:-}
+      MCP_DB_PATH: ${MCP_DB_PATH:-/data/dsh-passwords/platform.db}
+
+      # 网关监听/证书
+      MCP_GATEWAY_HOST: ${MCP_GATEWAY_HOST:-0.0.0.0}
+      MCP_GATEWAY_PORT: ${MCP_GATEWAY_PORT:-3088}
+      MCP_GATEWAY_AUTO_TLS: ${MCP_GATEWAY_AUTO_TLS:-0}
+      MCP_GATEWAY_REDIRECT_PORT: ${MCP_GATEWAY_REDIRECT_PORT:-}
+      MCP_GATEWAY_DOMAIN: ${MCP_GATEWAY_DOMAIN:-}
+      MCP_GATEWAY_ACME_EMAIL: ${MCP_GATEWAY_ACME_EMAIL:-}
+      MCP_GATEWAY_ACME_STAGING: ${MCP_GATEWAY_ACME_STAGING:-}
+      MCP_GATEWAY_TLS_CERT: ${MCP_GATEWAY_TLS_CERT:-}
+      MCP_GATEWAY_TLS_KEY: ${MCP_GATEWAY_TLS_KEY:-}
+
+      # 高级运维覆盖项：普通用户无需配置；保留透传以兼容既有部署 .env。
+      MCP_GATEWAY_INTERNAL_PROBE_TIMEOUT_MS: ${MCP_GATEWAY_INTERNAL_PROBE_TIMEOUT_MS:-}
+      MCP_GATEWAY_UPSTREAM_HEADER_TIMEOUT_MS: ${MCP_GATEWAY_UPSTREAM_HEADER_TIMEOUT_MS:-}
+      MCP_DSH_PASSWORDS_INVENTORY_TTL_MS: ${MCP_DSH_PASSWORDS_INVENTORY_TTL_MS:-}
+      MCP_GATEWAY_MUX_FRAGMENT_BYTES: ${MCP_GATEWAY_MUX_FRAGMENT_BYTES:-}
+      MCP_GATEWAY_MUX_PING_INTERVAL_MS: ${MCP_GATEWAY_MUX_PING_INTERVAL_MS:-}
+      MCP_GATEWAY_MUX_PONG_TIMEOUT_MS: ${MCP_GATEWAY_MUX_PONG_TIMEOUT_MS:-}
+      MCP_GATEWAY_MUX_WRITE_STALL_MS: ${MCP_GATEWAY_MUX_WRITE_STALL_MS:-}
+
+      # dsh 相关
+      MCP_DSH_ROOT: ${MCP_DSH_ROOT:-/opt/dsh/node_modules/@deepseek-ai/dsh}
+      MCP_DSH_RESTART_SERVICE: ${MCP_DSH_RESTART_SERVICE:-}
+      MCP_DSH_SETTINGS_FILE: ${MCP_DSH_SETTINGS_FILE:-}
+      # 分容器拓扑才需要（本模板为单容器，dsh web 走容器内回环，无需开启）
+      MCP_DSH_PATCH_ALLOW_BIND_ALL: ${MCP_DSH_PATCH_ALLOW_BIND_ALL:-}
+
+      # 管理员目录选择器安全起点（browse roots）：逗号/换行分隔的容器内绝对路径；
+      # 留空时唯一安全起点为容器用户家目录（os.homedir()），不会从整机根枚举。
+      MCP_GATEWAY_DIRECTORY_PICKER_ROOTS: ${MCP_GATEWAY_DIRECTORY_PICKER_ROOTS:-}
+
+      # 自更新：默认关闭/手动。本模板不挂载宿主 Docker socket，也未提供宿主机 Compose
+      # 目录，因此 capability 探测为 false，设置页只显示宿主机手动命令（fail-closed）；
+      # 需要应用内更新时，再显式挂载 socket 与 Compose 目录并填写下列变量。
+      MCP_DSH_AUTO_UPDATE: ${MCP_DSH_AUTO_UPDATE:-}
+      MCP_DSH_UPDATE_MAX_BPS: ${MCP_DSH_UPDATE_MAX_BPS:-}
+      MCP_DSH_DOCKER_SELF_UPDATE: ${MCP_DSH_DOCKER_SELF_UPDATE:-}
+      MCP_DSH_DOCKER_COMPOSE_DIR: ${MCP_DSH_DOCKER_COMPOSE_DIR:-}
+      MCP_DSH_DOCKER_COMPOSE_FILE: ${MCP_DSH_DOCKER_COMPOSE_FILE:-}
+      MCP_DSH_DOCKER_IMAGE: ${MCP_DSH_DOCKER_IMAGE:-}
+      MCP_DSH_DOCKER_SOCKET: ${MCP_DSH_DOCKER_SOCKET:-}
+
+      DSH_PASSWORDS_ENV_FILE: ${DSH_PASSWORDS_ENV_FILE:-/data/dsh-passwords/.env}
     ports:
       - "127.0.0.1:3088:3088"
     volumes:

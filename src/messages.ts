@@ -26,6 +26,38 @@ export interface AuthUser {
 export type ApiAuth = (req: Request, res: Response, requireAdmin?: boolean) => AuthUser | null;
 
 /**
+ * 聊天 SSE 单订阅者的写缓冲上限。
+ * `res.write()` 在内部缓冲低于 highWaterMark 时返回 true，超过时返回 false；
+ * 忽略该返回值（持续对慢客户端写）会让服务端缓冲无界增长。这里把「写返回 false 后
+ * 累计未排空的字节」超过上限的订阅者直接断开——SSE 是实时推送，慢客户端重连后可经
+ * `/gateway/api/messages?since=` 增量补齐，故丢弃比持有无界缓冲更安全。
+ */
+export const CHAT_SSE_MAX_PENDING_BYTES = 1 * 1024 * 1024;
+
+/** 向单个聊天 SSE 订阅者写一帧；返回 false 表示该订阅者应被移除（已关闭或缓冲超限）。 */
+export function pushChatSseFrame(
+  client: { res: Pick<Response, 'write' | 'writableEnded' | 'destroyed' | 'destroy'>; pendingBytes: number },
+  payload: string,
+): boolean {
+  if (client.res.writableEnded || client.res.destroyed) return false;
+  let flushed: boolean;
+  try {
+    flushed = client.res.write(payload);
+  } catch {
+    return false;
+  }
+  if (flushed) {
+    // 缓冲已在 highWaterMark 以下：下次写若背压，从零重新累计。
+    client.pendingBytes = 0;
+    return true;
+  }
+  client.pendingBytes += Buffer.byteLength(payload, 'utf8');
+  if (client.pendingBytes <= CHAT_SSE_MAX_PENDING_BYTES) return true;
+  client.res.destroy();
+  return false;
+}
+
+/**
  * 本模块用到的 DB 最小面。gateway 的 Database 实例结构兼容，可直接传入；
  * 只声明这里真正调用的方法，避免与 db.ts 的具体类型耦合。
  */
@@ -60,6 +92,14 @@ export interface MessageRouteDeps {
   nullableInt: (v: unknown) => number | null;
   /** 字符串数组清洗（截断到 max）。 */
   stringArray: (v: unknown, max?: number) => string[];
+  /**
+   * 把长连接登记到网关共享撤销表（封禁/登出/删号/改密/权限变更时由网关关闭）。
+   * 返回注销函数；重复调用幂等。未登记的长连接在撤权后仍会继续推送（撤权窗口）。
+   */
+  registerRevocableClient: (
+    userId: number,
+    client: { close: (code?: number, reason?: string) => void },
+  ) => () => void;
 }
 
 /** 注册结果：工厂持有的状态清理钩子。 */
@@ -69,23 +109,25 @@ export interface MessageRoutes {
 }
 
 export function registerMessageRoutes(app: Application, deps: MessageRouteDeps): MessageRoutes {
-  const { db, apiAuth, jsonBody, chatMediaAllowed, nullableInt, stringArray } = deps;
+  const { db, apiAuth, jsonBody, chatMediaAllowed, nullableInt, stringArray, registerRevocableClient } = deps;
 
   // ── 留言 / 聊天（SSE 广播） ────────────────────────────────
   // 订阅者带 userId，广播时按收件人过滤（与 GET /gateway/api/messages 的
   // 列表语义一致）：定向消息只推给收件人与发件人，公开消息推给所有人。
-  const chatClients = new Set<{ res: Response; userId: number }>();
+  interface ChatClient {
+    res: Response;
+    userId: number;
+    /** 写背压后累计的未排空字节（见 pushChatSseFrame / CHAT_SSE_MAX_PENDING_BYTES）。 */
+    pendingBytes: number;
+  }
+  const chatClients = new Set<ChatClient>();
   function broadcastMessage(msg: MessageRow): void {
     const payload = `data: ${JSON.stringify(msg)}\n\n`;
     for (const client of chatClients) {
       const visible =
         msg.recipient_id === null || msg.recipient_id === client.userId || msg.sender_id === client.userId;
       if (!visible) continue;
-      try {
-        client.res.write(payload);
-      } catch {
-        chatClients.delete(client);
-      }
+      if (!pushChatSseFrame(client, payload)) chatClients.delete(client);
     }
   }
 
@@ -277,14 +319,19 @@ export function registerMessageRoutes(app: Application, deps: MessageRouteDeps):
     res.setHeader('X-Accel-Buffering', 'no');
     res.flushHeaders();
     res.write(`data: ${JSON.stringify({ type: 'init', me: { id: me.userId, username: me.username, role: me.role } })}\n\n`);
-    const client = { res, userId: me.userId };
+    const client: ChatClient = { res, userId: me.userId, pendingBytes: 0 };
     chatClients.add(client);
+    // 写背压恢复：一次 write 返回 true 即代表缓冲已回到 highWaterMark 以下。
+    res.on('drain', () => { client.pendingBytes = 0; });
+    // 登记到网关撤销表：封禁/登出/删号/改密/权限变更与 WS 同口径立即断开，
+    // 不留「HTTP 已失效而 SSE 仍持续推送」的撤权窗口。
+    const unregisterClient = registerRevocableClient(me.userId, {
+      close: () => { if (!res.writableEnded) res.destroy(); },
+    });
     // 心跳：25 秒一条 SSE 注释帧。既防止代理/负载均衡器把空闲连接杀掉，
-    // 也用于探活——write 失败说明连接已死，立即移除，避免僵尸连接缓慢积累。
+    // 也用于探活——write 失败/缓冲超限说明连接已死或跟不上，立即移除。
     const heartbeat = setInterval(() => {
-      try {
-        res.write(': ping\n\n');
-      } catch {
+      if (!pushChatSseFrame(client, ': ping\n\n')) {
         clearInterval(heartbeat);
         chatClients.delete(client);
       }
@@ -294,6 +341,7 @@ export function registerMessageRoutes(app: Application, deps: MessageRouteDeps):
     const cleanup = () => {
       clearInterval(heartbeat);
       chatClients.delete(client);
+      unregisterClient();
     };
     req.on('close', cleanup);
     res.on('close', cleanup);

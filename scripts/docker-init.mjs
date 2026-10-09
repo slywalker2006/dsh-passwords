@@ -80,8 +80,14 @@ export function initializeDocker({
       firstInitialization = true;
       log(`[dsh-passwords] ${envFile} had no usable SETUP_KEY; ${setupKeyFromEnv ? 'adopted SETUP_KEY from the container environment' : 'generated one'} without replacing existing configuration`);
     }
+    // 旧卷可能已经用 SETUP_KEY 派生密钥加密数据库。已有数据库且未显式提供
+    // MCP_DB_ENC_KEY 时不能随机补写新密钥，否则下一次启动将无法解密旧数据。
+    // 新数据库才生成并固化独立密钥；显式环境变量仍由运行时优先使用。
+    const existingDb = existsSync(dbPath);
+    const providedDbEncKey = nonEmpty(env.MCP_DB_ENC_KEY, '');
+    const dbEncKey = existingDb ? providedDbEncKey : providedDbEncKey || randomBytes(32).toString('hex');
     appendMissingEnv(envFile, {
-      MCP_DB_ENC_KEY: randomBytes(32).toString('hex'),
+      ...(dbEncKey === '' ? {} : { MCP_DB_ENC_KEY: dbEncKey }),
       MCP_DB_PATH: dbPath,
       MCP_GATEWAY_AUTO_TLS: '0',
       MCP_GATEWAY_HOST: '0.0.0.0',

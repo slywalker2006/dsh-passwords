@@ -213,21 +213,34 @@ const WORKSPACE_PACKAGE = '@deepseek-ai/dsh-client-ui-workspace';
 const WORKSPACE_FILE = path.join('lib', 'client.js');
 const STARTUP_PACKAGE = '@deepseek-ai/dsh-web-app';
 const STARTUP_FILE = path.join('lib', 'startup.js');
+const HOST_WEBSERVER_PACKAGE = '@deepseek-ai/dsh-host-webserver';
+const HOST_WEBSERVER_FILE = path.join('lib', 'index.js');
 const CONNECTION_PACKAGE = '@deepseek-ai/dsh-client-connection';
 const CONNECTION_FILE = path.join('lib', 'index.js');
 const AUTH_COOKIE_PATCH_MARK = 'dshpw-authenticated-cookie';
 const AUTH_COOKIE_PATCH_HARDEN_MARK = 'dshpw-authenticated-cookie-loopback-v2';
-// dsh 上游安全闸：拒绑 0.0.0.0（防把可执行 RPC 暴露到网络）。分容器拓扑中网关容器
-// 要跨容器访问 dsh web，但 dsh 只允许回环——本子补丁默认关闭（MCP_DSH_PATCH_ALLOW_BIND_ALL=1
-// 开启），开启后允许 dsh 绑所有网卡，使另一容器的网关能访问到 dsh web。
+// dsh 上游安全闸有「两处」拒绑通配地址，两处都要放行，opt-in 的 bind-all 才真正生效：
+//   A. dsh-web-app/lib/startup.js —— CLI 参数闸：`if (<通配条件>) program.error(...)`
+//   B. dsh-host-webserver/lib/index.js —— WebServer.Config.host 校验：`if (isWildcardAddress(parsed)) throw new Error(...)`
+// 只放行 A 会让 status 变绿却仍在 B 处启动即抛错（WebServer 在 listen 前校验配置），
+// 所以状态与注入都必须同时核验两闸。
+//
+// 锚点收窄到「已验证的通配拒绝条件」，不用宽松的 if(options.host…) 泛匹配，避免误吃 TLS
+// 或其它 host 校验：
+//   alpha.1（启动闸）: `options.host === "0.0.0.0"`
+//   alpha.2（启动闸）: `options.host !== void 0 && isWildcardHost(options.host)`
+//   alpha.2（webserver 闸）: `isWildcardAddress(parsed)`
+// 未列出的形态不匹配即不注入；不新增按版本分支的兼容层。
 const BIND_ALL_MARK = 'dshpw-bindall';
-const BIND_ALL_FROM =
-  'if (options.host === "0.0.0.0") program.error("error: --host 0.0.0.0 is intentionally not supported yet for safety: it would expose remote code execution to the network; use 127.0.0.1 instead");';
+const BIND_ALL_GUARD_RE =
+  /if\s*\(\s*(options\.host\s*===\s*"0\.0\.0\.0"|options\.host\s*!==\s*void 0\s*&&\s*isWildcardHost\(\s*options\.host\s*\))\s*\)\s*program\.error\(\s*(?:`[\s\S]*?`|'[\s\S]*?'|"[\s\S]*?")\s*\)/;
+// 保留上游原判定条件，只把 program.error 降级为 console.warn：通配地址放行，不重写判定逻辑。
 const BIND_ALL_TO =
-  `/* ${BIND_ALL_MARK} */ if (options.host === "0.0.0.0") console.warn("[dshpw] --host 0.0.0.0 enabled for gateway reachability");`;
-// 结构化闸签名：不依赖完整报错文案——上游改措辞仍能识别「拒绑闸还在」，
-// 真正移除拒绑（原生支持 0.0.0.0）才不匹配。用于 fail-closed 状态判定。
-const BIND_ALL_GUARD_RE = /program\.error\(\s*['"][^'"]*0\.0\.0\.0[^'"]*['"]/;;
+  `/* ${BIND_ALL_MARK} */ if ($1) console.warn("[dshpw] wildcard --host allowed for gateway reachability");`;
+const WS_BIND_GUARD_RE =
+  /if\s*\(\s*(isWildcardAddress\(\s*parsed\s*\))\s*\)\s*throw\s+new\s+Error\(\s*(?:`[\s\S]*?`|'[\s\S]*?'|"[\s\S]*?")\s*\)/;
+const WS_BIND_ALL_TO =
+  `/* ${BIND_ALL_MARK} */ if ($1) console.warn("[dshpw] webserver wildcard host allowed for gateway reachability");`;
 
 /**
  * Add the alpha.1 Host-only Cookie minting bridge. The official browser auth
@@ -296,6 +309,36 @@ function patchConnectionAuthCookie(content: string): string | null {
 function bindAllEnabled(): boolean {
   const raw = (process.env.MCP_DSH_PATCH_ALLOW_BIND_ALL ?? '').trim().toLowerCase();
   return ['1', 'true', 'yes'].includes(raw);
+}
+
+/** bind-all 的两个目标：启动闸（startup.js）与 webserver 配置闸（index.js）。 */
+function findBindAllTargets(dshRoot: string, profileDir: string): string[][] {
+  return [
+    findDshBundleFiles(dshRoot, STARTUP_PACKAGE, STARTUP_FILE, profileDir),
+    findDshBundleFiles(dshRoot, HOST_WEBSERVER_PACKAGE, HOST_WEBSERVER_FILE, profileDir),
+  ];
+}
+
+/**
+ * 对单个 bind-all 目标应用结构化闸替换：先按哈希元数据迁移旧备份，仅在闸仍匹配时
+ * 用放行版本覆盖并留存原始备份。返回是否发生改动。
+ */
+function patchBindAllGuard(file: string, guardRe: RegExp, replacement: string): boolean {
+  const content = readFileSync(file, 'utf8');
+  migrateLegacyBackup(file, content, (original) =>
+    guardRe.test(original) ? original.replace(guardRe, replacement) : null,
+  );
+  if (!guardRe.test(content)) return false;
+  const patched = content.replace(guardRe, replacement);
+  ensureOriginalBackup(file, content, patched);
+  writeFileSync(file, patched);
+  return true;
+}
+
+/** bind-all 目标当前状态：已注入标记，或本就不含已验证的通配拒绝闸。 */
+function bindAllGuardSatisfied(file: string, guardRe: RegExp): boolean {
+  const content = readFileSync(file, 'utf8');
+  return content.includes(BIND_ALL_MARK) || !guardRe.test(content);
 }
 
 const SETTINGS_FROM = 'connection.isLoopback ? "host" : "memory"';
@@ -500,12 +543,13 @@ export function patchStatus(
   let bindAll = true;
   try {
     if (bindAllEnabled()) {
-      const startupFiles = findDshBundleFiles(dshRoot, STARTUP_PACKAGE, STARTUP_FILE, profileDir);
-      const st = startupFiles.length === 0 ? null : startupFiles.every((startupFile) => {
-        const content = readFileSync(startupFile, 'utf8');
-        return content.includes(BIND_ALL_MARK) || !BIND_ALL_GUARD_RE.test(content);
-      });
-      bindAll = st === true;
+      const [startupFiles, webServerFiles] = findBindAllTargets(dshRoot, profileDir);
+      // 两闸都必须满足：目标缺失即无法证实，fail-closed 报 false。
+      bindAll =
+        startupFiles.length > 0 &&
+        startupFiles.every((file) => bindAllGuardSatisfied(file, BIND_ALL_GUARD_RE)) &&
+        webServerFiles.length > 0 &&
+        webServerFiles.every((file) => bindAllGuardSatisfied(file, WS_BIND_GUARD_RE));
     }
   } catch {
     bindAll = false;
@@ -619,30 +663,25 @@ export function applyRemotePatch(
   }
 
   // 4) 允许 dsh web 绑 0.0.0.0（默认关闭：MCP_DSH_PATCH_ALLOW_BIND_ALL=1 才打；
-  //    分容器拓扑需要网关容器跨容器访问 dsh web）。目标文件缺失则跳过，不影响 1-3。
-  //    开关关闭时反向自愈：恢复曾打过的 startup.js（见下）。
+  //    分容器拓扑需要网关容器跨容器访问 dsh web）。必须同时放行启动闸（startup.js）
+  //    与 webserver 配置闸（dsh-host-webserver/index.js），否则重启时 WebServer 校验即报错。
+  //    目标文件缺失则跳过，不影响 1-3。开关关闭时反向自愈两闸（见下）。
   if (bindAllEnabled()) {
-    const stFiles = findDshBundleFiles(dshRoot, STARTUP_PACKAGE, STARTUP_FILE, profileDir);
-    for (const stFile of stFiles) {
-      const st = readFileSync(stFile, 'utf8');
-      migrateLegacyBackup(stFile, st, (original) =>
-        original.includes(BIND_ALL_FROM) ? original.replace(BIND_ALL_FROM, BIND_ALL_TO) : null,
-      );
-      if (st.includes(BIND_ALL_FROM)) {
-        const patched = st.replace(BIND_ALL_FROM, BIND_ALL_TO);
-        ensureOriginalBackup(stFile, st, patched);
-        writeFileSync(stFile, patched);
-        changed = true;
-      }
+    const [startupFiles, webServerFiles] = findBindAllTargets(dshRoot, profileDir);
+    for (const file of startupFiles) {
+      if (patchBindAllGuard(file, BIND_ALL_GUARD_RE, BIND_ALL_TO)) changed = true;
+    }
+    for (const file of webServerFiles) {
+      if (patchBindAllGuard(file, WS_BIND_GUARD_RE, WS_BIND_ALL_TO)) changed = true;
     }
   } else {
-    const stFiles = findDshBundleFiles(dshRoot, STARTUP_PACKAGE, STARTUP_FILE, profileDir);
-    for (const stFile of stFiles) {
-      // 开关关闭时自愈：曾开启过的部署（共享卷/复用状态卷）会残留已移除闸的
-      // startup.js，静默保留等于关闭开关后安全闸仍未恢复。仅在当前内容与备份
-      // 元数据完全吻合时恢复（与 rollbackPatch 同口径，防跨版本污染）。
-      if (currentMatchesPatchedBackup(stFile)) {
-        writeFileSync(stFile, readFileSync(stFile + BAK_SUFFIX));
+    // 开关关闭时自愈：曾开启过的部署（共享卷/复用状态卷）会残留已移除闸的文件，
+    // 静默保留等于关闭开关后安全闸仍未恢复。仅在当前内容与备份元数据完全吻合时
+    // 恢复（与 rollbackPatch 同口径，防跨版本污染）。
+    const [startupFiles, webServerFiles] = findBindAllTargets(dshRoot, profileDir);
+    for (const file of [...startupFiles, ...webServerFiles]) {
+      if (currentMatchesPatchedBackup(file)) {
+        writeFileSync(file, readFileSync(file + BAK_SUFFIX));
         changed = true;
       }
     }
@@ -664,7 +703,8 @@ export function rollbackPatch(
   const wsFiles = findDshBundleFiles(dshRoot, WORKSPACE_PACKAGE, WORKSPACE_FILE, profileDir);
   const stFiles = findDshBundleFiles(dshRoot, STARTUP_PACKAGE, STARTUP_FILE, profileDir);
   const connectionFiles = findDshBundleFiles(dshRoot, CONNECTION_PACKAGE, CONNECTION_FILE, profileDir);
-  const targets = [...new Set([...settingsFiles, ...wsFiles, ...stFiles, ...connectionFiles])];
+  const webServerFiles = findDshBundleFiles(dshRoot, HOST_WEBSERVER_PACKAGE, HOST_WEBSERVER_FILE, profileDir);
+  const targets = [...new Set([...settingsFiles, ...wsFiles, ...stFiles, ...connectionFiles, ...webServerFiles])];
 
   // Preflight every target before writing any file. A partial rollback would leave
   // DSH in an undocumented mixed state when another tool has changed one bundle.

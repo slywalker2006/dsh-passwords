@@ -32,7 +32,11 @@ import { connect as tlsConnect } from 'node:tls';
 import { type Application, type Request, type Response } from 'express';
 import { createRequire } from 'node:module';
 import type { AuthService } from './auth.js';
-import type { Database, UserPermissionsRow } from './db.js';
+import { MuxHeartbeat, type MuxHeartbeatCloseSource, type MuxHeartbeatOptions, type MuxHeartbeatSocket } from './remote-mux-heartbeat.js';
+import { createRemoteMuxDiagnosticsSession, type RemoteMuxCloseSource, type RemoteMuxStallKind } from './remote-mux-diagnostics.js';
+import { MuxSender, MuxSenderBudget, type MuxAcceptOutcome, type MuxFragmentSocket, type MuxRejectKind } from './remote-mux-sender.js';
+import { loadingTimeline, eventLoopDelaySampler } from './loading-timeline.js';
+import { samePathForMatch, type Database, type UserPermissionsRow } from './db.js';
 import type { Lang } from './i18n.js';
 import { t } from './i18n.js';
 import {
@@ -52,6 +56,8 @@ import {
   directoryEntryVisible,
   endpointAllowed,
   extractPathFromBody,
+  extractDirectoryCreatePath,
+  extractWorkspaceCreatePath,
   extractSessionId,
   extractWorkspaceId,
   extractWorkspaceRenamePaths,
@@ -69,6 +75,9 @@ import {
   isWorkspaceDirectoryCreate,
   isWorkspaceOrderWrite,
   isWorkspaceRestricted,
+  isAbsoluteLikePath,
+  isFilesystemRootPath,
+  isFullyQualifiedPath,
   normalizePath,
   parseSessionAddress,
   pathWithin,
@@ -99,10 +108,16 @@ const WebSocket = require('ws') as {
   };
 };
 
+/** ws readyState 的 CLOSING（RFC 6455 / WHATWG = 2）。手写形状沿用 gateway.ts 只声明 OPEN，
+ *  而关闭握手判定另需区分「已进入 CLOSING」与「无法再握手」，故在此显式命名。 */
+const WS_CLOSING = 2;
+
 /** 与 gateway.ts L111-L137 逐字一致（结构类型，跨模块兼容）。 */
 /** 网关内部扩展请求：权限执行时把用户/权限附在 req 上，供后续中间件与代理读取 */
 type Req = Request & {
   dshpwUser?: number;
+  /** 已认证用户名（审计 actor）；权限行仍只挂子用户。 */
+  dshpwUsername?: string;
   dshpwPerms?: UserPermissionsRow;
   /** 会话目录白名单校验用：本次请求判定出的目标工作区路径（session.create/fork 时）；
    *  由 needsFolderCheck 写入，供 session.create 响应回调记录 sessionId→cwd 缓存 */
@@ -124,8 +139,15 @@ type Req = Request & {
   dshpwCreatedSessionId?: string;
   /** session/selectModel 已通过白名单校验的会话 ID；响应回调用它登记会话有效模型。 */
   dshpwModelSessionId?: string;
-  /** directoryPicker/list 响应过滤：ancestors 模式只保留通往授权根的条目。 */
-  dshpwDirListFilter?: { mode: 'ancestors'; roots: string[]; showRoots?: boolean };
+  /** directoryPicker/list 响应过滤：authorized 只逐条过滤敏感/他人子树；ancestors 再按授权根裁剪条目与 crumbs。 */
+  dshpwDirListFilter?: {
+    mode: 'authorized' | 'ancestors';
+    /** 授权可读根（canonical 形态）：条目可见性与导航判定。 */
+    readRoots: string[];
+    /** 入口注入用的词法根（readable roots）。 */
+    injectRoots: string[];
+    showRoots?: boolean;
+  };
 
 };
 
@@ -172,41 +194,65 @@ type RemoteMuxUserConnection = {
   socket: any;
   publishSessionAttachment: (sessionId: string, cwd: string) => void;
   publishWorkspaceUpsert: (workspace: Record<string, unknown>) => void;
+  /**
+   * 权限/身份撤销的受限入口：gateway 在下发 socket.close 之前调用它，立即 dispose 两条腿的
+   * 发送器与心跳、把诊断首因锁定为 permission-revoked 并 arm 5s grace，避免关闭握手完成前
+   * 旧 carrier 继续携带已撤销的授权快照。只接受受限的关闭码，不向调用方暴露
+   * active/发送器/诊断等内部状态；重复调用幂等。
+   */
+  teardownCarrier: (code?: number) => void;
 };
 
 /** WebSocket.OPEN；有界发送 helper 不依赖 ws，故本地保留常量。 */
 const MUX_SOCKET_OPEN = 1;
 
+/**
+ * MuxSender 用户态写入前导水位（传输规格 §3.1）：分片模式下把已提交给 ws/Node 的
+ * `bufferedAmount` 压在 256 KiB 内，降到 128 KiB 再续片。它们是**用户态**前导指标，与
+ * 共享预队列 `REMOTE_MUX_MAX_PENDING_BYTES`（2 MiB）及单条/接受容量预算相互独立，不得混用。
+ */
+const REMOTE_MUX_HIGH_WATER_BYTES = 256 * 1024;
+const REMOTE_MUX_LOW_WATER_BYTES = 128 * 1024;
+
 /** Remote mux 有界发送所需的最小 socket 面（生产为 ws 连接，测试为 stub）。 */
 export type MuxBufferedSocket = {
   readonly readyState: number;
   readonly bufferedAmount: number;
-  send(data: string): void;
+  /**
+   * 写出一个文本帧。`onFlush` 在该帧的**本地写入完成**后回调：成功即一次可解释的
+   * 本地写入进度；带 error 表示本地写入失败，不是进度，调用方按各自 send failure 路径处理。
+   */
+  send(data: string, onFlush?: (error?: Error) => void): void;
 };
 
-export type MuxSendOutcome = 'sent' | 'skipped' | 'overflow' | 'failed';
+export type MuxSendOutcome = 'sent' | 'skipped' | 'oversized' | 'backpressure' | 'failed';
 
 /**
  * Remote mux 两侧共用的有界发送。`bufferedAmount` 是 socket 内尚未冲出的字节：
  * 总积压上限为 `limit + maxFrameBytes`，即正常待发送余量再加一个最大合法帧，
  * 允许单个历史快照及其后的帧正常排队，但不能让多个慢消费帧无界累积。检查写入后的
- * 预计总量，超过上限时调用方以 1013 关闭。返回：
- *  - 'sent'     写出（顺序不变）；
- *  - 'skipped'  socket 非 OPEN，未写出也无需收尾；
- *  - 'overflow' 写入后会超过缓冲上限，调用方以 1013 关闭；
- *  - 'failed'   `send` 抛异常，调用方以 1011 关闭。
+ * 预计总量，超过上限时调用方以 1013 关闭。单帧自身超限与聚合背压分开返回，便于
+ * 下行把单个逻辑流隔离，而不误杀共享 carrier。`onFlush` 是写出帧的本地写入完成回调
+ * （ws 的 send 回调）：成功表示一次可解释的本地写入进度，带 error 不是进度。返回：
+ *  - 'sent'         写出（顺序不变）；
+ *  - 'skipped'      socket 非 OPEN，未写出也无需收尾；
+ *  - 'oversized'    单帧超过最大合法帧大小；
+ *  - 'backpressure' 写入后会超过聚合缓冲上限，调用方以 1013 关闭；
+ *  - 'failed'       `send` 抛异常，调用方以 1011 关闭。
  */
 export function sendMuxFrameBounded(
   socket: MuxBufferedSocket,
   text: string,
   limit: number,
   maxFrameBytes: number,
+  onFlush?: (error?: Error) => void,
 ): MuxSendOutcome {
   if (socket.readyState !== MUX_SOCKET_OPEN) return 'skipped';
   const frameBytes = Buffer.byteLength(text);
-  if (frameBytes > maxFrameBytes || socket.bufferedAmount + frameBytes > limit + maxFrameBytes) return 'overflow';
+  if (frameBytes > maxFrameBytes) return 'oversized';
+  if (socket.bufferedAmount + frameBytes > limit + maxFrameBytes) return 'backpressure';
   try {
-    socket.send(text);
+    socket.send(text, onFlush);
   } catch {
     return 'failed';
   }
@@ -252,6 +298,7 @@ export interface ProxyDeps {
   hostEventFilter: (userId: number, perms: UserPermissionsRow) => Transform;
   INJECT_SCRIPT: string;
   isPlainJsonRecord: (value: unknown) => value is Record<string, unknown>;
+  isSensitivePath: (candidate: string) => boolean;
   isTokenRevoked: (token: string) => boolean;
   langOf: (req: Request) => Lang;
   mergeAuthorizedAccess: (userId: number, perms: UserPermissionsRow, grants: ReadonlySet<string>, visible: ReadonlyMap<string, string>) => Map<string, string>;
@@ -264,6 +311,7 @@ export interface ProxyDeps {
   OFFICIAL_ACCOUNT_REMOTE_ENDPOINTS: Set<string>;
   OFFICIAL_JOB_REMOTE_ENDPOINTS: Set<string>;
   OFFICIAL_TERMINAL_HTTP_RE: RegExp;
+  OFFICIAL_TERMINAL_REMOTE_ENDPOINTS: Set<string>;
 
   originHostMatches: (req: OriginRequest) => boolean;
   parseRemoteMuxClientFrame: (data: Buffer, allowAnyEndpoint: boolean) => { type: "open"; streamId: string; endpoint: string; payload: unknown; } | { type: "cancel"; streamId: string; } | { type: "item"; streamId: string; value?: unknown; } | { type: "end"; streamId: string; } | null;
@@ -277,8 +325,10 @@ export interface ProxyDeps {
   recordSessionModelSelection: (sessionId: string, selection: AllowedModelSpec | null) => void;
   registerUserWebSocketClient: (userId: number, client: { close: (code?: number, reason?: string) => void; }) => (() => void);
   registryAuthorizedSockets: Set<Duplex>;
-  REMOTE_MUX_HEARTBEAT_INTERVAL_MS: 2000;
-  REMOTE_MUX_MAX_MISSED_HEARTBEATS: 2;
+  REMOTE_MUX_FRAGMENT_BYTES: number;
+  REMOTE_MUX_PING_INTERVAL_MS: number;
+  REMOTE_MUX_PONG_TIMEOUT_MS: number;
+  REMOTE_MUX_WRITE_STALL_MS: number;
   REMOTE_MUX_MAX_PAYLOAD_BYTES: number;
   REMOTE_MUX_MAX_PENDING_BYTES: number;
   REMOTE_MUX_MAX_STREAMS: 64;
@@ -314,7 +364,7 @@ export interface ProxyDeps {
   upstreamPort: number;
   upstreamScheme: "https" | "http";
   upstreamTransport: typeof https | typeof http;
-  upstreamWsOptions: () => { headers: Record<string, string>; rejectUnauthorized?: boolean; agent?: any; maxPayload: number; };
+  upstreamWsOptions: () => { headers: Record<string, string>; rejectUnauthorized?: boolean; agent?: any; maxPayload: number; perMessageDeflate?: false; };
   userAccessEpochFor: (userId: number) => number;
   userArchivedSessionIds: Map<number, Set<string>>;
   userSessionAccess: Map<number, Map<string, string>>;
@@ -450,7 +500,14 @@ export function createSandboxApplier(deps: SandboxApplierDeps): {
  */
 const SCHEDULE_CATALOG_RE = /^\/api\/schedule[.\/]catalog$/;
 
+/**
+ * 子用户目录浏览/创建的路径必须“完全限定”：POSIX 下为绝对路径；Windows 下只有盘符限定
+ * （`C:\…`）或完整 UNC（`\\server\share…`）才算——`\foo`、`/foo` 这类 rooted 形式会落到
+ * 进程当前盘符，属于含糊输入，拒绝以免与授权根判定错位（与 DSH `fullyQualified` 同口径）。
+ */
+
 export function registerProxyRoutes(app: Application, deps: ProxyDeps): ProxyRoutesHandle {
+  const processMuxBudget = new MuxSenderBudget(512 * 1024 * 1024);
   const {
     db,
     auth,
@@ -481,6 +538,7 @@ export function registerProxyRoutes(app: Application, deps: ProxyDeps): ProxyRou
     hostEventFilter,
     INJECT_SCRIPT,
     isPlainJsonRecord,
+    isSensitivePath,
     isTokenRevoked,
     langOf,
     mergeAuthorizedAccess,
@@ -493,6 +551,7 @@ export function registerProxyRoutes(app: Application, deps: ProxyDeps): ProxyRou
     OFFICIAL_ACCOUNT_REMOTE_ENDPOINTS,
     OFFICIAL_JOB_REMOTE_ENDPOINTS,
     OFFICIAL_TERMINAL_HTTP_RE,
+    OFFICIAL_TERMINAL_REMOTE_ENDPOINTS,
 
     originHostMatches,
     parseRemoteMuxClientFrame,
@@ -506,11 +565,13 @@ export function registerProxyRoutes(app: Application, deps: ProxyDeps): ProxyRou
     recordSessionModelSelection,
     registerUserWebSocketClient,
     registryAuthorizedSockets,
-    REMOTE_MUX_HEARTBEAT_INTERVAL_MS,
-    REMOTE_MUX_MAX_MISSED_HEARTBEATS,
+    REMOTE_MUX_FRAGMENT_BYTES,
     REMOTE_MUX_MAX_PAYLOAD_BYTES,
     REMOTE_MUX_MAX_PENDING_BYTES,
     REMOTE_MUX_MAX_STREAMS,
+    REMOTE_MUX_PING_INTERVAL_MS,
+    REMOTE_MUX_PONG_TIMEOUT_MS,
+    REMOTE_MUX_WRITE_STALL_MS,
     remoteAccountRequestIsEmpty,
     remoteEventOwnership,
     remoteEventOwnershipKey,
@@ -618,6 +679,26 @@ export function registerProxyRoutes(app: Application, deps: ProxyDeps): ProxyRou
     const pending = pendingCreatedDirectoryPaths(userId);
     if (deleted === undefined || deleted.size === 0) return pending;
     return pending.filter((entry) => !deleted.has(deletedOwnedWorkspaceKey(entry)));
+  };
+
+  // ── Issue #38 审计：子用户新建目录 / 工作区登记 ─────────────────────
+  // 只记 actor（用户名）、ip、user-agent 与结果摘要；目标路径仅在非敏感时明文记录，
+  // 敏感路径只留叶子名，绝不落完整敏感主机路径、请求体、token 或密码。db.audit
+  // 自身吞异常且不返回值，因此审计写入失败既不阻断也不改变任何授权结果。
+  const auditPathSummary = (value: string): string | { sensitive: true; leaf: string } => {
+    const normalized = normalizePath(value);
+    if (isSensitivePath(value) || isSensitivePath(normalized)) {
+      return { sensitive: true, leaf: path.basename(normalized) };
+    }
+    return normalized;
+  };
+  const auditDirectoryEvent = (eventType: string, req: Request, reqAs: Req, detail: Record<string, unknown>): void => {
+    db.audit(eventType, {
+      username: reqAs.dshpwUsername ?? null,
+      ip: req.ip,
+      userAgent: req.headers['user-agent'] ?? null,
+      detail: JSON.stringify(detail),
+    });
   };
 
   // ── 反向代理私有 helper（原 gateway.ts L3808-L3924）──────────────────────
@@ -838,7 +919,7 @@ export function registerProxyRoutes(app: Application, deps: ProxyDeps): ProxyRou
     const reqAs = req as Req;
     // alpha.1 的 uploadFileBinary 是 Connection 注册的独立原始字节流，
     // 不会进入后面的 JSON ownership 检查。它必须在 pipe 到上游之前完成
-    // sessionId 授权，否则 allow_upload=true 会变成“可向任意已知会话上传”。
+    // sessionId 授权，否则已认证用户会变成“可向任意已知会话上传”。
     if (
       reqAs.dshpwUser !== undefined &&
       reqAs.dshpwIsAdmin !== true &&
@@ -1001,16 +1082,34 @@ export function registerProxyRoutes(app: Application, deps: ProxyDeps): ProxyRou
             }
             if (businessOk) {
               if (reqAs.dshpwWorkspaceCreate === true) {
-                if (createdPath !== null && normalizePath(createdPath) === reqAs.dshpwWorkspacePath) {
+                const grantUserId = reqAs.dshpwUser!;
+                const grantPath = reqAs.dshpwWorkspacePath!;
+                if (createdPath !== null && normalizePath(createdPath) === grantPath) {
                   // 上游 created:true 只表示 DSH registry 新增了条目，不代表目录由
                   // 当前子用户创建。主用户分配的共享目录不能因此变成私有工作区。
-                  const owned = db.listUserWorkspacePaths(reqAs.dshpwUser!);
-                  const pending = visiblePendingCreatedDirectories(reqAs.dshpwUser!);
-                  if (created && workspaceRegistrationAllowed(reqAs.dshpwWorkspacePath, [], owned, pending)) {
-                    db.addUserWorkspace(reqAs.dshpwUser!, reqAs.dshpwWorkspacePath);
-                    db.addAllowedFolder(reqAs.dshpwUser!, reqAs.dshpwWorkspacePath);
+                  // 迟到回包防线：管理员可能在 await 上游期间撤权/关开关/推进 epoch；
+                  // 回包到达时以当前 live 权限行与请求 epoch 复核，绝不重赋读取 grant。
+                  const owned = db.listUserWorkspacePaths(grantUserId);
+                  const pending = visiblePendingCreatedDirectories(grantUserId);
+                  const livePerms = effectivePermissions(grantUserId);
+                  const epochUnchanged = userAccessEpochFor(grantUserId) === sessionAccessRequestEpoch;
+                  if (created && epochUnchanged && livePerms.allow_workspace_create &&
+                    folderAllowed(grantPath, livePerms.allowed_folders) &&
+                    // 迟到的登记回包同样复核敏感基：请求通过到回包之间 realpath/链接可能
+                    // 改指敏感目录，登记与请求门禁必须同口径。
+                    !isSensitivePath(grantPath) && !isSensitivePath(canonicalizePathBestEffort(grantPath)) &&
+                    // 请求通过到回包之间另一子用户可能已登记同名/祖先子树：必须以当前
+                    // live 所有权快照复核单向子树重叠，否则后到的回包会把该目录登记成本
+                    // 用户私有工作区（跨租户 TOCTOU）。
+                    !workspaceSubtreeOverlap(grantUserId, grantPath) &&
+                    workspaceRegistrationAllowed(grantPath, [], owned, pending)) {
+                    db.addUserWorkspace(grantUserId, grantPath);
+                    db.addAllowedFolder(grantUserId, grantPath);
                     // 该路径重新成为活跃工作区：解除删除墓碑，避免后续 pending 被误屏蔽。
-                    clearDeletedOwnedWorkspace(reqAs.dshpwUser!, reqAs.dshpwWorkspacePath);
+                    clearDeletedOwnedWorkspace(grantUserId, grantPath);
+                    auditDirectoryEvent('workspace_registered', req, reqAs, {
+                      result: 'ok', path: auditPathSummary(grantPath),
+                    });
                   }
                   // 立即更新该用户的 workspaceId→path 映射并向已建立的 Remote mux
                   // 连接补发过滤后的 upsert：否则紧随其后的 session.create（带
@@ -1096,30 +1195,39 @@ export function registerProxyRoutes(app: Application, deps: ProxyDeps): ProxyRou
         // 解析失败只影响记账（登记变得更严格），响应本身原样透传。
         if (reqAs.dshpwUser !== undefined && reqAs.dshpwIsAdmin !== true &&
           req.method === 'POST' && isWorkspaceDirectoryCreate(proxyPath)) {
+          const recordUserId = reqAs.dshpwUser;
           bufferUpstream(upstreamRes, res, (raw) => {
             try {
               const body = decodeUpstreamBody(raw, String(upstreamRes.headers['content-encoding'] ?? ''));
               const parsed = JSON.parse(body.toString('utf8')) as Record<string, unknown>;
               const result = parsed.result;
               if (isPlainJsonRecord(result) && result.ok === true && typeof result.value === 'string' && result.value.length > 0) {
-                // 仅新建工作区用户的 __deny__ 表示“暂无预分配根目录”，刚由本人创建的
-                // 目录仍必须进入 pending，供 picker 和 workspace/create 使用；预存目录
-                // 不在 pending 中，仍由后续登记门禁拒绝。
-                // 但只登记「本次请求的父目录之内」的新目录：DSH 的 createDirectory 只接受
+                // pending 只是「刚创建目录」的登记凭据，不再授予浏览或创建例外。
+                // 只登记「本次请求的父目录之内」的新目录：DSH 的 createDirectory 只接受
                 // 单个路径段（拒绝 . / .. / 含分隔符），若上游被替换或回归，返回路径可能逃逸
                 // 出请求的父目录，而 pending 命中即可把该越界目录登记为私有工作区并写入
-                // 白名单。父目录解析不出（请求未带 path）时同样记账不成立（fail-closed，
-                // 登记通道仍要求已分配/自建）。
+                // 白名单。父目录解析不出（请求未带 path）时同样记账不成立（fail-closed）。
+                // 词法与 canonical 必须**同时**命中请求父目录（与创建门禁同口径）：
+                // 只要求其一即可时，根内目录链接能把回包 canonical 带出根，逃逸路径会被记入 pending。
                 const requestedParent = reqAs.dshpwSessionCwd;
                 const createdPath = canonicalizePathBestEffort(result.value);
-                const insideRequestedParent = requestedParent !== undefined && (
-                  pathWithin(result.value, requestedParent) ||
-                  pathWithin(createdPath, canonicalizePathBestEffort(requestedParent))
-                );
-                if (insideRequestedParent) {
+                const insideRequestedParent = requestedParent !== undefined &&
+                  pathWithin(result.value, requestedParent) &&
+                  pathWithin(createdPath, canonicalizePathBestEffort(requestedParent));
+                // 迟到回包防线：管理员可能在 await 上游期间撤权/关开关/推进 epoch；
+                // 回包到达时以当前 live 权限行与请求 epoch 复核，且新目录仍须落在当前
+                // 可读范围内，避免撤权后旧回复重新登记 pending。
+                const livePerms = effectivePermissions(recordUserId);
+                const epochUnchanged = userAccessEpochFor(recordUserId) === sessionAccessRequestEpoch;
+                const stillReadable = folderAllowed(result.value, livePerms.allowed_folders) &&
+                  folderAllowed(createdPath, livePerms.allowed_folders);
+                if (insideRequestedParent && epochUnchanged && livePerms.allow_workspace_create && stillReadable) {
                   // 用户重新创建了同名目录：解除删除墓碑，使其进入正常 pending 信任窗口。
-                  clearDeletedOwnedWorkspace(reqAs.dshpwUser!, createdPath);
-                  recordPendingCreatedDirectory(reqAs.dshpwUser!, createdPath);
+                  clearDeletedOwnedWorkspace(recordUserId, createdPath);
+                  recordPendingCreatedDirectory(recordUserId, createdPath);
+                  auditDirectoryEvent('directory_created', req, reqAs, {
+                    result: 'ok', path: auditPathSummary(createdPath),
+                  });
                 }
               }
             } catch {
@@ -1132,8 +1240,9 @@ export function registerProxyRoutes(app: Application, deps: ProxyDeps): ProxyRou
           return;
         }
 
-        // ── directoryPicker/list 响应过滤（子用户祖先导航模式）：只保留通往授权根的
-        // 条目，隐藏无关目录名；无法解析时 fail-closed，不回放未过滤清单。
+        // ── directoryPicker/list 响应过滤（子用户）：逐条剔除敏感（lexical+canonical）与他人
+        // 工作区子树；ancestors 模式再按授权根/创建根裁剪条目与 crumbs；home/path 未授权时
+        // 替换为授权根。结构畸形 fail-closed（502），绝不回放未过滤清单。
         if (reqAs.dshpwDirListFilter !== undefined && reqAs.dshpwUser !== undefined) {
           const filter = reqAs.dshpwDirListFilter;
           bufferUpstream(upstreamRes, res, (raw) => {
@@ -1141,21 +1250,62 @@ export function registerProxyRoutes(app: Application, deps: ProxyDeps): ProxyRou
               const body = decodeUpstreamBody(raw, String(upstreamRes.headers['content-encoding'] ?? ''));
               const parsed = JSON.parse(body.toString('utf8')) as Record<string, unknown>;
               const result = parsed.result;
-              if (isPlainJsonRecord(result) && result.ok === true && isPlainJsonRecord(result.value) && Array.isArray(result.value.entries)) {
-                const visibleEntries = (result.value.entries as unknown[]).filter((entry) =>
-                  isPlainJsonRecord(entry) && typeof entry.path === 'string' && directoryEntryVisible(entry.path, filter.roots),
-                );
+              if (isPlainJsonRecord(result) && result.ok === true) {
+                if (!isPlainJsonRecord(result.value)) {
+                  // ok:true 但缺列表结构 → 畸形，fail-closed。
+                  throw new Error('directory listing shape invalid');
+                }
+                const value = result.value;
+                // 结构畸形一律 fail-closed：不做“只过滤 entries 就透传”的半处理，
+                // 否则 crumbs/home/path 会把未过滤的宿主目录信息原样放回。
+                if (typeof value.path !== 'string' || typeof value.home !== 'string' ||
+                    !Array.isArray(value.crumbs) || !Array.isArray(value.entries)) {
+                  throw new Error('directory listing shape invalid');
+                }
+                const userId = reqAs.dshpwUser!;
+                // 条目可见性只看当前可读根（allowed_folders）；创建范围与之同源，无独立导航集。
+                const navRoots = [...filter.readRoots, ...filter.injectRoots];
+                // 敏感（lexical + canonical）与他人工作区子树（lexical + canonical）逐条剔除。
+                const blockedEntry = (candidate: string): boolean => {
+                  const canonicalCandidate = canonicalizePathBestEffort(candidate);
+                  return isSensitivePath(candidate) || isSensitivePath(canonicalCandidate) ||
+                    workspaceSubtreeOverlap(userId, candidate) || workspaceSubtreeOverlap(userId, canonicalCandidate);
+                };
+                const navigableEntry = (candidate: string): boolean =>
+                  directoryEntryVisible(candidate, navRoots) ||
+                  directoryEntryVisible(canonicalizePathBestEffort(candidate), navRoots);
+                value.entries = (value.entries as unknown[]).filter((entry) => {
+                  if (!isPlainJsonRecord(entry) || typeof entry.path !== 'string') return false;
+                  const entryPath = entry.path;
+                  if (blockedEntry(entryPath)) return false;
+                  if (filter.mode === 'authorized') return true;
+                  return navigableEntry(entryPath);
+                });
+                // crumbs：只回放导航可达的祖先（授权根的祖先或自身），
+                // 不向不相关目录泄漏宿主路径段。
+                value.crumbs = (value.crumbs as unknown[]).filter((crumb) =>
+                  isPlainJsonRecord(crumb) && typeof crumb.path === 'string' && navigableEntry(crumb.path));
+                // home：真实宿主 home 不在授权可读位置时替换为授权根，避免泄漏宿主 home 元数据；
+                // path：仅在不相关（非导航祖先）时替换，保留合法导航位置。
+                const authorizedLocation = (candidate: string): boolean =>
+                  filter.readRoots.some((root) => pathWithin(candidate, root)) ||
+                  filter.injectRoots.some((root) => pathWithin(candidate, root));
+                const fallbackRoot = filter.injectRoots[0] ?? filter.readRoots[0];
+                if (!authorizedLocation(value.home) && fallbackRoot !== undefined) value.home = fallbackRoot;
+                if (!authorizedLocation(value.path) && fallbackRoot !== undefined &&
+                    !navigableEntry(value.path)) value.path = fallbackRoot;
                 if (filter.showRoots) {
-                  const existing = new Set(visibleEntries.filter(isPlainJsonRecord).map((entry) => typeof entry.path === 'string' ? entry.path : ''));
-                  for (const root of filter.roots) {
-                    if (existing.has(root)) continue;
+                  const existing = new Set((value.entries as unknown[]).filter(isPlainJsonRecord)
+                    .map((entry) => typeof entry.path === 'string' ? normalizePath(entry.path) : ''));
+                  for (const root of filter.injectRoots) {
+                    if (existing.has(normalizePath(root))) continue;
+                    existing.add(normalizePath(root));
                     const normalized = root.replace(/\\/g, '/').replace(/\/$/, '');
                     const slash = normalized.lastIndexOf('/');
                     const name = slash >= 0 && slash < normalized.length - 1 ? normalized.slice(slash + 1) : normalized;
-                    visibleEntries.push({ name, path: root, hidden: false });
+                    (value.entries as unknown[]).push({ name, path: root, hidden: false });
                   }
                 }
-                result.value.entries = visibleEntries;
               }
               const out = Buffer.from(JSON.stringify(parsed), 'utf8');
               const respHeaders = headersForRewrittenBody(upstreamRes.headers);
@@ -1424,9 +1574,18 @@ export function registerProxyRoutes(app: Application, deps: ProxyDeps): ProxyRou
                 const archived = value === null ? undefined : value.archivedSessionIds;
                 if (value === null || !Array.isArray(archived)) throw new Error('invalid archive value');
                 const archivePerms = effectivePermissions(archiveUserId);
-                value.archivedSessionIds = archived.filter((id): id is string =>
+                const projected = archived.filter((id): id is string =>
                   typeof id === 'string' && authorizedSubuserSessionRoot(archiveUserId, id, archivePerms) !== null,
                 );
+                value.archivedSessionIds = projected;
+                // 归档动作是权威投影：立即刷新该用户的内存归档集合（只含已授权会话），并
+                // 推进同一用户 workspace.list 的顺序水位，令在途更旧的列表响应无法回滚它。
+                // 畸形/业务失败不会进入本分支，旧状态保持不动。
+                const access = userSessionAccess.get(archiveUserId);
+                if (access !== undefined) {
+                  userArchivedSessionIds.set(archiveUserId, new Set(projected));
+                  replaceUserSessionAccess(archiveUserId, access, userAccessEpochFor(archiveUserId), bumpWorkspaceListRequestRevision());
+                }
               }
               const out = Buffer.from(JSON.stringify(parsed), 'utf8');
               const respHeaders = headersForRewrittenBody(upstreamRes.headers);
@@ -1827,8 +1986,12 @@ export function registerProxyRoutes(app: Application, deps: ProxyDeps): ProxyRou
             try {
               let body = raw;
               const enc = String(upstreamRes.headers['content-encoding'] ?? '');
+              // 观测：解压+JSON.parse（parse）；清洗（filter）；重新序列化（stringify）。
+              // 只记录耗时与输入/输出字节，绝不记录正文。
+              const parseStart = loadingTimeline.begin();
               if (enc.includes('gzip')) body = gunzipBounded(body);
               const parsed = JSON.parse(body.toString('utf8'));
+              loadingTimeline.elapsed('gateway.history.parse', parseStart, { bytesIn: raw.length });
               if (reqAs.dshpwPerms !== undefined && reqAs.dshpwPerms.sandbox_mode !== null) {
                 void clampSessionHistorySandbox(
                   parsed,
@@ -1836,8 +1999,13 @@ export function registerProxyRoutes(app: Application, deps: ProxyDeps): ProxyRou
                 );
               }
               // F-A2：递归清洗历史中所有字符串字段（消息内容/工具结果）的隐藏 Unicode
+              const filterStart = loadingTimeline.begin();
               const cleaned = sanitizeHiddenUnicodeJson(parsed);
+              loadingTimeline.elapsed('gateway.history.filter', filterStart);
+              const stringifyStart = loadingTimeline.begin();
               const out = Buffer.from(JSON.stringify(cleaned), 'utf8');
+              loadingTimeline.elapsed('gateway.history.stringify', stringifyStart, { bytesOut: out.length });
+              eventLoopDelaySampler.sample('gateway.eventLoop.delay');
               const respHeaders = headersForRewrittenBody(upstreamRes.headers);
               respHeaders['content-length'] = String(out.length);
               if (!res.headersSent) res.writeHead(upstreamRes.statusCode ?? 200, respHeaders);
@@ -1861,11 +2029,19 @@ export function registerProxyRoutes(app: Application, deps: ProxyDeps): ProxyRou
         if (req.method === 'POST' && /^\/api\/session[.\/]page$/.test(proxyPath)) {
           bufferUpstream(upstreamRes, res, (raw) => {
             try {
+              // 观测：parse（解码+JSON.parse）/ filter（清洗）/ stringify（重新序列化）。
+              const parseStart = loadingTimeline.begin();
               const parsed = JSON.parse(
                 decodeUpstreamBody(raw, String(upstreamRes.headers['content-encoding'] ?? '')).toString('utf8'),
               ) as unknown;
+              loadingTimeline.elapsed('gateway.page.parse', parseStart, { bytesIn: raw.length });
+              const filterStart = loadingTimeline.begin();
               const cleaned = sanitizeHiddenUnicodeJson(parsed);
+              loadingTimeline.elapsed('gateway.page.filter', filterStart);
+              const stringifyStart = loadingTimeline.begin();
               const out = Buffer.from(JSON.stringify(cleaned), 'utf8');
+              loadingTimeline.elapsed('gateway.page.stringify', stringifyStart, { bytesOut: out.length });
+              eventLoopDelaySampler.sample('gateway.eventLoop.delay');
               const respHeaders = headersForRewrittenBody(upstreamRes.headers);
               respHeaders['content-length'] = String(out.length);
               if (!res.headersSent) res.writeHead(upstreamRes.statusCode ?? 200, respHeaders);
@@ -2210,7 +2386,7 @@ export function registerProxyRoutes(app: Application, deps: ProxyDeps): ProxyRou
     // 会话必为活会话）再确认一次授权档位并 fail-closed。
     const needsSandboxRunCheck =
       reqAs.dshpwPerms !== undefined &&
-      reqAs.dshpwPerms.sandbox_mode !== null &&
+      reqAs.dshpwUser !== undefined &&
       req.method === 'POST' &&
       /^\/api\/(?:session[.\/]prompt|subagents[.\/]prompt)$/.test(proxyPath);
     const agentPresetMutation = AGENT_PRESET_MUTATION_RE.test(proxyPath);
@@ -2305,6 +2481,77 @@ export function registerProxyRoutes(app: Application, deps: ProxyDeps): ProxyRou
         // 转发体默认原样；SSRF 校验或审批改写时会整体重建（重建必须同步更新 content-length）
         let forwardBody = Buffer.concat(chunks);
 
+        // ── 模型白名单（allowed_models）判定 ──
+        // 官方这些 RPC 都无法只靠请求体判定真实模型（create/fork/prompt 没有模型字段），
+        // 所以：selectModel 对请求体里的 {provider, model} 正向校验；其余用网关记录的会话
+        // 有效模型（官方 modelSelection 投影 / selectModel 结果 / Host 默认）再校验，拿不到
+        // 就 fail-closed。受限用户创建的会话记录为 'default'（Host 共享默认），fork 新建会话
+        // 同理（DSH fork 用 agentDefaultModel 而不是源会话模型，源模型与默认模型都要判）。
+        // 判定只依赖 bodyObj/proxyPath 与传入的允许列表；reqAs 状态写入留在原始调用点。
+        // 转发前门禁与沙盒 await 之后的复核共用本函数，避免两处逻辑漂移；null = 不限。
+        const modelGateAllows = (allowed: readonly string[] | null): boolean => {
+          if (allowed === null) return true;
+          if (/^\/api\/session[.\/]selectModel$/.test(proxyPath)) {
+            // 模型字段只从官方 wire 位置读取：有 ClientConnection envelope 时只看
+            // args.request（DSH 同源解码）；否则兼容直接顶层字段的调用方。绝不允许顶层
+            // 伪字段在 envelope 请求里“洗白”一个不同模型。缺字段/格式非法同样拒绝
+            // （不能只靠上游 resolveCallConfig 报错）。
+            const requestEnvelope = clientConnectionArgs(bodyObj);
+            const requestPayload = rpcRequestPayload(bodyObj);
+            const selection = modelSelectionFrom(requestPayload) ??
+              (requestEnvelope === null ? modelSelectionFrom(bodyObj) : null);
+            return selection !== null && modelChoiceVerdict(allowed, selection).ok;
+          }
+          if (/^\/api\/session[.\/]create$/.test(proxyPath)) {
+            // create 不带模型：新会话用 Host 共享默认，默认不在白名单仍允许创建（客户端拿到
+            // 过滤后的 modelCatalog 后可另选允许模型；prompt 会在模型未收敛时 fail-closed）。
+            // 唯一提前拒绝：白名单为空（[] = 禁止全部），建了也永远用不了。
+            return allowedModelSet(allowed)?.size !== 0;
+          }
+          // 用协议感知的会话地址解析（与所有权校验同源）：只认官方 RPC 的
+          // request/args/address/sessionId 结构，不扫描请求体里的任意字段。
+          const authorized = collectAuthorizedSessionIds(bodyObj);
+          const sessionIds = authorized === null ? [] : [...authorized];
+          if (sessionIds.length === 0) return false;
+          // subagents/prompt 的模型同样来自 Host 默认（子代理没有自己的 model/selection
+          // 状态），所以只能拿默认模型做判定。
+          const isSubagentPrompt = /^\/api\/subagents[.\/]prompt$/.test(proxyPath);
+          for (const sessionId of sessionIds) {
+            const effective = isSubagentPrompt ? null : effectiveSessionModel(sessionId);
+            // fork：DSH 新会话用 Host 默认模型，所以源会话模型与默认模型都要过白名单。
+            const candidates: (AllowedModelSpec | null)[] = [effective];
+            if (isSubagentPrompt || /^\/api\/session[.\/]fork$/.test(proxyPath)) {
+              candidates.push(getHostDefaultModelKnown() ? getHostDefaultModel() : null);
+            }
+            if (candidates.some((candidate) => !modelChoiceVerdict(allowed, candidate).ok)) return false;
+          }
+          return true;
+        };
+        // Agent preset 白名单判定：同上，转发前与沙盒 await 后共用；null = 不限。
+        const agentPresetGateAllows = (allowedPresets: readonly string[] | null): boolean => {
+          if (allowedPresets === null) return true;
+          const allowedSet = new Set(allowedPresets);
+          const requestedPreset = agentPresetFromRequest(bodyObj);
+          const sessionIds = collectSessionIds(bodyObj);
+          const requiresExplicitPreset = AGENT_PRESET_SELECT_RE.test(proxyPath);
+          const sessionAgentPresets = sessionAgentPresetMapFor(reqAs.dshpwUser!);
+          const inheritedPreset = /^\/api\/session[.\/]fork$/.test(proxyPath)
+            ? [...sessionIds].map((id) => sessionAgentPresets.get(id)).find((id): id is string => id !== undefined)
+            : undefined;
+          const promptPresets = /^\/api\/session[.\/]prompt$/.test(proxyPath)
+            ? [...sessionIds].map((id) => sessionAgentPresets.get(id))
+            : [];
+          const selectedPreset = requestedPreset ?? inheritedPreset;
+          const isSessionCreate = /^\/api\/session[.\/]create$/.test(proxyPath);
+          return isSessionCreate
+            ? requestedPreset === null || allowedSet.has(requestedPreset)
+            : requiresExplicitPreset
+            ? requestedPreset !== null && allowedSet.has(requestedPreset)
+            : /^\/api\/session[.\/]fork$/.test(proxyPath)
+              ? selectedPreset !== undefined && allowedSet.has(selectedPreset)
+              : promptPresets.length > 0 && promptPresets.every((preset) => preset !== undefined && allowedSet.has(preset));
+        };
+
         if (needsImageAttachmentCheck && hasImageAttachment(bodyObj)) {
           upstreamReq.destroy();
           res.status(403).type('html').send(forbiddenPage(lang, t(lang, 'gw.noUpload')));
@@ -2315,14 +2562,27 @@ export function registerProxyRoutes(app: Application, deps: ProxyDeps): ProxyRou
           const requestedPath = isPlainJsonRecord(bodyObj) && typeof bodyObj.path === 'string'
             ? bodyObj.path
             : null;
-          const normalizedRequestedPath = requestedPath !== null && path.isAbsolute(requestedPath)
+          const normalizedRequestedPath = requestedPath !== null && isAbsoluteLikePath(requestedPath)
             ? normalizePath(requestedPath)
             : null;
+          // canonical 口径：realpath 解析符号链接/junction（失败回退字符串归一，不更宽松）。
+          const canonicalRequestedPath = normalizedRequestedPath === null
+            ? null
+            : canonicalizePathBestEffort(normalizedRequestedPath);
           const access = userSessionAccess.get(reqAs.dshpwUser!);
-          const authorizedWorkspace = normalizedRequestedPath !== null && access !== undefined &&
-            [...access.values()].some((workspacePath) => normalizePath(workspacePath) === normalizedRequestedPath) &&
+          // 「同一工作区」判定走 samePathForMatch：canonical + win32 大小写折叠 + 段边界。
+          // 单用 normalizePath 相等会在 Windows 大小写/别名形态下把合法工作区静默漏配。
+          const authorizedWorkspace = normalizedRequestedPath !== null && canonicalRequestedPath !== null &&
+            access !== undefined &&
+            [...access.values()].some((workspacePath) =>
+              samePathForMatch(workspacePath, normalizedRequestedPath) &&
+              samePathForMatch(workspacePath, canonicalRequestedPath)) &&
             folderAllowed(normalizedRequestedPath, reqAs.dshpwPerms!.allowed_folders) &&
-            !workspaceOwnedByAnotherSubuser(reqAs.dshpwUser!, normalizedRequestedPath);
+            folderAllowed(canonicalRequestedPath, reqAs.dshpwPerms!.allowed_folders) &&
+            !workspaceOwnedByAnotherSubuser(reqAs.dshpwUser!, normalizedRequestedPath) &&
+            // 绑定/白名单/归属之后仍须拒绝敏感路径：管理员可能把敏感目录（或其祖先）误
+            // 登记为工作区，或工作区本身是指向敏感目录的链接；只有敏感基能挡住。
+            !isSensitivePath(normalizedRequestedPath) && !isSensitivePath(canonicalRequestedPath);
           if (!authorizedWorkspace) {
             upstreamReq.destroy();
             res.status(403).type('html').send(forbiddenPage(lang, t(lang, 'gw.folderDenied')));
@@ -2383,6 +2643,13 @@ export function registerProxyRoutes(app: Application, deps: ProxyDeps): ProxyRou
             res.status(403).type('html').send(forbiddenPage(lang, t(lang, 'gw.folderDenied')));
             return;
           }
+          // 通过会话根/白名单/归属之后，仍须拒绝敏感路径：管理员可能把敏感目录的祖先
+          // 误登记为工作区，此时目标会同时命中白名单与归属，只有敏感基能挡住。
+          if (isSensitivePath(target) || isSensitivePath(canonicalizePathBestEffort(target))) {
+            upstreamReq.destroy();
+            res.status(403).type('html').send(forbiddenPage(lang, t(lang, 'gw.folderDenied')));
+            return;
+          }
         }
 
         if (needsRemoteEventResultCheck) {
@@ -2429,31 +2696,19 @@ export function registerProxyRoutes(app: Application, deps: ProxyDeps): ProxyRou
         }
 
         if (needsAgentPresetCheck) {
-          const allowedPresets = new Set(reqAs.dshpwPerms!.allowed_agent_presets ?? []);
-          const requestedPreset = agentPresetFromRequest(bodyObj);
-          const sessionIds = collectSessionIds(bodyObj);
-          const requiresExplicitPreset = AGENT_PRESET_SELECT_RE.test(proxyPath);
-          const sessionAgentPresets = sessionAgentPresetMapFor(reqAs.dshpwUser!);
-          const inheritedPreset = /^\/api\/session[.\/]fork$/.test(proxyPath)
-            ? [...sessionIds].map((id) => sessionAgentPresets.get(id)).find((id): id is string => id !== undefined)
-            : undefined;
-          const promptPresets = /^\/api\/session[.\/]prompt$/.test(proxyPath)
-            ? [...sessionIds].map((id) => sessionAgentPresets.get(id))
-            : [];
-          const selectedPreset = requestedPreset ?? inheritedPreset;
-          const isSessionCreate = /^\/api\/session[.\/]create$/.test(proxyPath);
-          const allowed = isSessionCreate
-            ? requestedPreset === null || allowedPresets.has(requestedPreset)
-            : requiresExplicitPreset
-            ? requestedPreset !== null && allowedPresets.has(requestedPreset)
-            : /^\/api\/session[.\/]fork$/.test(proxyPath)
-              ? selectedPreset !== undefined && allowedPresets.has(selectedPreset)
-              : promptPresets.length > 0 && promptPresets.every((preset) => preset !== undefined && allowedPresets.has(preset));
-          if (!allowed) {
+          if (!agentPresetGateAllows(reqAs.dshpwPerms!.allowed_agent_presets)) {
             upstreamReq.destroy();
             res.status(403).type('html').send(forbiddenPage(lang, t(lang, 'gw.folderDenied')));
             return;
           }
+          // DSH RPC 业务成功后的 preset 登记（供后续 prompt 的继承校验）仍需在此计算。
+          const requestedPreset = agentPresetFromRequest(bodyObj);
+          const sessionIds = collectSessionIds(bodyObj);
+          const sessionAgentPresets = sessionAgentPresetMapFor(reqAs.dshpwUser!);
+          const inheritedPreset = /^\/api\/session[.\/]fork$/.test(proxyPath)
+            ? [...sessionIds].map((id) => sessionAgentPresets.get(id)).find((id): id is string => id !== undefined)
+            : undefined;
+          const selectedPreset = requestedPreset ?? inheritedPreset;
           if ((/^\/api\/session[.\/](create|fork)$/.test(proxyPath) || AGENT_PRESET_SELECT_RE.test(proxyPath)) && selectedPreset !== undefined) {
             reqAs.dshpwAgentPreset = selectedPreset;
           }
@@ -2492,41 +2747,49 @@ export function registerProxyRoutes(app: Application, deps: ProxyDeps): ProxyRou
             res.status(403).type('html').send(forbiddenPage(lang, t(lang, 'gw.folderDenied')));
             return;
           }
-          const requestedPath = extractPathFromBody(bodyObj) ?? os.homedir();
+          const explicitPath = extractPathFromBody(bodyObj);
+          // 子用户目录浏览不做相对解析：显式 path 必须完全限定（拒绝相对与 Windows 盘符含糊的 rooted 形式）。
+          if (explicitPath !== null && !isFullyQualifiedPath(explicitPath)) {
+            upstreamReq.destroy();
+            res.status(403).type('html').send(forbiddenPage(lang, t(lang, 'gw.folderDenied')));
+            return;
+          }
+          const requestedPath = explicitPath ?? os.homedir();
           const canonical = canonicalizePathBestEffort(requestedPath);
           const folders = reqAs.dshpwPerms!.allowed_folders;
-          // 刚创建的目录视作临时授权根：picker 里能立即看到并进入（选择新文件夹必需）。
-          const pendingDirs = visiblePendingCreatedDirectories(reqAs.dshpwUser!);
-          const withinPending = pendingDirs.some((entry) => pathWithin(canonical, entry));
-          if ((folderAllowed(requestedPath, folders) && folderAllowed(canonical, folders)) || withinPending ||
-              (folders.includes('__deny__') && reqAs.dshpwPerms!.allow_workspace_create && canonical === canonicalizePathBestEffort(os.homedir()))) {
-            // 授权子树内 / 自己刚创建的目录内：完整列表，不过滤。
+          const readableRoots = folders.filter((entry) => entry !== '__deny__' &&
+            (entry.startsWith('/') || /^[A-Za-z]:\//.test(entry)));
+          const readableRootsCanonical = readableRoots.map((entry) => canonicalizePathBestEffort(entry));
+          // 读取与创建范围合二为一后没有独立创建根导航：可读根（allowed_folders）即
+          // 唯一的条目可见性与导航来源，pending 只在登记侧生效，不再扩大浏览范围。
+          if (folderAllowed(requestedPath, folders) && folderAllowed(canonical, folders)) {
+            // 授权子树内：内容保留，但响应仍逐条剔除敏感（lexical + canonical）与他人
+            // 工作区子树，并清洗 crumbs/home/path。
+            reqAs.dshpwDirListFilter = {
+              mode: 'authorized',
+              readRoots: readableRootsCanonical,
+              injectRoots: readableRoots,
+            };
           } else {
-            const roots = [
-              ...folders
-                .filter((entry) => entry !== '__deny__' && (entry.startsWith('/') || /^[A-Za-z]:\//.test(entry)))
-                .map((entry) => canonicalizePathBestEffort(entry)),
-              ...pendingDirs,
-            ].filter((entry) => pathWithin(entry, canonical));
+            const roots = readableRootsCanonical.filter((entry) => pathWithin(entry, canonical));
             if (roots.length === 0) {
               // 初始 picker 可能从 home/根目录开始，而授权根位于另一棵树或另一盘符。
               // 不把它当成越权浏览：上游内容全部过滤，并在响应中给出已授权根作为
               // 可点击入口。真正进入根目录后仍按 folderAllowed + canonical path 双判定。
-              // __deny__（尚无预分配根目录）同样走这条路径：有刚创建的 pending 目录时
-              // 给出入口，没有时条目为空——既不回放上游内容，也不返回会让官方 picker
-              // 直接报错的 403。
+              // __deny__ / 空白名单同样走这条路径：有可读根时给出入口，没有时条目为空，
+              // 既不回放上游内容，也不返回会让官方 picker 直接报错的 403。
               reqAs.dshpwDirListFilter = {
                 mode: 'ancestors',
-                roots: [
-                  ...folders
-                    .filter((entry) => entry !== '__deny__' && (entry.startsWith('/') || /^[A-Za-z]:\//.test(entry)))
-                    .map((entry) => canonicalizePathBestEffort(entry)),
-                  ...pendingDirs,
-                ],
+                readRoots: readableRootsCanonical,
+                injectRoots: readableRoots,
                 showRoots: true,
               };
             } else {
-              reqAs.dshpwDirListFilter = { mode: 'ancestors', roots };
+              reqAs.dshpwDirListFilter = {
+                mode: 'ancestors',
+                readRoots: roots,
+                injectRoots: [],
+              };
             }
           }
         }
@@ -2567,8 +2830,13 @@ export function registerProxyRoutes(app: Application, deps: ProxyDeps): ProxyRou
         }
 
         if (needsFolderCheck) {
-          let targetPath: string | null = extractPathFromBody(bodyObj);
-          if (targetPath === null) {
+          const exactCreatePath = isWorkspaceDirectoryCreate(proxyPath)
+            ? extractDirectoryCreatePath(bodyObj)
+            : isWorkspaceCreate(proxyPath)
+              ? extractWorkspaceCreatePath(bodyObj)
+              : extractPathFromBody(bodyObj);
+          let targetPath: string | null = exactCreatePath;
+          if (targetPath === null && !isWorkspaceDirectoryCreate(proxyPath) && !isWorkspaceCreate(proxyPath)) {
               const wid = extractWorkspaceId(bodyObj);
               if (wid !== null) {
                 // A subuser resolves IDs through that user's filtered workspace baseline;
@@ -2586,6 +2854,11 @@ export function registerProxyRoutes(app: Application, deps: ProxyDeps): ProxyRou
                 return;
               }
             }
+          if (targetPath === null && (isWorkspaceDirectoryCreate(proxyPath) || isWorkspaceCreate(proxyPath))) {
+            upstreamReq.destroy();
+            res.status(403).type('html').send(forbiddenPage(lang, t(lang, 'gw.folderDenied')));
+            return;
+          }
           // session.create 即使用户的目录白名单为空（不限目录），仍不可借共享父目录
           // 或 workspaceId 缓存向其他用户拥有的工作区创建会话。用单向子树判定：
           // A 被分配父目录、B 拥有其子工作区时，目标只要伸进 B 的子树（含相等）即拒；
@@ -2599,25 +2872,63 @@ export function registerProxyRoutes(app: Application, deps: ProxyDeps): ProxyRou
           }
           // 新建工作区本身由专门权限控制；目录选择器创建仍必须先限制父目录，
           // 不能因允许“登记工作区”而获得任意宿主路径写入能力。
-          if (targetPath !== null && !isWorkspaceCreate(proxyPath) && !isWorkspaceDirectoryCreate(proxyPath) && !folderAllowed(targetPath, reqAs.dshpwPerms!.allowed_folders)) {
-            upstreamReq.destroy();
-            res.status(403).type('html').send(forbiddenPage(lang, t(lang, 'gw.folderDenied')));
-            return;
+          if (targetPath !== null && !isWorkspaceCreate(proxyPath) && !isWorkspaceDirectoryCreate(proxyPath)) {
+            const folders = reqAs.dshpwPerms!.allowed_folders;
+            // 子用户会话 cwd 只做词法白名单判定不够：授权目录树内的符号链接/junction 可
+            // 把 cwd 指到白名单外或敏感基。session/create 必须再用 canonical path 复核
+            // 白名单与敏感基，任一不通过即 fail-closed（null 旧规则分支同样适用）。
+            const canonicalTarget = WORKSPACE_ENDPOINT_RE.test(proxyPath)
+              ? canonicalizePathBestEffort(targetPath)
+              : null;
+            if (!folderAllowed(targetPath, folders) ||
+              (canonicalTarget !== null && (!folderAllowed(canonicalTarget, folders) || isSensitivePath(canonicalTarget)))) {
+              upstreamReq.destroy();
+              res.status(403).type('html').send(forbiddenPage(lang, t(lang, 'gw.folderDenied')));
+              return;
+            }
           }
           if (targetPath !== null && isWorkspaceDirectoryCreate(proxyPath)) {
-            // 创建父目录三类合法：授权子树内（原始串+真实路径双判定堵符号链接逃逸）、
-            // 主目录（picker 落点与工作区惯例父目录，D1 工作流第一步）、
-            // 自己刚创建的目录内（嵌套创建）；另不得落在另一子用户的工作区子树内。
+            // 目录创建的父路径必须是平台完全限定路径，避免 Windows 的 /foo 或 \\foo
+            // 被网关按当前盘解析，而上游按另一种 rooted 语义解释。
+            if (!isFullyQualifiedPath(targetPath)) {
+              auditDirectoryEvent('directory_create_denied', req, reqAs, {
+                result: 'denied', reason: 'not_fully_qualified', parent: auditPathSummary(targetPath),
+              });
+              upstreamReq.destroy();
+              res.status(403).type('html').send(forbiddenPage(lang, t(lang, 'gw.folderDenied')));
+              return;
+            }
+            // 读取与创建范围合二为一：allowed_folders 是唯一范围，创建不引入任何独立
+            // 创建根、主目录或 pending 例外。父目录与新目标都必须以**当前 live 权限行**
+            // 同时通过词法与 canonical 两个口径的 folderAllowed，并落在非文件系统根、
+            // 非敏感基、非他人工作区子树内（根/敏感/归属为顶层合取，不能被开关短路）。
             const canonicalParent = canonicalizePathBestEffort(targetPath);
-            const folders = reqAs.dshpwPerms!.allowed_folders;
-            const denyAll = folders.includes('__deny__');
-            const pendingDirs = visiblePendingCreatedDirectories(reqAs.dshpwUser!);
-            const homeCanonical = canonicalizePathBestEffort(os.homedir());
-            const parentAllowed =
-              (folderAllowed(targetPath, folders) && folderAllowed(canonicalParent, folders)) ||
-              (reqAs.dshpwPerms!.allow_workspace_create && canonicalParent === homeCanonical) ||
-              pendingDirs.some((entry) => pathWithin(canonicalParent, entry));
-            if (!parentAllowed || workspaceSubtreeOverlap(reqAs.dshpwUser!, canonicalParent)) {
+            const currentPerms = effectivePermissions(reqAs.dshpwUser!);
+            const folders = currentPerms.allowed_folders;
+            const directoryArgs = clientConnectionArgs(bodyObj) ?? (isPlainJsonRecord(bodyObj) ? bodyObj : null);
+            const name = directoryArgs?.name;
+            const validName = typeof name === 'string' && name.length > 0 && name !== '.' && name !== '..' &&
+              !/[\\/\u0000-\u001f\u007f]/.test(name);
+            const targetLexical = validName ? path.join(targetPath, name) : '';
+            const targetCanonical = validName ? canonicalizePathBestEffort(path.join(canonicalParent, name)) : '';
+            const parentAllowed = folderAllowed(targetPath, folders) && folderAllowed(canonicalParent, folders) &&
+              !isFilesystemRootPath(targetPath) && !isFilesystemRootPath(canonicalParent) &&
+              !isSensitivePath(targetPath) && !isSensitivePath(canonicalParent);
+            const targetAllowed = validName &&
+              folderAllowed(targetLexical, folders) && folderAllowed(targetCanonical, folders) &&
+              !isFilesystemRootPath(targetLexical) && !isFilesystemRootPath(targetCanonical) &&
+              !isSensitivePath(targetLexical) && !isSensitivePath(targetCanonical);
+            if (!currentPerms.allow_workspace_create || !parentAllowed || !targetAllowed ||
+              workspaceSubtreeOverlap(reqAs.dshpwUser!, targetPath) ||
+              workspaceSubtreeOverlap(reqAs.dshpwUser!, canonicalParent) ||
+              (validName && workspaceSubtreeOverlap(reqAs.dshpwUser!, targetCanonical))) {
+              auditDirectoryEvent('directory_create_denied', req, reqAs, {
+                result: 'denied',
+                reason: !currentPerms.allow_workspace_create ? 'create_disabled'
+                  : (!parentAllowed || !targetAllowed) ? 'path_not_allowed'
+                    : 'workspace_overlap',
+                target: auditPathSummary(validName ? targetLexical : targetPath),
+              });
               upstreamReq.destroy();
               res.status(403).type('html').send(forbiddenPage(lang, t(lang, 'gw.folderDenied')));
               return;
@@ -2630,14 +2941,33 @@ export function registerProxyRoutes(app: Application, deps: ProxyDeps): ProxyRou
             // 工作区子树重叠（相等或父子嵌套）。
             if (!reqAs.dshpwIsAdmin && isWorkspaceCreate(proxyPath)) {
               const canonicalTarget = canonicalizePathBestEffort(targetPath);
-              // create-only 用户的 __deny__ 仅表示没有预先分配的根目录；登记
-              // 仍须命中 assigned/owned/pending 三者之一，不能把哨兵当成无条件拒绝。
-              const assigned = reqAs.dshpwPerms!.allowed_folders
+              // 登记与读取同源：目标必须落在**当前 live 白名单**内（词法+canonical 双命中），
+              // 再命中 assigned/owned/pending 三者之一。__deny__ 表示不可读，因此必须拒；
+              // 旧 pending 也不得绕过已撤销的读取权限。
+              const registrationPerms = effectivePermissions(reqAs.dshpwUser!);
+              const assigned = registrationPerms.allowed_folders
                 .filter((entry) => entry !== '__deny__')
                 .flatMap((entry) => [entry, canonicalizePathBestEffort(entry)]);
               const owned = db.listUserWorkspacePaths(reqAs.dshpwUser!).flatMap((entry) => [entry, canonicalizePathBestEffort(entry)]);
-              if (!workspaceRegistrationAllowed(canonicalTarget, assigned, owned, visiblePendingCreatedDirectories(reqAs.dshpwUser!)) ||
-                workspaceSubtreeOverlap(reqAs.dshpwUser!, canonicalTarget)) {
+              if (!folderAllowed(targetPath, registrationPerms.allowed_folders) ||
+                !folderAllowed(canonicalTarget, registrationPerms.allowed_folders) ||
+                !workspaceRegistrationAllowed(canonicalTarget, assigned, owned, visiblePendingCreatedDirectories(reqAs.dshpwUser!)) ||
+                workspaceSubtreeOverlap(reqAs.dshpwUser!, canonicalTarget) ||
+                // 登记与读取同源：管理员误把敏感目录（或其祖先）分配为工作区时，目标会同时
+                // 命中白名单与 assigned/owned/pending，只有敏感基能挡住登记。
+                isSensitivePath(targetPath) || isSensitivePath(canonicalTarget)) {
+                auditDirectoryEvent('workspace_registration_denied', req, reqAs, {
+                  result: 'denied',
+                  reason: (!folderAllowed(targetPath, registrationPerms.allowed_folders) ||
+                    !folderAllowed(canonicalTarget, registrationPerms.allowed_folders))
+                    ? 'not_in_allowlist'
+                    : !workspaceRegistrationAllowed(canonicalTarget, assigned, owned, visiblePendingCreatedDirectories(reqAs.dshpwUser!))
+                      ? 'not_assigned_or_created'
+                      : (isSensitivePath(targetPath) || isSensitivePath(canonicalTarget))
+                        ? 'sensitive_path'
+                        : 'workspace_overlap',
+                  target: auditPathSummary(canonicalTarget),
+                });
                 upstreamReq.destroy();
                 res.status(403).type('html').send(forbiddenPage(lang, t(lang, 'gw.workspaceDenied')));
                 return;
@@ -2786,7 +3116,12 @@ export function registerProxyRoutes(app: Application, deps: ProxyDeps): ProxyRou
             const cwd = reqAs.dshpwIsAdmin === true
               ? sessionCwdById.get(sessionId)
               : access.get(sessionId);
-            return !perms.disabled_sessions.includes(sessionId) && cwd !== undefined && folderAllowed(cwd, perms.allowed_folders);
+            if (perms.disabled_sessions.includes(sessionId) || cwd === undefined || !folderAllowed(cwd, perms.allowed_folders)) {
+              return false;
+            }
+            if (reqAs.dshpwIsAdmin === true) return true;
+            const userId = reqAs.dshpwUser;
+            return userId !== undefined && (db.hasUserSessionGrant(userId, sessionId) || workspaceOwnedByUser(userId, cwd));
           };
           if (bodySessionIds.size === 0 || [...bodySessionIds].some((sessionId) => !allowed(sessionId))) {
             upstreamReq.destroy();
@@ -2812,72 +3147,23 @@ export function registerProxyRoutes(app: Application, deps: ProxyDeps): ProxyRou
           }
         }
 
-        // ── 模型白名单：转发前判定（所有模型入口的唯一强制点）─────────────────
-        // 官方的这些 RPC 都无法只靠请求体判定真实模型（create/fork/prompt 没有模型
-        // 字段），所以只能：
-        //   · selectModel：对请求体里的 {provider, model} 做正向校验；
-        //   · 其余：用网关记录的会话有效模型（官方 modelSelection 投影 / selectModel
-        //     结果 / Host 默认）再校验，拿不到就 fail-closed。
-        // 受限用户创建的会话记录为 'default'（Host 共享默认），fork 新建会话同理
-        // （DSH fork 用 agentDefaultModel 而不是源会话模型，因此源模型与默认模型都要判）。
+        // ── 模型白名单：转发前判定（所有模型入口的强制点，与沙盒 await 后复核共用）──
         if (needsModelCheck) {
           const allowed = reqAs.dshpwPerms!.allowed_models;
-          // selectModel 的模型字段只从官方 wire 位置读取：有 ClientConnection
-          // envelope 时只看 args.request（DSH 同源解码）；否则兼容直接顶层字段的
-          // 调用方。绝不允许顶层伪字段在 envelope 请求里“洗白”一个不同模型。
-          const requestEnvelope = clientConnectionArgs(bodyObj);
-          const requestPayload = rpcRequestPayload(bodyObj);
-          const selection = modelSelectionFrom(requestPayload) ??
-            (requestEnvelope === null ? modelSelectionFrom(bodyObj) : null);
           const fail = (): void => {
             upstreamReq.destroy();
             res.status(403).type('html').send(forbiddenPage(lang, t(lang, 'gw.folderDenied')));
           };
+          if (!modelGateAllows(allowed)) {
+            fail();
+            return;
+          }
           if (/^\/api\/session[.\/]selectModel$/.test(proxyPath)) {
-            // 正向校验 provider+model 成对命中 allowlist；缺字段/格式非法同样拒绝
-            // （不能只靠上游 resolveCallConfig 报错）。
-            if (selection === null || !modelChoiceVerdict(allowed, selection).ok) {
-              fail();
-              return;
-            }
+            // 登记本次判定出的目标会话，供成功响应回调登记有效模型。
             const requestedSessionIds = collectAuthorizedSessionIds(bodyObj);
             const requestedSessionId = requestedSessionIds === null ? null : [...requestedSessionIds][0];
             if (requestedSessionId !== null && requestedSessionId !== undefined) {
               reqAs.dshpwModelSessionId = requestedSessionId;
-            }
-          } else if (/^\/api\/session[.\/]create$/.test(proxyPath)) {
-            // create 不带模型：新会话会用 Host 共享默认。若默认不在白名单（或尚未
-            // 观测到默认），仍允许创建——客户端拿到过滤后的 modelCatalog 后可以
-            // 选一个允许模型；真正的 prompt 会在模型未收敛时 fail-closed。
-            // 唯一提前拒绝的情况：白名单为空（[] = 禁止全部），建了也永远用不了。
-            const emptyAllowed = allowedModelSet(allowed)?.size === 0;
-            if (emptyAllowed) {
-              fail();
-              return;
-            }
-          } else {
-            // 用协议感知的会话地址解析（与所有权校验同源）：只认官方 RPC 的
-            // request/args/address/sessionId 结构，不扫描请求体里的任意字段。
-            const authorized = collectAuthorizedSessionIds(bodyObj);
-            const sessionIds = authorized === null ? [] : [...authorized];
-            if (sessionIds.length === 0) {
-              fail();
-              return;
-            }
-            // subagents/prompt 的模型同样来自 Host 默认（子代理没有自己的
-            // model/selection 状态），所以只能拿默认模型做判定。
-            const isSubagentPrompt = /^\/api\/subagents[.\/]prompt$/.test(proxyPath);
-            for (const sessionId of sessionIds) {
-              const effective = isSubagentPrompt ? null : effectiveSessionModel(sessionId);
-              // fork：DSH 新会话用 Host 默认模型，所以源会话模型与默认模型都要过白名单。
-              const candidates: (AllowedModelSpec | null)[] = [effective];
-              if (isSubagentPrompt || /^\/api\/session[.\/]fork$/.test(proxyPath)) {
-                candidates.push(getHostDefaultModelKnown() ? getHostDefaultModel() : null);
-              }
-              if (candidates.some((candidate) => !modelChoiceVerdict(allowed, candidate).ok)) {
-                fail();
-                return;
-              }
             }
           }
         }
@@ -2907,6 +3193,44 @@ export function registerProxyRoutes(app: Application, deps: ProxyDeps): ProxyRou
             }
           }
           if (res.headersSent || res.writableEnded || res.destroyed) return;
+        }
+
+        // Sandbox enforcement awaits an internal confirmation. Re-check the
+        // authoritative permission epoch and DB grant before forwarding the old request.
+        if (needsSandboxRunCheck && reqAs.dshpwUser !== undefined) {
+          const userId = reqAs.dshpwUser;
+          const postSandboxSessionIds = collectAuthorizedSessionIds(bodyObj);
+          const postSandboxIds = postSandboxSessionIds === null ? [] : [...postSandboxSessionIds];
+          const currentPerms = db.getPermissions(userId);
+          const currentAccess = userSessionAccessFor(userId);
+          const currentEpoch = userAccessEpochFor(userId);
+          const currentMode = currentPerms?.sandbox_mode ?? null;
+          const requestedMode = reqAs.dshpwPerms!.sandbox_mode;
+          const currentModeIsStricter = currentMode !== null &&
+            strictestSandboxMode(requestedMode, currentMode) === currentMode;
+          const allowedAfterSandbox = (sessionId: string): boolean => {
+            const cwd = currentAccess.get(sessionId);
+            return currentPerms !== null && cwd !== undefined &&
+              !currentPerms.disabled_sessions.includes(sessionId) &&
+              folderAllowed(cwd, currentPerms.allowed_folders) &&
+              (db.hasUserSessionGrant(userId, sessionId) || workspaceOwnedByUser(userId, cwd));
+          };
+          // 沙盒确认是一次 await：期间管理员可能收紧 allowed_models/allowed_agent_presets。
+          // 这类变更不推进授权 epoch（只有子集/会话授权变更才 fence），所以必须用当前
+          // live 权限行对这两个白名单重新判定，避免在途 prompt 用旧快照放行已撤销的
+          // 模型/预设。原请求受该门禁约束时（needs*Check）才复核，保持行为一致。
+          const modelsStillAllowed = !needsModelCheck || modelGateAllows(currentPerms?.allowed_models ?? null);
+          const presetsStillAllowed = !needsAgentPresetCheck || agentPresetGateAllows(currentPerms?.allowed_agent_presets ?? null);
+          if (currentEpoch !== sessionAccessRequestEpoch ||
+            currentPerms === null ||
+            (currentModeIsStricter && requestedMode !== currentMode) ||
+            !modelsStillAllowed ||
+            !presetsStillAllowed ||
+            postSandboxIds.some((sessionId) => !allowedAfterSandbox(sessionId))) {
+            upstreamReq.destroy();
+            if (!res.headersSent) res.status(403).type('html').send(forbiddenPage(lang, t(lang, 'gw.folderDenied')));
+            return;
+          }
         }
 
         // The alpha client may publish the workspace upsert before the unary
@@ -3017,8 +3341,8 @@ export function registerProxyRoutes(app: Application, deps: ProxyDeps): ProxyRou
     if (token && !isTokenRevoked(token)) {
       try {
         const user = auth.verifyToken(token);
-        const row = db.getUserByUsername(user.username);
-        if (row !== null && user.cv === row.credential_version) {
+        const row = db.getUserById(user.userId);
+        if (row !== null && row.username === user.username && user.cv === row.credential_version) {
           const perms = effectivePermissions(row.id);
           if (!perms.banned) {
             authed = true;
@@ -3042,7 +3366,7 @@ export function registerProxyRoutes(app: Application, deps: ProxyDeps): ProxyRou
       socket.destroy();
       return;
     }
-    // 与 HTTP 侧一致：已登记的宿主能力只由主用户使用；
+    // 与 HTTP 侧一致：owner: 登记一律拒绝；ssh 登记与官方 terminal 共用 allowSsh；
     // 已加载普通插件的 WS 仍须命中运行时清单。
     const wsPathClass = classifySubuserPath(gatePath, {
       endpointRules: getEndpointRules(),
@@ -3054,15 +3378,25 @@ export function registerProxyRoutes(app: Application, deps: ProxyDeps): ProxyRou
       dynamicPluginApiPath(gatePath, getDynamicPluginManifest()) ||
       dynamicPluginRootPath(gatePath, getDynamicPluginManifest())
     );
+    let userSshEndpointPassed = false;
     if (userRole === 'user') {
+      // owner: 规则与跨 transport 的 SSH 登记一律拒绝（两把钥匙之外的能力不放行）。
       if (wsPathClass === 'owner-only' ||
-          endpointAllowed(gatePath, getEndpointRules(), { capability: 'ssh' })) {
+          (wsPathClass !== 'ssh' && endpointAllowed(gatePath, getEndpointRules(), { capability: 'ssh' }))) {
         socket.end('HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n');
         return;
       }
+      if (wsPathClass === 'ssh') {
+        const perms = authUserId === null ? null : effectivePermissions(authUserId);
+        if (perms === null || !perms.allow_ssh) {
+          socket.end('HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n');
+          return;
+        }
+        userSshEndpointPassed = true;
+      }
     }
-    if (dynamicPluginPathPassed) {
-      // 宿主插件清单授权建立后纳入撤销集合：运行时收紧时立即断开旧连接。
+    if (dynamicPluginPathPassed || userSshEndpointPassed) {
+      // SSH 登记或宿主插件清单授权建立后纳入撤销集合：运行时收紧时立即断开旧连接。
       registryAuthorizedSockets.add(socket);
       socket.once('close', () => { registryAuthorizedSockets.delete(socket); });
     }
@@ -3076,13 +3410,22 @@ export function registerProxyRoutes(app: Application, deps: ProxyDeps): ProxyRou
         const endpointUrl = `${upstream.protocol === 'https:' ? 'wss' : 'ws'}://${upstreamAuthority}${fwdPath}`;
         const upstreamWs = new WebSocket.WebSocket(endpointUrl, upstreamWsOptions());
         const active = new Map<string, RemoteMuxUserStreamState | null>();
+        const diagnostics = createRemoteMuxDiagnosticsSession(`mux-${Date.now().toString(36)}`);
         // 记录已经排队/发送 open 的逻辑流。若网关随后因首帧授权校验拒绝它，
         // rejectLogicalStream 必须向上游补 cancel，避免宿主侧订阅脱离 active 后泄漏。
         const upstreamForwardedStreamIds = new Set<string>();
+        // 观测：记录每个逻辑流 open 被转发到上游的时刻（关闭时为哨兵 0），用于测算
+        // 上游快照准备耗时（open 转发 → 上游首个 item）。只存数值，绝不存帧内容。
+        const upstreamForwardedAt = new Map<string, number>();
         let upstreamOpen = false;
-        let clientMissedHeartbeats = 0;
-        let upstreamMissedHeartbeats = 0;
-        let heartbeat: NodeJS.Timeout | undefined;
+        // 两条腿各持一个 MuxHeartbeat。在 closeCarrier、heartbeatClose 与 expirePendingSessionStreams
+        // 全部定义之后再构造（见下方 startHeartbeats）；onClose/onTick 只引用其闭包，不会早于声明被调用。
+        let clientHeartbeat: MuxHeartbeat | null = null;
+        let upstreamHeartbeat: MuxHeartbeat | null = null;
+        // 两条腿各持一个 MuxSender（下行网关→浏览器、上行网关→上游）：业务数据与 pending drain
+        // 统一经它发送。实例在 closeCarrier/heartbeat 定义之后构造（见 createDirectionSender）。
+        let clientSender: MuxSender | null = null;
+        let upstreamSender: MuxSender | null = null;
         const pending: string[] = [];
         let pendingBytes = 0;
         // session/control/follow may arrive before workspace/follow. A grant
@@ -3127,7 +3470,7 @@ export function registerProxyRoutes(app: Application, deps: ProxyDeps): ProxyRou
                 : [];
               const row = { ...previous, sessionIds: [...new Set([...previousIds, sessionId])] };
               state.visibleWorkspaceRows.set(workspaceId, row);
-              if (!sendClientFrame(JSON.stringify({
+              if (!sendClientItemFrame(state.streamId, JSON.stringify({
                 type: 'item',
                 streamId: state.streamId,
                 value: { type: 'upsert', workspace: row },
@@ -3167,14 +3510,21 @@ export function registerProxyRoutes(app: Application, deps: ProxyDeps): ProxyRou
             const row = { ...workspace, sessionIds: [...new Set([...rowIds, ...previousIds])] };
             state.visibleWorkspaces.set(workspaceId, workspacePath);
             state.visibleWorkspaceRows.set(workspaceId, row);
-            if (!sendClientFrame(JSON.stringify({
+            if (!sendClientItemFrame(state.streamId, JSON.stringify({
               type: 'item',
               streamId: state.streamId,
               value: { type: 'upsert', workspace: row },
             }))) break;
           }
         };
-        const connection: RemoteMuxUserConnection = { socket: client, publishSessionAttachment, publishWorkspaceUpsert };
+        const connection: RemoteMuxUserConnection = {
+          socket: client,
+          publishSessionAttachment,
+          publishWorkspaceUpsert,
+          // 前向引用：teardownCarrier 在下方定义；connection 仅在权限撤销时被 gateway 调用，
+          // 那时同步初始化早已完成。
+          teardownCarrier: (code?: number) => teardownCarrier(code),
+        };
         const registeredClients = remoteMuxClientsByUser.get(authUserId!) ?? new Set<RemoteMuxUserConnection>();
         registeredClients.add(connection);
         remoteMuxClientsByUser.set(authUserId!, registeredClients);
@@ -3184,94 +3534,246 @@ export function registerProxyRoutes(app: Application, deps: ProxyDeps): ProxyRou
             remoteMuxClientsByUser.delete(authUserId!);
           }
         };
-        const stopHeartbeat = (): void => {
-          if (heartbeat === undefined) return;
-          clearInterval(heartbeat);
-          heartbeat = undefined;
+        // 停止并回收两条腿的探测/写停滞状态机。幂等：MuxHeartbeat.dispose() 幂等，且它先
+        // 收敛状态、推进 generation 再通知 onClose，故关闭回调反复调用也不会重入关闭。
+        const disposeHeartbeats = (): void => {
+          clientHeartbeat?.dispose();
+          upstreamHeartbeat?.dispose();
         };
-        const closeBoth = (code?: number, reason?: string): void => {
-          stopHeartbeat();
-          try { if (client.readyState === WebSocket.OPEN) client.close(code, reason); else client.terminate(); } catch {}
-          try { if (upstreamWs.readyState === WebSocket.OPEN) upstreamWs.close(code, reason); else upstreamWs.terminate(); } catch {}
+        // 关闭/撤销时立即收敛两条腿的发送器与心跳。MuxSender.dispose 与 MuxHeartbeat.dispose
+        // 都幂等：重复调用不再触发任何发送失败或探测关闭。
+        const disposeSenders = (): void => {
+          clientSender?.dispose();
+          upstreamSender?.dispose();
         };
-        // 下行（网关→浏览器）有界发送：与上行共用 REMOTE_MUX_MAX_PENDING_BYTES。
-        // 浏览器消费不过来导致 bufferedAmount 超预算时关闭整条 carrier（1013），
-        // 不丢单帧、不重排，也不改变既有授权判断。
-        const sendClientFrame = (text: string): boolean => {
-          const outcome = sendMuxFrameBounded(client, text, REMOTE_MUX_MAX_PENDING_BYTES, REMOTE_MUX_MAX_PAYLOAD_BYTES);
-          if (outcome === 'overflow') { closeBoth(1013, 'Remote stream backpressure limit exceeded'); return false; }
-          if (outcome === 'failed') { closeBoth(1011, 'Remote stream send failed'); return false; }
-          return outcome === 'sent';
+        const disposeCarrier = (): void => {
+          disposeSenders();
+          disposeHeartbeats();
         };
+        const remoteMuxCloseSource = (reason: string | undefined): RemoteMuxCloseSource => {
+          if (reason === 'Permissions changed' || reason === 'Identity switched' || reason === 'Credentials changed' || reason === 'Session ended' || reason === 'Workspace deleted') return 'permission-revoked';
+          if (reason === 'Remote stream backpressure limit exceeded') return 'backpressure';
+          if (reason === 'Remote stream queue too large') return 'queue-overflow';
+          if (reason === 'Remote stream send failed') return 'send-failed';
+          if (reason === 'upstream error') return 'upstream-error';
+          if (reason === 'upstream closed') return 'upstream-close';
+          if (reason === 'client websocket error') return 'client-error';
+          if (reason === 'text messages required' || reason === 'invalid Remote stream request' || reason === 'invalid Remote stream payload' || reason === 'invalid Remote stream response' || reason === 'duplicate stream id' || reason === 'too many Remote streams') return 'protocol';
+          return 'unknown';
+        };
+        const senderSnapshot = (sender: MuxSender | null) => {
+          const snapshot = sender?.snapshot();
+          return {
+            queuedMessages: snapshot?.queuedMessages ?? 0,
+            queuedBytes: snapshot?.queuedBytes ?? 0,
+            acceptedBytes: snapshot?.acceptedBytes ?? 0,
+            inFlight: snapshot?.inFlight ?? false,
+            bufferedAmount: snapshot?.bufferedAmount ?? 0,
+          };
+        };
+        const observeCarrierClose = (reject?: { direction: 'client' | 'upstream'; kind: MuxRejectKind; messageBytes: number } | null): void => {
+          const clientState = senderSnapshot(clientSender);
+          const upstreamState = senderSnapshot(upstreamSender);
+          diagnostics.observe({
+            pendingBytes,
+            clientSender: clientState,
+            upstreamSender: upstreamState,
+            ...(reject === undefined ? {} : { reject }),
+          });
+        };
+        const logCloseRecord = (record: ReturnType<typeof diagnostics.close>): void => {
+          if (record === null) return;
+          console.error(`[dsh-passwords] remote.mux close source=${record.source} direction=${record.direction} code=${record.code} buffered=${record.bufferedBytes} pending=${record.pendingBytes} streams=${record.streams} stall=${record.stall} clientQueued=${record.clientSender.queuedMessages}/${record.clientSender.queuedBytes} clientAccepted=${record.clientSender.acceptedBytes} clientInFlight=${Number(record.clientSender.inFlight)} clientBuffered=${record.clientSender.bufferedAmount} upstreamQueued=${record.upstreamSender.queuedMessages}/${record.upstreamSender.queuedBytes} upstreamAccepted=${record.upstreamSender.acceptedBytes} upstreamInFlight=${Number(record.upstreamSender.inFlight)} upstreamBuffered=${record.upstreamSender.bufferedAmount}${record.reject === null ? '' : ` rejectDirection=${record.reject.direction} reject=${record.reject.kind} rejectBytes=${record.reject.messageBytes}`}`);
+        };
+        const REMOTE_MUX_CLOSE_GRACE_MS = 5_000;
+        let closeIssued = false;
+        let closeGraceCancel: (() => void) | null = null;
+        // 两腿各自的关闭完成标记：仅用于 grace 收敛判定与到期回收，不参与任何授权/权限决策。
+        let clientLegClosed = false;
+        let upstreamLegClosed = false;
+        // 优雅 close 之后最多 5 秒 grace：到期只强制回收**尚未完成关闭握手**的那条腿，避免半开连接
+        // 长期占用，同时不再把已进入关闭握手（CLOSING）的腿提前 terminate。定时器 unref，不拖住进程退出。
+        const armCloseGrace = (): void => {
+          if (closeGraceCancel !== null) return;
+          if (clientLegClosed && upstreamLegClosed) return;
+          const timer = setTimeout(() => {
+            closeGraceCancel = null;
+            disposeCarrier();
+            if (!clientLegClosed) { try { client.terminate(); } catch {} }
+            if (!upstreamLegClosed) { try { upstreamWs.terminate(); } catch {} }
+          }, REMOTE_MUX_CLOSE_GRACE_MS);
+          timer.unref();
+          closeGraceCancel = () => clearTimeout(timer);
+        };
+        // 两腿都完成关闭握手后立即取消 grace：已无需要强制回收的半开腿。
+        const cancelCloseGraceIfSettled = (): void => {
+          if (!clientLegClosed || !upstreamLegClosed) return;
+          if (closeGraceCancel === null) return;
+          closeGraceCancel();
+          closeGraceCancel = null;
+        };
+        // 统一幂等关闭的共用收尾：立即 dispose 两条腿的发送器与心跳（避免关闭过程中再冒出一次
+        // 发送失败/探测关闭），随后只记录一次结构化诊断（首个关闭来源加锁，即“首因”不被迟到
+        // 来源改写）。不触碰物理 socket：由调用方决定是否下发 socket close/terminate。
+        const settleCarrierClose = (
+          source: RemoteMuxCloseSource,
+          code: number | undefined,
+          close?: { stall?: RemoteMuxStallKind; direction?: 'client' | 'upstream' | 'both'; reject?: { direction: 'client' | 'upstream'; kind: MuxRejectKind; messageBytes: number } },
+        ): void => {
+          observeCarrierClose(close?.reject ?? null);
+          const observedPending = pendingBytes;
+          const clientState = senderSnapshot(clientSender);
+          const upstreamState = senderSnapshot(upstreamSender);
+          disposeCarrier();
+          const record = diagnostics.close({
+            source,
+            direction: close?.direction ?? 'both',
+            code,
+            bufferedBytes: client.bufferedAmount + upstreamWs.bufferedAmount,
+            pendingBytes: observedPending,
+            streams: active.size,
+            stall: close?.stall,
+            clientSender: clientState,
+            upstreamSender: upstreamState,
+            reject: close?.reject ?? null,
+          });
+          logCloseRecord(record);
+        };
+        // 单腿关闭请求：OPEN 时发起/继续优雅关闭握手；CLOSING 时握手已在进行，继续等待对端 Close
+        // （绝不 terminate，否则会丢弃已入队的 Close，让对端只观察到 1006）；CONNECTING/CLOSED 无法
+        // 再握手，直接 terminate 收敛以避免悬空连接。
+        const requestLegClose = (ws: any, code?: number, reason?: string): void => {
+          try {
+            if (ws.readyState === WebSocket.OPEN) ws.close(code, reason);
+            else if (ws.readyState !== WS_CLOSING) ws.terminate();
+          } catch {}
+        };
+        const closeCarrier = (code?: number, reason?: string, close?: { source?: RemoteMuxCloseSource; stall?: RemoteMuxStallKind; direction?: 'client' | 'upstream' | 'both'; reject?: { direction: 'client' | 'upstream'; kind: MuxRejectKind; messageBytes: number } }): void => {
+          settleCarrierClose(close?.source ?? remoteMuxCloseSource(reason), code, close);
+          if (closeIssued) return;
+          closeIssued = true;
+          requestLegClose(client, code, reason);
+          requestLegClose(upstreamWs, code, reason);
+          armCloseGrace();
+        };
+        // 受限的权限/身份撤销入口：由 gateway 在下发 socket.close 之前调用。它立即收敛两条腿的
+        // 发送器与心跳，把诊断首因锁定为 permission-revoked（不依赖调用方文案），并 arm 5s grace；
+        // 物理 socket 的 close(code, reason) 仍由 gateway 保留，以维持既有 code/reason 与权限行为。
+        // 不向调用方暴露 active/发送器/诊断等内部状态；重复调用幂等（dispose 幂等、诊断已锁存、
+        // grace 只 arm 一次）。
+        const teardownCarrier = (code = 1012): void => {
+          settleCarrierClose('permission-revoked', code);
+          armCloseGrace();
+        };
+        // 下行（网关→浏览器）与上行（网关→上游）各一个 MuxSender：所有业务数据与 pending
+        // drain 统一经它发送。它保证一条业务文本 = 一条 WS 文本消息、同方向 FIFO、分片不交错，
+        // 在单条 100 MiB / 方向接受 102 MiB 预算内接受消息，并按 256 KiB/128 KiB **用户态**水位做
+        // 排水等待（与独立的共享 pending 2 MiB 预队列预算分开）；心跳的忙/闲与写入进度由它按
+        // 边沿/成功分片回调，以及排水实测 bufferedAmount 下降驱动。
+        const fragmentBytes = REMOTE_MUX_FRAGMENT_BYTES;
+        // 方向接受预算：单条 100 MiB + 一条最大帧后的 2 MiB 余量。队列字节预算必须与它同值——
+        // 一条合法消息（最大 100 MiB）可能排在在途消息之后等待，若队列字节上限更小，合法消息会在
+        // 接受预算远未用尽时被判 queue-full 并误关整条 carrier。旧值误用共享 pending 2 MiB 预算，
+        // 导致 3 MiB 兄弟流 item 在 A 在途时被 1013 误杀。总接受字节已由本预算封顶（queueBytes ≤
+        // acceptedBytes），队列仍有界，等待深度由 maxQueueMessages 条数上限兜底。
+        const directionAcceptBudgetBytes = REMOTE_MUX_MAX_PAYLOAD_BYTES + REMOTE_MUX_MAX_PENDING_BYTES;
+        const fragmentSocketOf = (ws: any): MuxFragmentSocket => ({
+          get readyState(): number { return ws.readyState; },
+          get bufferedAmount(): number { return ws.bufferedAmount; },
+          // ws 的 send(data, options, cb)：文本帧（binary:false）＋ fin 决定是否消息末片。
+          // ws 成功时把回调参数传 null（不是 undefined）；发送器仅把带值回调视为失败，
+          // 因此这里把 null/undefined 归一为 undefined，避免成功回调被误判为写失败。
+          send: (data: Buffer, options: { binary: false; fin: boolean }, onFlush?: (error?: Error) => void) =>
+            ws.send(data, options, (error?: Error | null) => onFlush?.(error ?? undefined)),
+        });
+        const createDirectionSender = (ws: any, direction: 'client' | 'upstream', heartbeat: () => MuxHeartbeat | null): MuxSender =>
+          new MuxSender(fragmentSocketOf(ws), {
+            fragmentBytes,
+            // 用户态写入前导水位与共享 pending 预队列预算分离：分片模式下把已提交给 ws/Node 的
+            // bufferedAmount 压在 256 KiB 内，降到 128 KiB 再续片（单帧模式不做排水等待）。
+            highWaterBytes: REMOTE_MUX_HIGH_WATER_BYTES,
+            lowWaterBytes: REMOTE_MUX_LOW_WATER_BYTES,
+            // 单条消息 100 MiB；方向接受总量 102 MiB。
+            maxMessageBytes: REMOTE_MUX_MAX_PAYLOAD_BYTES,
+            acceptBudgetBytes: directionAcceptBudgetBytes,
+            // 等待队列字节与接受预算同值：任何能被接受的合法消息都必须能排在在途消息之后，
+            // 否则大 item 的兄弟流会被误判 queue-full。条数上限仍是队列深度的独立护栏。
+            // 8192 条等待槽可容纳已复现的 5000 条小事件突发；字节/接受预算仍是硬上限，
+            // 不把该缓解误当成无限背压。持续输入仍由 102 MiB 方向预算和 write-stall 收敛。
+            maxQueueMessages: REMOTE_MUX_MAX_STREAMS * 128,
+            maxQueueBytes: directionAcceptBudgetBytes,
+            sharedBudget: processMuxBudget,
+            drainPollIntervalMs: 10,
+            onBusy: () => heartbeat()?.markBusy(),
+            onIdle: () => heartbeat()?.markIdle(),
+            onProgress: () => heartbeat()?.noteWriteProgress(),
+            onReject: (kind, messageBytes) => diagnostics.observe({ reject: { direction, kind, messageBytes } }),
+            onFailure: () => closeCarrier(1011, 'Remote stream send failed'),
+          });
+        clientSender = createDirectionSender(client, 'client', () => clientHeartbeat);
+        upstreamSender = createDirectionSender(upstreamWs, 'upstream', () => upstreamHeartbeat);
+        const sendClientFrame = (text: string, tag: string | null = null): MuxAcceptOutcome => {
+          if (clientSender === null) return 'closed';
+          return clientSender.enqueue(text, tag === null ? {} : { tag });
+        };
+        const rejectKindOf = (outcome: Exclude<MuxAcceptOutcome, 'accepted' | 'closed'>): MuxRejectKind => {
+          if (outcome === 'oversized') return 'message-bytes';
+          if (outcome === 'overflow') return 'accepted-bytes';
+          return 'queue-count';
+        };
+        const sendClientControlFrame = (text: string): boolean => {
+          const outcome = sendClientFrame(text);
+          if (outcome === 'accepted') return true;
+          if (outcome === 'closed') return false;
+          closeCarrier(1013, 'Remote stream backpressure limit exceeded', { direction: 'client', reject: { direction: 'client', kind: rejectKindOf(outcome), messageBytes: Buffer.byteLength(text, 'utf8') } });
+          return false;
+        };
+        function sendClientItemFrame(streamId: string, text: string): boolean {
+          const outcome = sendClientFrame(text, streamId);
+          if (outcome === 'accepted') return true;
+          if (outcome === 'closed') return false;
+          // item 帧的容量拒绝（oversized / overflow / queue-full）是该逻辑流的应用级失败，不是
+          // carrier 失败：发送受限 error 让 DSH 停止重试该流，同 carrier 的兄弟流继续运行。
+          // rejectLogicalStream 先取消该流尚未开始的下行待发项（释放队列），再排 error；只有连
+          // error 控制帧也排不进时才由 sendClientControlFrame 按 carrier 级收敛。
+          rejectLogicalStream(streamId, 'gateway/overflow', outcome === 'oversized'
+            ? 'Remote item exceeds carrier frame limit'
+            : 'Remote stream send queue full');
+          return false;
+        }
         // A denied logical stream is an application-level Remote failure, not a
         // carrier failure. Sending an error frame lets DSH stop retrying that
         // stream while workspace/control/events streams on the same mux survive.
         // ws emits protocol failures (for example an unmasked client frame) as
         // EventEmitter 'error'. Handle it locally so malformed client traffic
         // closes this carrier instead of terminating the gateway process.
-        client.on('error', () => closeBoth(1002, 'client websocket error'));
+        client.on('error', () => closeCarrier(1002, 'client websocket error'));
 
         const rejectLogicalStream = (streamId: string, code: string, message: string): void => {
           dropPendingSessionStream(streamId);
           active.delete(streamId);
+          // 取消该逻辑流**尚未开始发送**的消息；正在分片的消息必须发到 FIN，error/cancel 排在其后
+          // （FIFO），绝不会把半条消息与 error 交错。两个方向都要取消：上行被拒时若不清空该流尚未
+          // 开始的上行待发项，紧随其后的上游 cancel 会因共享队列仍满而再次失败，退化成 carrier 关闭。
+          clientSender?.cancel(streamId);
+          upstreamSender?.cancel(streamId);
           if (upstreamForwardedStreamIds.delete(streamId)) {
             // 该 open 已经到达或排队等待到达上游；即使浏览器不再发送 cancel，
             // 也要由网关回收宿主侧流。cancel 自身走同一 pending budget。
-            queueUpstreamFrame(JSON.stringify({ type: 'cancel', streamId }));
+            queueUpstreamFrame(JSON.stringify({ type: 'cancel', streamId }), streamId);
           }
-          sendClientFrame(JSON.stringify({
+          upstreamForwardedAt.delete(streamId);
+          sendClientControlFrame(JSON.stringify({
             type: 'error',
             streamId,
             error: { code, message, details: {} },
           }));
         };
-        const startHeartbeat = (): void => {
-          if (heartbeat !== undefined) return;
-          heartbeat = setInterval(() => {
-            // 心跳顺带收敛超时的延迟会话流（收到消息时也会收敛一次）。
-            expirePendingSessionStreams();
-            if (client.readyState === WebSocket.OPEN) {
-              if (clientMissedHeartbeats >= REMOTE_MUX_MAX_MISSED_HEARTBEATS) {
-                closeBoth(1011, 'Remote stream heartbeat timed out');
-                return;
-              }
-              clientMissedHeartbeats += 1;
-              try { client.ping(); } catch { closeBoth(1011, 'Remote stream heartbeat failed'); return; }
-            }
-            if (upstreamWs.readyState === WebSocket.OPEN) {
-              if (upstreamMissedHeartbeats >= REMOTE_MUX_MAX_MISSED_HEARTBEATS) {
-                closeBoth(1011, 'Remote stream heartbeat timed out');
-                return;
-              }
-              upstreamMissedHeartbeats += 1;
-              try { upstreamWs.ping(); } catch { closeBoth(1011, 'Remote stream heartbeat failed'); }
-            }
-          }, REMOTE_MUX_HEARTBEAT_INTERVAL_MS);
-          heartbeat.unref();
-        };
-        client.on('pong', () => { clientMissedHeartbeats = 0; });
-        upstreamWs.on('pong', () => { upstreamMissedHeartbeats = 0; });
-        startHeartbeat();
-        const queueUpstreamFrame = (text: string): boolean => {
-          const textBytes = Buffer.byteLength(text);
-          if (!upstreamOpen || upstreamWs.readyState !== WebSocket.OPEN) {
-            if (pendingBytes + textBytes > REMOTE_MUX_MAX_PENDING_BYTES) {
-              closeBoth(1009, 'Remote stream queue too large');
-              return false;
-            }
-            pending.push(text);
-            pendingBytes += textBytes;
-            return true;
-          }
-          // 上行（网关→上游）有界发送：最大帧外留有 2 MiB 队列余量。
-          const outcome = sendMuxFrameBounded(upstreamWs, text, REMOTE_MUX_MAX_PENDING_BYTES, REMOTE_MUX_MAX_PAYLOAD_BYTES);
-          if (outcome === 'overflow') { closeBoth(1013, 'Remote stream backpressure limit exceeded'); return false; }
-          if (outcome === 'failed') { closeBoth(1011, 'Remote stream send failed'); return false; }
-          return outcome === 'sent';
-        };
         /**
          * 延迟等待 baseline 的会话/控制流已在上面登记授权身份；超时即拒（该逻辑流的
          * error 帧），避免永久挂起。调用时机：心跳、收到任何客户端消息、flush 前。
+         * 必须在 startHeartbeats() 之前声明：heartbeatOptions.onTick 直接引用本函数，
+         * 否则同步调度的 start() 会在闭包引用时命中暂时性死区。
          */
         const expirePendingSessionStreams = (): void => {
           if (pendingSessionStreams.size === 0) return;
@@ -3281,6 +3783,69 @@ export function registerProxyRoutes(app: Application, deps: ProxyDeps): ProxyRou
               rejectLogicalStream(streamId, 'gateway/forbidden', 'Remote session not available for this user');
             }
           }
+        };
+        // 每条腿一个 MuxHeartbeat：nonce probe + 独立 Pong deadline + 写停滞 deadline，替换旧
+        // 的“每 2 秒计数、漏 2 次即关”的窗口心跳。onClose 每腿至多一次，直接收敛到既有
+        // closeCarrier 路径；tick 继续驱动 expirePendingSessionStreams 收敛过期的延迟会话流。
+        const heartbeatClose = (direction: 'client' | 'upstream') => (source: MuxHeartbeatCloseSource): void => {
+          // write-stall/探测失败/timed out 都保持受限诊断分类 'heartbeat'，并附带受限的停滞
+          // 类型（write/probe）；分类直接传入，不依赖 reason 文案匹配，客户端 code/reason 兼容。
+          const details = { source: 'heartbeat' as const, stall: source === 'write-stall' ? 'write' as const : 'probe' as const, direction };
+          if (source === 'ping-send-failed') { closeCarrier(1011, 'Remote stream heartbeat failed', details); return; }
+          if (source === 'write-stall') { closeCarrier(1011, 'Remote stream write stalled', details); return; }
+          closeCarrier(1011, 'Remote stream heartbeat timed out', details);
+        };
+        // ws 适配：ping(payload, done) 交由 ws 按 _isServer 决定掩码（浏览器腿 unmasked、上游腿
+        // masked）。硬编码 mask=true 会把服务端帧错误掩码，被对端判为协议错误而断连。
+        const heartbeatSocketOf = (ws: any, mask: boolean): MuxHeartbeatSocket => ({
+          get readyState(): number { return ws.readyState; },
+          // 浏览器腿是 ws server 侧，控制帧不能掩码；上游腿是 ws client 侧，
+          // RFC 6455 要求客户端发出的 Ping 必须掩码。两条腿必须显式区分。
+          ping: (payload, done) => ws.ping(payload, mask, (error: Error | null) => done(error ?? undefined)),
+        });
+        const heartbeatOptions: Omit<MuxHeartbeatOptions, 'onClose'> = {
+          pingIntervalMs: REMOTE_MUX_PING_INTERVAL_MS,
+          pongTimeoutMs: REMOTE_MUX_PONG_TIMEOUT_MS,
+          writeStallMs: REMOTE_MUX_WRITE_STALL_MS,
+          onTick: () => expirePendingSessionStreams(),
+        };
+        const startHeartbeats = (): void => {
+          if (clientHeartbeat === null) {
+            clientHeartbeat = new MuxHeartbeat(heartbeatSocketOf(client, false), { ...heartbeatOptions, onClose: heartbeatClose('client') });
+            clientHeartbeat.start();
+          }
+          if (upstreamHeartbeat === null) {
+            upstreamHeartbeat = new MuxHeartbeat(heartbeatSocketOf(upstreamWs, true), { ...heartbeatOptions, onClose: heartbeatClose('upstream') });
+            upstreamHeartbeat.start();
+          }
+        };
+        client.on('pong', (payload: Buffer) => { clientHeartbeat?.notePong(payload); });
+        upstreamWs.on('pong', (payload: Buffer) => { upstreamHeartbeat?.notePong(payload); });
+        startHeartbeats();
+        const queueUpstreamFrame = (text: string, tag: string | null = null, kind: 'item' | 'control' = 'control'): boolean => {
+          const textBytes = Buffer.byteLength(text);
+          if (!upstreamOpen || upstreamWs.readyState !== WebSocket.OPEN || upstreamSender === null) {
+            // 上游尚未 open：先落在网关侧 pending 队列（共享 2 MiB 预算），open 后原子
+            // 转入 Sender 发送（见 upstreamWs 'open' 排水）。pending 是 carrier 级预算，
+            // 与控制帧一样不属于任何单个逻辑流，超限仍按 carrier 级收敛。
+            if (pendingBytes + textBytes > REMOTE_MUX_MAX_PENDING_BYTES) {
+              closeCarrier(1009, 'Remote stream queue too large', { direction: 'upstream', reject: { direction: 'upstream', kind: 'queue-bytes', messageBytes: textBytes } });
+              return false;
+            }
+            pending.push(text);
+            pendingBytes += textBytes;
+            return true;
+          }
+          const outcome = upstreamSender.enqueue(text, tag === null ? {} : { tag });
+          if (outcome === 'accepted') return true;
+          if (outcome === 'closed') return false;
+          if (kind === 'item' && tag !== null) {
+            // item 帧的容量拒绝只隔离该逻辑流，不关整条 carrier；控制帧仍 carrier 级。
+            rejectLogicalStream(tag, 'gateway/overflow', 'Remote stream send queue full');
+            return false;
+          }
+          closeCarrier(1013, 'Remote stream backpressure limit exceeded', { direction: 'upstream', reject: { direction: 'upstream', kind: rejectKindOf(outcome), messageBytes: textBytes } });
+          return false;
         };
         const flushPendingSessionStreams = (): void => {
           expirePendingSessionStreams();
@@ -3313,20 +3878,21 @@ export function registerProxyRoutes(app: Application, deps: ProxyDeps): ProxyRou
             }
             dropPendingSessionStream(streamId);
             if (active.has(streamId)) {
-              if (!queueUpstreamFrame(pendingStream.text)) return;
+              if (!queueUpstreamFrame(pendingStream.text, streamId)) return;
               upstreamForwardedStreamIds.add(streamId);
+              upstreamForwardedAt.set(streamId, loadingTimeline.begin());
             }
           }
         };
         client.on('message', (data: Buffer, isBinary: boolean) => {
-          if (isBinary) { closeBoth(1003, 'text messages required'); return; }
+          if (isBinary) { closeCarrier(1003, 'text messages required'); return; }
           // 任何上行消息都是收敛延迟会话流的时机（等价于心跳的超时检查）。
           expirePendingSessionStreams();
           // 子用户侧只校验端点名形状，具体端点是否可用在下面逐条判定：端点属于
           // 允许集合才建立逻辑流，属于「拒绝但仍可回答」集合或完全未知时只回该
           // 逻辑流的 error（不转发上游），不再因为一条流不可用而重启整条 carrier。
           const frame = parseRemoteMuxClientFrame(Buffer.from(data), !isSubuser);
-          if (frame === null) { closeBoth(1008, 'invalid Remote stream request'); return; }
+          if (frame === null) { closeCarrier(1008, 'invalid Remote stream request'); return; }
           // alpha.1 上行帧（item/end）只对「已真正转发到上游、且由网关透明放行」的逻辑
           // 流生效：active.get() 为 undefined 是未打开/已结束的流（伪造或竞态），返回
           // 状态对象则是子用户按资源逐帧过滤的流（session/control、workspace/follow、
@@ -3336,18 +3902,49 @@ export function registerProxyRoutes(app: Application, deps: ProxyDeps): ProxyRou
             if (active.get(frame.streamId) !== null || !upstreamForwardedStreamIds.has(frame.streamId)) return;
             // 客户端 end 只结束上行；下行仍由上游的 end/error（已有逻辑）驱动收尾，
             // 因此这里不删除本地状态，避免提前丢掉仍在上游产生的输出。
-            queueUpstreamFrame(JSON.stringify(frame));
+            queueUpstreamFrame(JSON.stringify(frame), frame.streamId, frame.type === 'item' ? 'item' : 'control');
             return;
           }
           let deferUntilWorkspaceBaseline = false;
           if (frame.type === 'open') {
-            if (active.has(frame.streamId)) { closeBoth(1008, 'duplicate stream id'); return; }
-            if (active.size >= REMOTE_MUX_MAX_STREAMS) { closeBoth(1008, 'too many Remote streams'); return; }
+            if (active.has(frame.streamId)) { closeCarrier(1008, 'duplicate stream id'); return; }
+            if (active.size >= REMOTE_MUX_MAX_STREAMS) { closeCarrier(1008, 'too many Remote streams'); return; }
             if (isSubuser) {
               const perms = effectivePermissions(authUserId!);
-              if (endpointAllowed(`/api/${frame.endpoint}`, getEndpointRules()) ||
-                  endpointAllowed(`/api/${frame.endpoint.replace('/', '.')}`, getEndpointRules())) {
+              // 核心网关授权流（Remote mux 官方面）由下方官方逐流授权逻辑负责：
+              // session/control、session/follow、workspace/follow、$events 走会话
+              // grant/所有权与 workspace baseline，job/account/workspaceFiles 各有专属
+              // 授权。它们绝不能落到通用 SSH 登记规则上——登记 /api/* 或
+              // /api/session/* 会把核心流误拒并导致客户端反复重连。因此这里先判定核心
+              // 集合，只有非核心流才走通用 SSH 登记检查。
+              const isOfficialRemoteCoreEndpoint =
+                frame.endpoint === 'session/control' ||
+                frame.endpoint === 'session/follow' ||
+                frame.endpoint === 'workspace/follow' ||
+                frame.endpoint === '$events' ||
+                OFFICIAL_JOB_REMOTE_ENDPOINTS.has(frame.endpoint) ||
+                OFFICIAL_ACCOUNT_REMOTE_ENDPOINTS.has(frame.endpoint) ||
+                frame.endpoint === 'workspaceFiles/changes';
+              const endpointPaths = [
+                `/api/${frame.endpoint}`,
+                `/api/${frame.endpoint.replace('/', '.')}`,
+              ];
+              // owner: 登记对子用户始终拒绝：官方 terminal 与 allowSsh 都不构成例外。
+              // 必须先于下方的官方 terminal allowSsh 分支判定，否则
+              // owner:/api/terminal/follow（或 owner:/api/terminal/*）会被 allowSsh 覆盖，
+              // 让子用户绕过 owner-only 拿到宿主 shell。
+              if (endpointPaths.some((path) =>
+                endpointAllowed(path, getEndpointRules(), { capability: 'owner-only' }))) {
                 rejectLogicalStream(frame.streamId, 'gateway/forbidden', 'Remote host capability is owner-only');
+                return;
+              }
+              // 已登记的 ssh 能力 Remote 流不随 allowSsh 放开：mux 只由 allowSsh 放行
+              // 官方 terminal（v2.7.5 既定语义），其余登记命中一律拒绝；未登记流仍走
+              // 下方官方集合/敏感面的 fail-closed 判定，不在这里凭空放开。
+              if (!isOfficialRemoteCoreEndpoint &&
+                  !OFFICIAL_TERMINAL_REMOTE_ENDPOINTS.has(frame.endpoint) &&
+                  endpointPaths.some((path) => endpointAllowed(path, getEndpointRules()))) {
+                rejectLogicalStream(frame.streamId, 'gateway/forbidden', 'Remote endpoint is not available for this user');
                 return;
               }
               // workspaceFiles/changes carries a lookup session id and a target path.
@@ -3407,14 +4004,21 @@ export function registerProxyRoutes(app: Application, deps: ProxyDeps): ProxyRou
                   visibleWorkspaceRows: new Map(),
                 });
               } else {
-                // 官方 terminal 只结束该逻辑流，不能让一条被拒流关闭整条 carrier。
+                // 官方 terminal Remote 流由 allowSsh 控制：开启时才放行
+                // terminal/follow / terminal/retain；关闭时只结束该逻辑流
+                // （terminal/unavailable），不让一条被拒流关闭整条 carrier。
+                // 已登记的第三方 SSH mux 流不在此放开（见上方登记检查），
+                // terminal 也仍不进通用 SSH 登记分类。
+                const officialTerminalAllowed =
+                  OFFICIAL_TERMINAL_REMOTE_ENDPOINTS.has(frame.endpoint) && perms.allow_ssh;
                 const rejectedEndpoint = remoteMuxSubuserRejectedEndpoints.get(frame.endpoint);
-                if (rejectedEndpoint !== undefined) {
+                if (rejectedEndpoint !== undefined && !officialTerminalAllowed) {
                   rejectLogicalStream(frame.streamId, rejectedEndpoint.code, rejectedEndpoint.message);
                   return;
                 }
-                // 宿主敏感面优先于运行时清单拒绝：即使流已登记也不能放行。
-                if (isSubuserBlockedRemoteEndpoint(frame.endpoint)) {
+                // 宿主敏感面优先于运行时清单拒绝：即使流已登记也不能放行；
+                // allowSsh 授予的官方 terminal 流是唯一例外。
+                if (!officialTerminalAllowed && isSubuserBlockedRemoteEndpoint(frame.endpoint)) {
                   rejectLogicalStream(frame.streamId, 'gateway/forbidden', 'Remote endpoint is not available for this user');
                   return;
                 }
@@ -3425,9 +4029,10 @@ export function registerProxyRoutes(app: Application, deps: ProxyDeps): ProxyRou
                   return;
                 }
 
-                if (!remoteMuxStreamEndpoints.has(frame.endpoint)) {
-                    // 只有官方集合之外的普通扩展流才透明转发。动态清单不能
-                    // 覆盖官方流的授权、baseline 建立和响应过滤逻辑。
+                if (officialTerminalAllowed || !remoteMuxStreamEndpoints.has(frame.endpoint)) {
+                    // allowSsh 授予的官方 terminal 流与官方集合之外的普通扩展流
+                    // 都按透明姿态转发。动态清单不能覆盖官方流的授权、baseline
+                    // 建立和响应过滤逻辑。
                     active.set(frame.streamId, null);
                   } else if (frame.endpoint === 'session/follow') {
                     const address = remoteMuxFollowAddress(frame.payload);
@@ -3463,7 +4068,7 @@ export function registerProxyRoutes(app: Application, deps: ProxyDeps): ProxyRou
                       }
                     }
                   } else if (!remoteMuxEmptyArgs(frame.payload)) {
-                    closeBoth(1008, 'invalid Remote stream payload');
+                    closeCarrier(1008, 'invalid Remote stream payload');
                     return;
                   }
                   // $events is the alpha.3 Remote connection bootstrap. Blocking it
@@ -3518,15 +4123,27 @@ export function registerProxyRoutes(app: Application, deps: ProxyDeps): ProxyRou
             pendingBytes += bytes;
             return;
           }
-          if (!queueUpstreamFrame(text)) return;
-          if (frame.type === 'open') upstreamForwardedStreamIds.add(frame.streamId);
+          if (!queueUpstreamFrame(text, frame.streamId)) return;
+          if (frame.type === 'open') {
+            upstreamForwardedStreamIds.add(frame.streamId);
+            upstreamForwardedAt.set(frame.streamId, loadingTimeline.begin());
+          }
           if (frame.type === 'cancel') {
+            // 客户端取消该逻辑流：删除其尚未开始发送的下行消息；正在分片的消息发完 FIN。
+            clientSender?.cancel(frame.streamId);
             upstreamForwardedStreamIds.delete(frame.streamId);
+            upstreamForwardedAt.delete(frame.streamId);
             active.delete(frame.streamId);
           }
         });
         client.on('close', () => {
-          stopHeartbeat();
+          clientLegClosed = true;
+          const observedPending = pendingBytes + senderSnapshot(clientSender).queuedBytes + senderSnapshot(upstreamSender).queuedBytes;
+          const clientState = senderSnapshot(clientSender);
+          const upstreamState = senderSnapshot(upstreamSender);
+          disposeCarrier();
+          const record = diagnostics.close({ source: 'client-close', direction: 'client', code: 0, pendingBytes: observedPending, bufferedBytes: client.bufferedAmount + upstreamWs.bufferedAmount, streams: active.size, clientSender: clientState, upstreamSender: upstreamState });
+          logCloseRecord(record);
           unregisterClient();
           if (isSubuser) {
             const clientIds = new Set<string>();
@@ -3537,24 +4154,30 @@ export function registerProxyRoutes(app: Application, deps: ProxyDeps): ProxyRou
               if (ownership.userId === authUserId! && clientIds.has(ownership.clientId)) remoteEventOwnership.delete(eventId);
             }
           }
-          try { upstreamWs.close(); } catch {}
+          requestLegClose(upstreamWs);
+          armCloseGrace();
+          cancelCloseGraceIfSettled();
         });
         upstreamWs.on('open', () => {
           upstreamOpen = true;
+          // 上游一开就把网关侧 pending 队列原子转入 Sender：按 FIFO 逐帧 enqueue，
+          // 转出即从共享 2 MiB 预算扣减，避免网关队列与 Sender 队列双重占用。
           while (pending.length > 0 && upstreamWs.readyState === WebSocket.OPEN) {
             const text = pending[0]!;
-            const bytes = Buffer.byteLength(text);
-            const outcome = sendMuxFrameBounded(upstreamWs, text, REMOTE_MUX_MAX_PENDING_BYTES, REMOTE_MUX_MAX_PAYLOAD_BYTES);
-            if (outcome === 'overflow') { closeBoth(1013, 'Remote stream backpressure limit exceeded'); return; }
-            if (outcome === 'failed') { closeBoth(1011, 'Remote stream send failed'); return; }
-            // socket 在本轮中途不再 OPEN：保留该帧在队列里，交由后续路径处理。
-            if (outcome !== 'sent') return;
-            pending.shift();
-            pendingBytes -= bytes;
+            const outcome = upstreamSender === null ? 'closed' : upstreamSender.enqueue(text);
+            if (outcome === 'accepted') {
+              pending.shift();
+              pendingBytes -= Buffer.byteLength(text);
+              continue;
+            }
+            if (outcome === 'closed') return;
+            // 预先已通过共享 2 MiB pending 预算；排水中仍超预算说明口径不一致，按背压关闭。
+            closeCarrier(1013, 'Remote stream backpressure limit exceeded', { direction: 'upstream', reject: { direction: 'upstream', kind: rejectKindOf(outcome), messageBytes: Buffer.byteLength(text, 'utf8') } });
+            return;
           }
         });
         upstreamWs.on('message', (data: Buffer, isBinary: boolean) => {
-          if (isBinary) { closeBoth(1003, 'text messages required'); return; }
+          if (isBinary) { closeCarrier(1003, 'text messages required'); return; }
           const frame = parseRemoteMuxServerFrame(Buffer.from(data));
           // An unparseable frame is a carrier-level protocol violation and stays
           // fail-closed. A well-formed frame for an unknown stream id is not:
@@ -3563,10 +4186,19 @@ export function registerProxyRoutes(app: Application, deps: ProxyDeps): ProxyRou
           // already ended). Dropping it must never close the physical carrier —
           // doing so restarted every other stream, which is what turned one
           // cancelled stream into a main/subuser reconnect loop.
-          if (frame === null) { closeBoth(1011, 'invalid Remote stream response'); return; }
+          if (frame === null) { closeCarrier(1011, 'invalid Remote stream response'); return; }
           const state = active.get(frame.streamId);
           if (state === undefined) return;
           if (client.readyState !== WebSocket.OPEN) return;
+          if (frame.type === 'item') {
+            // 观测：上游快照准备（open 转发 → 上游首个 item）。首个完整 item 到达后即
+            // 清除记录点，后续 item 不再计时；只记录耗时与入站字节数。
+            const forwardedAt = upstreamForwardedAt.get(frame.streamId);
+            if (forwardedAt !== undefined) {
+              loadingTimeline.elapsed('mux.upstream.snapshot.prepare', forwardedAt, { bytesIn: data.length });
+              upstreamForwardedAt.delete(frame.streamId);
+            }
+          }
           if (frame.type === 'item' && state !== null) {
             const filtered = filterRemoteMuxUserItem(authUserId!, effectivePermissions(authUserId!), state, frame.value);
             // A session/follow or workspace file changes stream cannot make progress
@@ -3584,7 +4216,7 @@ export function registerProxyRoutes(app: Application, deps: ProxyDeps): ProxyRou
               return;
             }
             if (filtered === null) return;
-            sendClientFrame(JSON.stringify({ type: 'item', streamId: frame.streamId, value: filtered }));
+            if (!sendClientItemFrame(frame.streamId, JSON.stringify({ type: 'item', streamId: frame.streamId, value: filtered }))) return;
             if (
               state.endpoint === 'workspace/follow' &&
               typeof filtered === 'object' &&
@@ -3592,18 +4224,31 @@ export function registerProxyRoutes(app: Application, deps: ProxyDeps): ProxyRou
             ) {
               flushPendingSessionStreams();
             }
+          } else if (frame.type === 'item') {
+            // 未过滤流（管理员，或官方未过滤端点）的 item 仍是业务数据帧：走 item 通道，
+            // 容量拒绝只隔离该逻辑流；只有 open/end/error/cancel 等控制帧才走 carrier 级通道。
+            if (!sendClientItemFrame(frame.streamId, JSON.stringify(frame))) return;
           } else {
-            sendClientFrame(JSON.stringify(frame));
+            if (!sendClientControlFrame(JSON.stringify(frame))) return;
           }
           if (frame.type === 'end' || frame.type === 'error') {
             active.delete(frame.streamId);
             upstreamForwardedStreamIds.delete(frame.streamId);
+            upstreamForwardedAt.delete(frame.streamId);
           }
         });
-        upstreamWs.on('error', () => closeBoth(1011, 'upstream error'));
+        upstreamWs.on('error', () => closeCarrier(1011, 'upstream error'));
         upstreamWs.on('close', () => {
-          stopHeartbeat();
-          if (client.readyState === WebSocket.OPEN) client.close(1011, 'upstream closed');
+          upstreamLegClosed = true;
+          const observedPending = pendingBytes + senderSnapshot(clientSender).queuedBytes + senderSnapshot(upstreamSender).queuedBytes;
+          const clientState = senderSnapshot(clientSender);
+          const upstreamState = senderSnapshot(upstreamSender);
+          disposeCarrier();
+          const record = diagnostics.close({ source: 'upstream-close', direction: 'upstream', code: 1011, pendingBytes: observedPending, bufferedBytes: client.bufferedAmount + upstreamWs.bufferedAmount, streams: active.size, clientSender: clientState, upstreamSender: upstreamState });
+          logCloseRecord(record);
+          requestLegClose(client, 1011, 'upstream closed');
+          armCloseGrace();
+          cancelCloseGraceIfSettled();
         });
       });
       return;
@@ -3633,13 +4278,14 @@ export function registerProxyRoutes(app: Application, deps: ProxyDeps): ProxyRou
       });
       return;
     }
-    // 普通已加载插件的 WS 路径由运行时清单通用放行；未加载/未知 WS
-    // 路径仍 fail-closed，已登记的宿主能力在上面拒绝。管理员不受限制。
+    // 普通已加载插件的 WS 路径由运行时清单通用放行；已登记的 SSH 端点（allowSsh
+    // 已勾选）与官方 terminal 在上述分支放行；未加载/未知 WS 路径仍 fail-closed。
+    // 管理员不受限制。
     const builtinWsPath =
       gatePath === '/api/events.mux' ||
       gatePath === '/api/events.host' ||
       gatePath === '/plugins/events';
-    if (userRole === 'user' && !builtinWsPath && !dynamicPluginPathPassed) {
+    if (userRole === 'user' && !builtinWsPath && !dynamicPluginPathPassed && !userSshEndpointPassed) {
       socket.write('HTTP/1.1 404 Not Found\r\n\r\n');
       socket.destroy();
       return;

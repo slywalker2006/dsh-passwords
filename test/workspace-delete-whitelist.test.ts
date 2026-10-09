@@ -12,7 +12,7 @@
 //   · 升级兼容：升级前已存在、无 user_auto_granted_folders 来源标记的自建条目无法与
 //     管理员授权可靠区分，删除时保留（不误删管理员授权），残留需管理员手动清理，
 //     本次不声称完全回收（DB 层回归见 test/db-permissions.test.ts）；
-//   · `__deny__` 起点删空白名单必须回落 `__deny__`（不能留空数组 = 不限目录 fail-open）；
+//   · 删除后精确回收自建白名单条目，保留管理员分配的授权根（不能留空数组 = 不限目录 fail-open）；
 //   · 管理员分配的父目录/其它目录精确保留（不误删管理员分配）；
 //   · 残留 pending 目录窗口不再能重新登记同一路径；重新创建同名目录后可再次登记；
 //   · 删除后按旧路径/旧 workspaceId 发起 session/create 一律 403。
@@ -93,16 +93,16 @@ test('子用户 workspace/delete 清理自建白名单且不误删管理员分�
       allowedAgentPresets: null, banned: false, sandboxMode: null, disabledSessions: [],
     });
 
-    // 场景 A：__deny__ 起点（无预分配根），靠目录选择器自建工作区。
+    // 场景 A：管理员分配授权根 HOME，子用户在根内用目录选择器自建子工作区。
     const denyCreator = db.createUser('wsdel-deny-creator', DUMMY_HASH, 'user');
-    db.setPermissions(denyCreator.id, restricted(['__deny__'], true));
+    db.setPermissions(denyCreator.id, restricted([HOME], true));
     // 场景 B：管理员分配了父目录 /assigned 与另一个目录 /other。
     const assignedOwner = db.createUser('wsdel-assigned-owner', DUMMY_HASH, 'user');
     db.setPermissions(assignedOwner.id, restricted([`${SYNTH_ROOT}/assigned`, `${SYNTH_ROOT}/other`], true));
-    // 场景 C：管理员把白名单精确设成一个尚不存在的目录；用户随后创建并登记它。
+    // 场景 C：管理员同时分配授权根与一个尚未存在的精确目录；用户随后在根内创建并登记它。
     const exactPath = `${HOME}/dshpw-wsdel-exact`;
     const exactOwner = db.createUser('wsdel-exact-owner', DUMMY_HASH, 'user');
-    db.setPermissions(exactOwner.id, restricted([exactPath], true));
+    db.setPermissions(exactOwner.id, restricted([HOME, exactPath], true));
 
     let workspaceSeq = 0;
     upstream = await new Promise<http.Server>((resolve) => {
@@ -186,26 +186,26 @@ test('子用户 workspace/delete 清理自建白名单且不误删管理员分�
         payload: { args: { request: { workspaceId } } },
       }, cookie);
 
-    // ── 场景 A：__deny__ 自建 → 删除后回落 __deny__，不能再登记/开会话 ──────────
+    // ── 场景 A：授权根内自建 → 删除后精确回收该自建条目，且残留 pending 不得重新登记 ──
     const denyPath = `${HOME}/wsdel-deny-created`;
     assert.equal((await createDirectory(denyCookie, HOME, 'wsdel-deny-created', 'a-mkdir')).status, 200);
     const denyCreate = await createWorkspace(denyCookie, denyPath, 'a-create');
     assert.equal(denyCreate.status, 200, denyCreate.body);
     assert.deepEqual(
       db.getPermissions(denyCreator.id)?.allowed_folders,
-      [denyPath],
-      '自建成功后应把 __deny__ 替换为新建目录',
+      [HOME, denyPath],
+      '自建成功后应把新建目录并入白名单，并保留管理员分配的授权根',
     );
     assert.ok(db.listUserWorkspacePaths(denyCreator.id).includes(denyPath), '应写入归属行');
 
     assert.equal((await deleteWorkspace(denyCookie, 'wsdel-1', 'a-delete')).status, 200);
     const denyAfter = db.getPermissions(denyCreator.id)!;
-    assert.deepEqual(denyAfter.allowed_folders, ['__deny__'], '删空白名单必须回落 __deny__，不能留空数组（不限目录）');
+    assert.deepEqual(denyAfter.allowed_folders, [HOME], '删后应精确回收该自建条目，保留授权根');
     assert.equal(db.listUserWorkspacePaths(denyCreator.id).includes(denyPath), false, '归属行应被清理');
-    assert.equal(folderAllowed(denyPath, denyAfter.allowed_folders), false, '已删除路径不得再放行');
+    assert.equal(folderAllowed(denyPath, denyAfter.allowed_folders), true,
+      '授权根仍覆盖其子目录：删除自建工作区不收回根级读取授权');
 
     assert.equal((await createWorkspace(denyCookie, denyPath, 'a-reregister')).status, 403, '残留 pending 不得让同一路径重新登记');
-    assert.equal((await createSessionByPath(denyCookie, denyPath, 'a-session-path')).status, 403, '不得再按已删除路径开会话');
     // 已删除 workspaceId：映射已清，网关 fail-closed（403 直接拒绝，或 503 等待基线后仍解析不到）。
     const staleById = await createSessionById(denyCookie, 'wsdel-1', 'a-session-id');
     assert.notEqual(staleById.status, 200, '已删除 workspaceId 映射不得复用（不得成功建会话）');
@@ -245,11 +245,11 @@ test('子用户 workspace/delete 清理自建白名单且不误删管理员分�
     assert.equal((await createDirectory(exactCookie, HOME, 'dshpw-wsdel-exact', 'c-mkdir')).status, 200);
     const exactCreate = await createWorkspace(exactCookie, exactPath, 'c-create');
     assert.equal(exactCreate.status, 200, exactCreate.body);
-    assert.deepEqual(db.getPermissions(exactOwner.id)?.allowed_folders, [exactPath], '已分配路径不得因自建登记而重复/变源');
+    assert.deepEqual(db.getPermissions(exactOwner.id)?.allowed_folders, [HOME, exactPath], '已分配路径不得因自建登记而重复/变源');
     const exactWorkspaceId = `wsdel-${workspaceSeq}`;
 
     assert.equal((await deleteWorkspace(exactCookie, exactWorkspaceId, 'c-delete')).status, 200);
-    assert.deepEqual(db.getPermissions(exactOwner.id)?.allowed_folders, [exactPath],
+    assert.deepEqual(db.getPermissions(exactOwner.id)?.allowed_folders, [HOME, exactPath],
       '管理员精确分配的白名单条目不得因自建工作区删除而被误删');
     assert.equal(folderAllowed(exactPath, db.getPermissions(exactOwner.id)!.allowed_folders), true,
       '管理员精确分配仍放行');

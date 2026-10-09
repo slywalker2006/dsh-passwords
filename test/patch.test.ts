@@ -1,10 +1,11 @@
-// 补丁机制回归测试：覆盖支持的 DSH bundle 布局、当前 0.2.1-alpha.1 产物与回滚契约
+// 补丁机制回归测试：覆盖支持的 DSH bundle 布局、0.2.1-alpha.1/alpha.2 产物与回滚契约
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, copyFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, copyFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
 import { applyRemotePatch, patchStatus, rollbackPatch } from '../src/patch.js';
 
 /** 构建一个模拟 dsh 根目录（含两个必选补丁目标文件 + 可选 workspace 文件），返回 root 与清理函数 */
@@ -29,6 +30,103 @@ function makeDshRoot(
   }
   return { root, cleanup: () => rmSync(root, { recursive: true, force: true }) };
 }
+
+function makeDshRootWithBindAll(
+  startupContent: string,
+  webServerContent: string,
+): { root: string; cleanup: () => void } {
+  const root = mkdtempSync(path.join(tmpdir(), 'dshpw-patch-bindall-'));
+  const settingsDir = path.join(root, 'node_modules', '@deepseek-ai', 'dsh-client-ui-settings', 'lib');
+  mkdirSync(settingsDir, { recursive: true });
+  writeFileSync(path.join(settingsDir, 'client.js'), RC7_SETTINGS_PATCHED);
+  const startupDir = path.join(root, 'node_modules', '@deepseek-ai', 'dsh-web-app', 'lib');
+  mkdirSync(startupDir, { recursive: true });
+  writeFileSync(path.join(startupDir, 'startup.js'), startupContent);
+  const webServerDir = path.join(root, 'node_modules', '@deepseek-ai', 'dsh-host-webserver', 'lib');
+  mkdirSync(webServerDir, { recursive: true });
+  writeFileSync(path.join(webServerDir, 'index.js'), webServerContent);
+  return { root, cleanup: () => rmSync(root, { recursive: true, force: true }) };
+}
+
+const BIND_ALL_STARTUP_FILE = ['node_modules', '@deepseek-ai', 'dsh-web-app', 'lib', 'startup.js'];
+const BIND_ALL_WEBSERVER_FILE = ['node_modules', '@deepseek-ai', 'dsh-host-webserver', 'lib', 'index.js'];
+
+const REAL_STARTUP_PATH = path.join(process.cwd(), ...BIND_ALL_STARTUP_FILE);
+const REAL_WEBSERVER_PATH = path.join(process.cwd(), ...BIND_ALL_WEBSERVER_FILE);
+
+// 有限生命周期真实监听探针：用 mock root 内已打补丁的真实 WebServer 绑 0.0.0.0:0，
+// 打印实际端口后主动退出（OS 关闭监听，不留 server）。cwd = mock root，使其相对 import
+// 命中补丁副本，裸依赖沿目录向上解析到项目 node_modules。
+const WS_BIND_ALL_PROBE = [
+  "import { Context } from '@deepseek-ai/cordis';",
+  "const mod = await import('./node_modules/@deepseek-ai/dsh-host-webserver/lib/index.js');",
+  "mod.WebServer.Config({ host: '0.0.0.0', port: 0 });",
+  'const ctx = new Context();',
+  "ctx.plugin(mod.WebServer, { host: '0.0.0.0', port: 0 });",
+  'await new Promise((resolve) => setTimeout(resolve, 700));',
+  'const port = ctx.webServer && ctx.webServer.port;',
+  "console.log('BINDALL_LISTEN_PORT=' + port);",
+  'process.exit(0);',
+  '',
+].join('\n');
+
+/** 在指定 MCP_DSH_PATCH_ALLOW_BIND_ALL 取值下运行并恢复原值 */
+function withBindAllEnv<T>(value: string | undefined, run: () => T): T {
+  const prev = process.env.MCP_DSH_PATCH_ALLOW_BIND_ALL;
+  if (value === undefined) delete process.env.MCP_DSH_PATCH_ALLOW_BIND_ALL;
+  else process.env.MCP_DSH_PATCH_ALLOW_BIND_ALL = value;
+  try {
+    return run();
+  } finally {
+    if (prev === undefined) delete process.env.MCP_DSH_PATCH_ALLOW_BIND_ALL;
+    else process.env.MCP_DSH_PATCH_ALLOW_BIND_ALL = prev;
+  }
+}
+
+// alpha.1 拒绑闸：options.host 字面比较 + 双引号报错文案（旧锚点）
+const ALPHA1_STARTUP_BIND_GUARD = [
+  'function apply(ctx) {',
+  '  const program = webCommand();',
+  '  program.action(() => {',
+  '    const options = program.opts();',
+  '    if (options.host === "0.0.0.0") program.error("error: --host 0.0.0.0 is intentionally not supported yet for safety: it would expose remote code execution to the network; use 127.0.0.1 instead");',
+  '    ctx.provide("webStartup", options);',
+  '  });',
+  '}',
+  'export { apply };',
+  '',
+].join('\n');
+
+// alpha.2 拒绑闸：isWildcardHost 判定 + 模板串报错文案（与 node_modules 实际产物一致）
+const ALPHA2_STARTUP_BIND_GUARD = [
+  'function apply(ctx) {',
+  '  const program = webCommand();',
+  '  program.action(() => {',
+  '    const options = program.opts();',
+  '    if (options.host !== void 0 && isWildcardHost(options.host)) program.error(`error: --host ${options.host} is an unspecified (wildcard) address, which is not supported: binding every interface would expose remote code execution to the network; bind one concrete IPv4 or IPv6 address instead`);',
+  '    ctx.provide("webStartup", options);',
+  '  });',
+  '}',
+  'export { apply };',
+  '',
+].join('\n');
+
+// alpha.2 webserver 配置闸：WebServer.Config.host 校验中的通配拒绝（与 node_modules 实际产物一致）
+const WS_BIND_GUARD_UNPATCHED = [
+  'const WebServer = class extends Service {',
+  '  static Config = z.object({',
+  '    host: z.transform(z.string(), (value) => {',
+  '      const parsed = parseIpLiteral(value);',
+  '      if (parsed === void 0) throw notLiteralError(value);',
+  '      if (isWildcardAddress(parsed)) throw new Error(`webserver: host ${JSON.stringify(value)} is an unspecified (wildcard) address, which is not supported: binding every interface would expose remote code execution to the network; bind one concrete IPv4 or IPv6 address of a local interface instead`);',
+  '      return value;',
+  '    }).required(),',
+  '    port: z.natural().max(65535).required(),',
+  '  });',
+  '};',
+  'export { WebServer };',
+  '',
+].join('\n');
 
 const RC7_SETTINGS_UNPATCHED =
   'const mode = connection.isLoopback ? "host" : "memory";\nexport default mode;\n';
@@ -304,3 +402,171 @@ test('补丁：workspace 目标文件缺失时不失败（可选子补丁不影�
     cleanup();
   }
 });
+
+test('补丁状态：alpha.2 两闸未打时 bindAll 不得假绿，注入后同时放行并幂等', () => {
+  const { root, cleanup } = makeDshRootWithBindAll(ALPHA2_STARTUP_BIND_GUARD, WS_BIND_GUARD_UNPATCHED);
+  const startupFile = path.join(root, ...BIND_ALL_STARTUP_FILE);
+  const webServerFile = path.join(root, ...BIND_ALL_WEBSERVER_FILE);
+  try {
+    withBindAllEnv('1', () => {
+      assert.equal(patchStatus(root).bindAll, false, '两闸未打必须 fail-closed 报 false');
+      assert.equal(applyRemotePatch(root), 'applied');
+      assert.equal(patchStatus(root).bindAll, true);
+    });
+    const startup = readFileSync(startupFile, 'utf8');
+    assert.ok(startup.includes('dshpw-bindall'), '启动闸已注入标记');
+    assert.ok(startup.includes('isWildcardHost(options.host)'), '保留 alpha.2 启动闸原通配条件');
+    assert.ok(!startup.includes('is an unspecified (wildcard) address'), '启动闸拒绝式调用已移除');
+    const webServer = readFileSync(webServerFile, 'utf8');
+    assert.ok(webServer.includes('dshpw-bindall'), 'webserver 闸已注入标记');
+    assert.ok(webServer.includes('isWildcardAddress(parsed)'), '保留 webserver 原通配条件');
+    assert.ok(!webServer.includes('throw new Error(`webserver: host'), 'webserver 拒绝式 throw 已移除');
+    assert.equal(spawnSync(process.execPath, ['--check', startupFile]).status, 0);
+    assert.equal(spawnSync(process.execPath, ['--check', webServerFile]).status, 0);
+    assert.equal(withBindAllEnv('1', () => applyRemotePatch(root)), 'unchanged', '幂等');
+  } finally {
+    cleanup();
+  }
+});
+
+test('补丁：alpha.1 启动闸与 alpha.2 webserver 闸同轮放行（验证锚点集合，无版本分支）', () => {
+  const { root, cleanup } = makeDshRootWithBindAll(ALPHA1_STARTUP_BIND_GUARD, WS_BIND_GUARD_UNPATCHED);
+  const startupFile = path.join(root, ...BIND_ALL_STARTUP_FILE);
+  try {
+    withBindAllEnv('1', () => {
+      assert.equal(patchStatus(root).bindAll, false);
+      assert.equal(applyRemotePatch(root), 'applied');
+      assert.equal(patchStatus(root).bindAll, true);
+    });
+    const patched = readFileSync(startupFile, 'utf8');
+    assert.ok(patched.includes('options.host === "0.0.0.0"'), '保留 alpha.1 原条件');
+    assert.ok(!patched.includes('intentionally not supported'), '拒绝式报错已移除');
+    assert.equal(spawnSync(process.execPath, ['--check', startupFile]).status, 0);
+  } finally {
+    cleanup();
+  }
+});
+
+test('补丁：bind-all 未开启时不改动两个目标文件（默认不弱化）', () => {
+  const { root, cleanup } = makeDshRootWithBindAll(ALPHA2_STARTUP_BIND_GUARD, WS_BIND_GUARD_UNPATCHED);
+  const startupFile = path.join(root, ...BIND_ALL_STARTUP_FILE);
+  const webServerFile = path.join(root, ...BIND_ALL_WEBSERVER_FILE);
+  try {
+    withBindAllEnv(undefined, () => {
+      assert.equal(applyRemotePatch(root), 'unchanged');
+      assert.equal(patchStatus(root).bindAll, true, '未开启时沿用既有“不参与计算”语义');
+    });
+    assert.equal(readFileSync(startupFile, 'utf8'), ALPHA2_STARTUP_BIND_GUARD);
+    assert.equal(readFileSync(webServerFile, 'utf8'), WS_BIND_GUARD_UNPATCHED);
+  } finally {
+    cleanup();
+  }
+});
+
+test('补丁：bind-all 关闭时自愈恢复两闸（哈希匹配）', () => {
+  const { root, cleanup } = makeDshRootWithBindAll(ALPHA2_STARTUP_BIND_GUARD, WS_BIND_GUARD_UNPATCHED);
+  const startupFile = path.join(root, ...BIND_ALL_STARTUP_FILE);
+  const webServerFile = path.join(root, ...BIND_ALL_WEBSERVER_FILE);
+  try {
+    withBindAllEnv('1', () => {
+      assert.equal(applyRemotePatch(root), 'applied');
+    });
+    assert.notEqual(readFileSync(startupFile, 'utf8'), ALPHA2_STARTUP_BIND_GUARD);
+    assert.notEqual(readFileSync(webServerFile, 'utf8'), WS_BIND_GUARD_UNPATCHED);
+    withBindAllEnv(undefined, () => {
+      assert.equal(applyRemotePatch(root), 'applied', '关闭开关时恢复两闸');
+    });
+    assert.equal(readFileSync(startupFile, 'utf8'), ALPHA2_STARTUP_BIND_GUARD);
+    assert.equal(readFileSync(webServerFile, 'utf8'), WS_BIND_GUARD_UNPATCHED);
+  } finally {
+    cleanup();
+  }
+});
+
+test('补丁：bind-all 后回滚按哈希恢复两个原始文件', () => {
+  const { root, cleanup } = makeDshRootWithBindAll(ALPHA2_STARTUP_BIND_GUARD, WS_BIND_GUARD_UNPATCHED);
+  const startupFile = path.join(root, ...BIND_ALL_STARTUP_FILE);
+  const webServerFile = path.join(root, ...BIND_ALL_WEBSERVER_FILE);
+  try {
+    withBindAllEnv('1', () => {
+      assert.equal(applyRemotePatch(root), 'applied');
+    });
+    assert.equal(rollbackPatch(root), 'rolled-back');
+    assert.equal(readFileSync(startupFile, 'utf8'), ALPHA2_STARTUP_BIND_GUARD);
+    assert.equal(readFileSync(webServerFile, 'utf8'), WS_BIND_GUARD_UNPATCHED);
+  } finally {
+    cleanup();
+  }
+});
+
+test(
+  '补丁：真实 alpha.2 dsh-web-app startup.js 可被识别并注入',
+  { skip: !existsSync(REAL_STARTUP_PATH) },
+  () => {
+    const realStartup = readFileSync(REAL_STARTUP_PATH, 'utf8');
+    assert.ok(realStartup.includes('isWildcardHost(options.host)'), '安装产物仍是 alpha.2 启动闸形态');
+    const { root, cleanup } = makeDshRootWithBindAll(realStartup, WS_BIND_GUARD_UNPATCHED);
+    const startupFile = path.join(root, ...BIND_ALL_STARTUP_FILE);
+    try {
+      withBindAllEnv('1', () => {
+        assert.equal(patchStatus(root).bindAll, false);
+        assert.equal(applyRemotePatch(root), 'applied');
+        assert.equal(patchStatus(root).bindAll, true);
+      });
+      assert.equal(spawnSync(process.execPath, ['--check', startupFile]).status, 0);
+    } finally {
+      cleanup();
+    }
+  },
+);
+
+test(
+  '补丁：真实 alpha.2 dsh-host-webserver —— 未打拒绝通配，注入后配置放行且能真实监听 0.0.0.0 后退出',
+  { skip: !existsSync(REAL_WEBSERVER_PATH) },
+  async () => {
+    // 未打的真实产物：配置校验即拒绝通配（第二道闸的真实行为）
+    const realModule = await import(pathToFileURL(REAL_WEBSERVER_PATH).href);
+    assert.throws(
+      () => realModule.WebServer.Config({ host: '0.0.0.0', port: 0 }),
+      /wildcard/,
+      '未打 webserver 必须拒绝 0.0.0.0',
+    );
+
+    // 项目本地 mock root：真实 index.js 的裸依赖（cordis/schemastery/…）沿目录向上解析到项目 node_modules
+    const root = mkdtempSync(path.join(process.cwd(), '.dshpw-verify-'));
+    try {
+      const settingsDir = path.join(root, 'node_modules', '@deepseek-ai', 'dsh-client-ui-settings', 'lib');
+      mkdirSync(settingsDir, { recursive: true });
+      writeFileSync(path.join(settingsDir, 'client.js'), RC7_SETTINGS_PATCHED);
+      mkdirSync(path.join(root, ...BIND_ALL_STARTUP_FILE.slice(0, -1)), { recursive: true });
+      copyFileSync(REAL_STARTUP_PATH, path.join(root, ...BIND_ALL_STARTUP_FILE));
+      mkdirSync(path.join(root, ...BIND_ALL_WEBSERVER_FILE.slice(0, -1)), { recursive: true });
+      copyFileSync(REAL_WEBSERVER_PATH, path.join(root, ...BIND_ALL_WEBSERVER_FILE));
+
+      withBindAllEnv('1', () => {
+        assert.equal(patchStatus(root).bindAll, false, '两闸未打必须 fail-closed');
+        assert.equal(applyRemotePatch(root), 'applied');
+        assert.equal(patchStatus(root).bindAll, true);
+      });
+
+      const webServerFile = path.join(root, ...BIND_ALL_WEBSERVER_FILE);
+      assert.ok(readFileSync(webServerFile, 'utf8').includes('dshpw-bindall'));
+      // 打后真实副本：配置接受通配
+      const patchedModule = await import(pathToFileURL(webServerFile).href);
+      assert.equal(patchedModule.WebServer.Config({ host: '0.0.0.0', port: 0 }).host, '0.0.0.0');
+
+      // 真实监听：有限生命周期子进程，绑 0.0.0.0 后打印端口并退出（OS 关闭监听，不留 server）
+      const probe = spawnSync(process.execPath, ['--input-type=module', '-e', WS_BIND_ALL_PROBE], {
+        cwd: root,
+        encoding: 'utf8',
+        timeout: 20000,
+      });
+      assert.equal(probe.status, 0, `真实监听探针应正常退出：${String(probe.stderr)}`);
+      const match = /BINDALL_LISTEN_PORT=(\d+)/.exec(probe.stdout);
+      assert.ok(match !== null, `探针应打印真实监听端口：${probe.stdout}`);
+      assert.ok(Number(match[1]) > 0, '应为有效的非 0 监听端口');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+);
